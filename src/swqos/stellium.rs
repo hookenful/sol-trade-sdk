@@ -90,7 +90,7 @@ impl StelliumClient {
         let ping_handle = self.ping_handle.clone();
 
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60)); // Ping every 60 seconds
+            let mut interval = tokio::time::interval(Duration::from_secs(20)); // Ping every 20 seconds
 
             loop {
                 interval.tick().await;
@@ -99,17 +99,8 @@ impl StelliumClient {
                     break;
                 }
 
-                // Send ping request
-                let url = format!("{}/{}", endpoint, auth_token);
-                match http_client.get(&url).send().await {
-                    Ok(response) => {
-                        if !response.status().is_success() {
-                            eprintln!(" [Stellium] Ping failed with status: {}", response.status());
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(" [Stellium] Ping request error: {:?}", e);
-                    }
+                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
+                    println!(" [Stellium] ping request failed: {}", e);
                 }
             }
         });
@@ -121,6 +112,18 @@ impl StelliumClient {
             }
             *ping_guard = Some(handle);
         });
+    }
+
+    async fn send_ping_request(http_client: &Client, endpoint: &str, auth_token: &str) -> Result<()> {
+        let url = format!("{}/{}", endpoint, auth_token);
+        let start_time = Instant::now();
+        let response = http_client.get(&url).send().await?;
+        println!(
+            " [Stellium] ping status={} rtt={:?}",
+            response.status(),
+            start_time.elapsed()
+        );
+        Ok(())
     }
 
     pub async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
@@ -157,10 +160,10 @@ impl StelliumClient {
             if response_json.get("result").is_some() {
                 println!(" [Stellium] {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [Stellium] {} submission failed: {:?}", trade_type, _error);
+                println!(" [Stellium] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            eprintln!(" [Stellium] {} submission failed: {:?}", trade_type, response_text);
+            println!(" [Stellium] {} submission failed: {:?}", trade_type, response_text);
         }
 
         let start_time: Instant = Instant::now();

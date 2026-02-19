@@ -90,7 +90,7 @@ impl BlockRazorClient {
         let ping_handle = self.ping_handle.clone();
         
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60)); // Ping every 60 seconds
+            let mut interval = tokio::time::interval(Duration::from_secs(20)); // Ping every 20 seconds
             
             loop {
                 interval.tick().await;
@@ -101,7 +101,7 @@ impl BlockRazorClient {
                 
                 // Send ping request
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    eprintln!("BlockRazor ping request failed: {}", e);
+                    println!(" [blockrazor] ping request failed: {}", e);
                 }
             }
         });
@@ -137,17 +137,17 @@ impl BlockRazorClient {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         // Send GET request to /health endpoint with headers
+        let start_time = Instant::now();
         let response = http_client.get(&ping_url)
             .headers(headers)
             .send()
             .await?;
-        
-        if response.status().is_success() {
-            // ping successful, connection remains active
-            // Can optionally log, but to reduce noise, not printing here
-        } else {
-            eprintln!("BlockRazor ping request failed with status: {}", response.status());
-        }
+
+        println!(
+            " [blockrazor] ping status={} rtt={:?}",
+            response.status(),
+            start_time.elapsed()
+        );
         
         Ok(())
     }
@@ -177,10 +177,10 @@ impl BlockRazorClient {
             if response_json.get("result").is_some() || response_json.get("signature").is_some() {
                 println!(" [blockrazor] {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [blockrazor] {} submission failed: {:?}", trade_type, _error);
+                println!(" [blockrazor] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            eprintln!(" [blockrazor] {} submission failed: {:?}", trade_type, response_text);
+            println!(" [blockrazor] {} submission failed: {:?}", trade_type, response_text);
         }
 
         let start_time: Instant = Instant::now();

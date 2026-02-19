@@ -90,7 +90,7 @@ impl Node1Client {
         let ping_handle = self.ping_handle.clone();
         
         let handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60)); // Ping every 60 seconds
+            let mut interval = tokio::time::interval(Duration::from_secs(20)); // Ping every 20 seconds
             
             loop {
                 interval.tick().await;
@@ -101,7 +101,7 @@ impl Node1Client {
                 
                 // Send ping request
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    eprintln!("Node1 ping request failed: {}", e);
+                    println!(" [node1] ping request failed: {}", e);
                 }
             }
         });
@@ -125,16 +125,16 @@ impl Node1Client {
         };
 
         // Send GET request to /ping endpoint (no api-key required)
+        let start_time = Instant::now();
         let response = http_client.get(&ping_url)
             .send()
             .await?;
-        
-        if response.status().is_success() {
-            // ping successful, connection remains active
-            // Can optionally log, but to reduce noise, not printing here
-        } else {
-            eprintln!("Node1 ping request returned non-success status: {}", response.status());
-        }
+
+        println!(
+            " [node1] ping status={} rtt={:?}",
+            response.status(),
+            start_time.elapsed()
+        );
         
         Ok(())
     }
@@ -168,10 +168,10 @@ impl Node1Client {
             if response_json.get("result").is_some() {
                 println!(" [node1] {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [node1] {} submission failed: {:?}", trade_type, _error);
+                println!(" [node1] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            eprintln!(" [node1] {} submission failed: {:?}", trade_type, response_text);
+            println!(" [node1] {} submission failed: {:?}", trade_type, response_text);
         }
 
         let start_time: Instant = Instant::now();

@@ -3,6 +3,7 @@ use rand::seq::IndexedRandom;
 use reqwest::Client;
 use serde_json::json;
 use std::{sync::Arc, time::Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use std::time::Duration;
 use solana_transaction_status::UiTransactionEncoding;
@@ -13,6 +14,7 @@ use crate::swqos::{SwqosType, TradeType};
 use crate::swqos::SwqosClientTrait;
 
 use crate::{common::SolanaRpcClient, constants::swqos::FLASHBLOCK_TIP_ACCOUNTS};
+use tokio::task::JoinHandle;
 
 
 #[derive(Clone)]
@@ -21,6 +23,9 @@ pub struct FlashBlockClient {
     pub auth_token: String,
     pub rpc_client: Arc<SolanaRpcClient>,
     pub http_client: Client,
+    pub ping_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    pub stop_ping: Arc<AtomicBool>,
+    lifecycle_guard: Arc<()>,
 }
 
 #[async_trait::async_trait]
@@ -59,7 +64,77 @@ impl FlashBlockClient {
             .connect_timeout(Duration::from_millis(2000))  // Reduced from 5s to 2s
             .build()
             .unwrap();
-        Self { rpc_client: Arc::new(rpc_client), endpoint, auth_token, http_client }
+
+        let client = Self {
+            rpc_client: Arc::new(rpc_client),
+            endpoint,
+            auth_token,
+            http_client,
+            ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            lifecycle_guard: Arc::new(()),
+        };
+
+        // Start ping task without cloning self (to avoid Drop side effects on clone).
+        client.spawn_ping_task();
+
+        client
+    }
+
+    /// Start periodic ping task to keep connections active
+    fn spawn_ping_task(&self) {
+        let endpoint = self.endpoint.clone();
+        let auth_token = self.auth_token.clone();
+        let http_client = self.http_client.clone();
+        let stop_ping = self.stop_ping.clone();
+        let ping_handle = self.ping_handle.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(20)); // Ping every 20 seconds
+
+            loop {
+                interval.tick().await;
+
+                if stop_ping.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
+                    println!(" [FlashBlock] ping request failed: {}", e);
+                }
+            }
+        });
+
+        tokio::spawn(async move {
+            let mut ping_guard = ping_handle.lock().await;
+            if let Some(old_handle) = ping_guard.as_ref() {
+                old_handle.abort();
+            }
+            *ping_guard = Some(handle);
+        });
+    }
+
+    async fn send_ping_request(http_client: &Client, endpoint: &str, auth_token: &str) -> Result<()> {
+        let ping_url = if endpoint.ends_with('/') {
+            format!("{}api/v2/health", endpoint)
+        } else {
+            format!("{}/api/v2/health", endpoint)
+        };
+
+        let start_time = Instant::now();
+        let response = http_client
+            .get(&ping_url)
+            .header("Authorization", auth_token)
+            .send()
+            .await?;
+
+        println!(
+            " [FlashBlock] ping status={} rtt={:?}",
+            response.status(),
+            start_time.elapsed()
+        );
+
+        Ok(())
     }
 
     pub async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
@@ -90,10 +165,10 @@ impl FlashBlockClient {
             if response_json.get("success").is_some() || response_json.get("result").is_some() {
                 println!(" [FlashBlock] {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [FlashBlock] {} submission failed: {:?}", trade_type, _error);
+                println!(" [FlashBlock] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            eprintln!(" [FlashBlock] {} submission failed: {:?}", trade_type, response_text);
+            println!(" [FlashBlock] {} submission failed: {:?}", trade_type, response_text);
         }
 
         let start_time: Instant = Instant::now();
@@ -118,5 +193,22 @@ impl FlashBlockClient {
             self.send_transaction(trade_type, transaction, wait_confirmation).await?;
         }
         Ok(())
+    }
+}
+
+impl Drop for FlashBlockClient {
+    fn drop(&mut self) {
+        // Only the last clone should stop the shared ping task.
+        if Arc::strong_count(&self.lifecycle_guard) != 1 {
+            return;
+        }
+
+        self.stop_ping.store(true, Ordering::Relaxed);
+
+        if let Ok(mut ping_guard) = self.ping_handle.try_lock() {
+            if let Some(handle) = ping_guard.take() {
+                handle.abort();
+            }
+        }
     }
 }
