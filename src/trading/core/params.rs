@@ -8,6 +8,7 @@ use crate::instruction::utils::pumpswap::accounts::MAYHEM_FEE_RECIPIENT as MAYHE
 use crate::swqos::{SwqosClient, TradeType};
 use crate::trading::common::get_multi_token_balances;
 use crate::trading::MiddlewareManager;
+use crate::PrecheckConfig;
 use solana_hash::Hash;
 use solana_sdk::message::AddressLookupTableAccount;
 use solana_sdk::{pubkey::Pubkey, signature::Keypair};
@@ -72,6 +73,8 @@ pub struct SwapParams {
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
+    /// Optional precheck call inserted before PumpFun buy instruction.
+    pub precheck: Option<PrecheckConfig>,
 }
 
 impl std::fmt::Debug for SwapParams {

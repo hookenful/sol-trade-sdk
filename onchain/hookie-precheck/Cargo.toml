@@ -1,0 +1,22 @@
+[package]
+name = "hookie-precheck"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT"
+description = "On-chain precheck program for PumpFun buy flow"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["bpf-entrypoint"]
+bpf-entrypoint = []
+
+[dependencies]
+pinocchio = "0.10.2"
+
+[profile.release]
+overflow-checks = false
+lto = "fat"
+codegen-units = 1

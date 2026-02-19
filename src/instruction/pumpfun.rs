@@ -102,7 +102,14 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         // ========================================
         // Build instructions
         // ========================================
-        let mut instructions = Vec::with_capacity(2);
+        let mut instructions = Vec::with_capacity(3);
+
+        if let Some(precheck) = &params.precheck {
+            instructions.push(crate::instruction::hookie_precheck::build_precheck_v1_instruction(
+                bonding_curve_addr,
+                precheck,
+            )?);
+        }
 
         // Create associated token account
         if params.create_output_mint_ata {
@@ -307,6 +314,114 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         }
 
         Ok(instructions)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::PumpFunInstructionBuilder;
+    use crate::common::GasFeeStrategy;
+    use crate::instruction::hookie_precheck::DEFAULT_PRECHECK_PROGRAM_ID;
+    use crate::instruction::utils::pumpfun::get_creator_vault_pda;
+    use crate::instruction::utils::pumpfun::global_constants::FEE_RECIPIENT;
+    use crate::trading::core::params::{DexParamEnum, PumpFunParams, SwapParams};
+    use crate::trading::core::traits::InstructionBuilder;
+    use crate::PrecheckConfig;
+    use solana_sdk::pubkey::Pubkey;
+    use solana_sdk::signature::Keypair;
+
+    fn make_buy_params(with_precheck: bool) -> SwapParams {
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let creator_vault = get_creator_vault_pda(&creator).unwrap();
+        let pumpfun = PumpFunParams::from_trade(
+            Pubkey::new_unique(),
+            Pubkey::new_unique(),
+            mint,
+            creator,
+            creator_vault,
+            1_073_000_000_000_000,
+            30_000_000_000,
+            793_100_000_000_000,
+            1_500_000_000,
+            None,
+            FEE_RECIPIENT,
+            crate::constants::TOKEN_PROGRAM,
+            false,
+        );
+
+        SwapParams {
+            rpc: None,
+            payer: Arc::new(Keypair::new()),
+            trade_type: crate::swqos::TradeType::Buy,
+            input_mint: crate::constants::SOL_TOKEN_ACCOUNT,
+            input_token_program: None,
+            output_mint: mint,
+            output_token_program: None,
+            input_amount: Some(100_000_000),
+            slippage_basis_points: Some(100),
+            address_lookup_table_account: None,
+            recent_blockhash: None,
+            wait_transaction_confirmed: false,
+            protocol_params: DexParamEnum::PumpFun(pumpfun),
+            open_seed_optimize: false,
+            swqos_clients: Vec::new(),
+            middleware_manager: None,
+            durable_nonce: None,
+            with_tip: true,
+            create_input_mint_ata: false,
+            close_input_mint_ata: false,
+            create_output_mint_ata: false,
+            close_output_mint_ata: false,
+            fixed_output_amount: None,
+            gas_fee_strategy: GasFeeStrategy::new(),
+            simulate: true,
+            use_exact_sol_amount: Some(true),
+            precheck: if with_precheck {
+                Some(PrecheckConfig {
+                    program_id: None,
+                    context_slot: 123,
+                    max_slot_diff: 5,
+                    min_liquidity_lamports: 1_000_000_000,
+                    max_liquidity_lamports: 2_000_000_000,
+                })
+            } else {
+                None
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn pumpfun_buy_includes_precheck_instruction_first() {
+        let builder = PumpFunInstructionBuilder;
+        let params = make_buy_params(true);
+        let instructions =
+            builder.build_buy_instructions(&params).await.expect("build buy instructions");
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].program_id, DEFAULT_PRECHECK_PROGRAM_ID);
+        assert_eq!(
+            instructions[1].program_id,
+            crate::instruction::utils::pumpfun::accounts::PUMPFUN
+        );
+        assert_eq!(instructions[0].accounts.len(), 2);
+        assert_eq!(instructions[0].accounts[0].pubkey, solana_sdk::sysvar::clock::id());
+    }
+
+    #[tokio::test]
+    async fn pumpfun_buy_without_precheck_has_only_buy_instruction() {
+        let builder = PumpFunInstructionBuilder;
+        let params = make_buy_params(false);
+        let instructions =
+            builder.build_buy_instructions(&params).await.expect("build buy instructions");
+
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(
+            instructions[0].program_id,
+            crate::instruction::utils::pumpfun::accounts::PUMPFUN
+        );
     }
 }
 

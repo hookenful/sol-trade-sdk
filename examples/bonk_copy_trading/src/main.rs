@@ -176,6 +176,7 @@ async fn bonk_copy_trade_with_grpc(trade_info: BonkTradeEvent) -> AnyResult<()> 
         gas_fee_strategy: gas_fee_strategy.clone(),
         simulate: false,
         use_exact_sol_amount: None,
+        precheck: None,
     };
     client.buy(buy_params).await?;
 
