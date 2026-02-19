@@ -47,6 +47,37 @@ pub enum TradeTokenType {
     USDC,
 }
 
+/// Optional on-chain precheck configuration executed before PumpFun buy instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrecheckConfig {
+    /// Optional override for the precheck program id.
+    /// If omitted, SDK uses `instruction::hookie_precheck::DEFAULT_PRECHECK_PROGRAM_ID`.
+    pub program_id: Option<Pubkey>,
+    /// Source event slot that the trade is based on.
+    pub context_slot: u64,
+    /// Maximum allowed slot distance from `context_slot`.
+    pub max_slot_diff: u8,
+    /// Minimum allowed bonding curve real SOL reserves.
+    pub min_liquidity_lamports: u64,
+    /// Maximum allowed bonding curve real SOL reserves.
+    pub max_liquidity_lamports: u64,
+}
+
+impl PrecheckConfig {
+    #[inline]
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.max_slot_diff == 0 {
+            return Err(anyhow::anyhow!("precheck.max_slot_diff must be > 0"));
+        }
+        if self.min_liquidity_lamports > self.max_liquidity_lamports {
+            return Err(anyhow::anyhow!(
+                "precheck.min_liquidity_lamports must be <= precheck.max_liquidity_lamports"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Shared infrastructure components that can be reused across multiple wallets
 ///
 /// This struct holds the expensive-to-initialize components (RPC client, SWQOS clients)
@@ -193,6 +224,8 @@ pub struct TradeBuyParams {
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
+    /// Optional precheck call inserted before PumpFun buy instruction.
+    pub precheck: Option<PrecheckConfig>,
 }
 
 /// Parameters for executing sell orders across different DEX protocols
@@ -574,6 +607,7 @@ impl TradingClient {
             gas_fee_strategy: params.gas_fee_strategy,
             simulate: params.simulate,
             use_exact_sol_amount: params.use_exact_sol_amount,
+            precheck: params.precheck,
         };
 
         // Validate protocol params
@@ -684,6 +718,7 @@ impl TradingClient {
             gas_fee_strategy: params.gas_fee_strategy,
             simulate: params.simulate,
             use_exact_sol_amount: None,
+            precheck: None,
         };
 
         // Validate protocol params
