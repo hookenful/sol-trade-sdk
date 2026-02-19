@@ -101,7 +101,7 @@ impl Node1Client {
                 
                 // Send ping request
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    println!(" [node1] ping request failed: {}", e);
+                    eprintln!("Node1 ping request failed: {}", e);
                 }
             }
         });
@@ -125,16 +125,16 @@ impl Node1Client {
         };
 
         // Send GET request to /ping endpoint (no api-key required)
-        let start_time = Instant::now();
         let response = http_client.get(&ping_url)
             .send()
             .await?;
-
-        println!(
-            " [node1] ping status={} rtt={:?}",
-            response.status(),
-            start_time.elapsed()
-        );
+        
+        if response.status().is_success() {
+            // ping successful, connection remains active
+            // Can optionally log, but to reduce noise, not printing here
+        } else {
+            eprintln!("Node1 ping request returned non-success status: {}", response.status());
+        }
         
         Ok(())
     }
@@ -168,10 +168,10 @@ impl Node1Client {
             if response_json.get("result").is_some() {
                 println!(" [node1] {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                println!(" [node1] {} submission failed: {:?}", trade_type, _error);
+                eprintln!(" [node1] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            println!(" [node1] {} submission failed: {:?}", trade_type, response_text);
+            eprintln!(" [node1] {} submission failed: {:?}", trade_type, response_text);
         }
 
         let start_time: Instant = Instant::now();

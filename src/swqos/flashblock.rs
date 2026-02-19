@@ -99,9 +99,7 @@ impl FlashBlockClient {
                     break;
                 }
 
-                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    println!(" [FlashBlock] ping request failed: {}", e);
-                }
+                let _ = Self::send_ping_request(&http_client, &endpoint, &auth_token).await;
             }
         });
 
@@ -116,23 +114,16 @@ impl FlashBlockClient {
 
     async fn send_ping_request(http_client: &Client, endpoint: &str, auth_token: &str) -> Result<()> {
         let ping_url = if endpoint.ends_with('/') {
-            format!("{}api/v2/health", endpoint)
+            endpoint.to_string()
         } else {
-            format!("{}/api/v2/health", endpoint)
+            format!("{}/", endpoint)
         };
 
-        let start_time = Instant::now();
-        let response = http_client
+        let _response = http_client
             .get(&ping_url)
             .header("Authorization", auth_token)
             .send()
             .await?;
-
-        println!(
-            " [FlashBlock] ping status={} rtt={:?}",
-            response.status(),
-            start_time.elapsed()
-        );
 
         Ok(())
     }
@@ -165,10 +156,10 @@ impl FlashBlockClient {
             if response_json.get("success").is_some() || response_json.get("result").is_some() {
                 println!(" [FlashBlock] {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                println!(" [FlashBlock] {} submission failed: {:?}", trade_type, _error);
+                eprintln!(" [FlashBlock] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            println!(" [FlashBlock] {} submission failed: {:?}", trade_type, response_text);
+            eprintln!(" [FlashBlock] {} submission failed: {:?}", trade_type, response_text);
         }
 
         let start_time: Instant = Instant::now();

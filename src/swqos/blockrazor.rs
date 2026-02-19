@@ -101,7 +101,7 @@ impl BlockRazorClient {
                 
                 // Send ping request
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    println!(" [blockrazor] ping request failed: {}", e);
+                    eprintln!("BlockRazor ping request failed: {}", e);
                 }
             }
         });
@@ -137,17 +137,17 @@ impl BlockRazorClient {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         // Send GET request to /health endpoint with headers
-        let start_time = Instant::now();
         let response = http_client.get(&ping_url)
             .headers(headers)
             .send()
             .await?;
-
-        println!(
-            " [blockrazor] ping status={} rtt={:?}",
-            response.status(),
-            start_time.elapsed()
-        );
+        
+        if response.status().is_success() {
+            // ping successful, connection remains active
+            // Can optionally log, but to reduce noise, not printing here
+        } else {
+            eprintln!("BlockRazor ping request failed with status: {}", response.status());
+        }
         
         Ok(())
     }
@@ -177,10 +177,10 @@ impl BlockRazorClient {
             if response_json.get("result").is_some() || response_json.get("signature").is_some() {
                 println!(" [blockrazor] {} submitted: {:?}", trade_type, start_time.elapsed());
             } else if let Some(_error) = response_json.get("error") {
-                println!(" [blockrazor] {} submission failed: {:?}", trade_type, _error);
+                eprintln!(" [blockrazor] {} submission failed: {:?}", trade_type, _error);
             }
         } else {
-            println!(" [blockrazor] {} submission failed: {:?}", trade_type, response_text);
+            eprintln!(" [blockrazor] {} submission failed: {:?}", trade_type, response_text);
         }
 
         let start_time: Instant = Instant::now();
