@@ -64,7 +64,7 @@ pub async fn poll_transaction_confirmation(
     }
 
     let timeout: Duration = Duration::from_secs(15); // 🔧 增加到15秒，避免网络拥堵时超时
-    let interval: Duration = Duration::from_millis(1000);
+    let interval: Duration = Duration::from_millis(100);
     let start: Instant = Instant::now();
     let mut poll_count = 0u32;
 
