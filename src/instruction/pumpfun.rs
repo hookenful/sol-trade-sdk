@@ -9,7 +9,8 @@ use crate::{
 use crate::{
     instruction::utils::pumpfun::{
         accounts, get_bonding_curve_pda, get_creator, get_user_volume_accumulator_pda,
-        global_constants::{self}, BUY_DISCRIMINATOR, BUY_EXACT_SOL_IN_DISCRIMINATOR,
+        global_constants::{self},
+        BUY_DISCRIMINATOR, BUY_EXACT_SOL_IN_DISCRIMINATOR,
     },
     utils::calc::{
         common::{calculate_with_slippage_buy, calculate_with_slippage_sell},
@@ -125,13 +126,19 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         }
 
         let mut buy_data = [0u8; 24];
-        if params.use_exact_sol_amount.unwrap_or(true) {
+        let use_exact_sol_amount = params.use_exact_sol_amount.unwrap_or(true);
+        if use_exact_sol_amount {
             // buy_exact_sol_in(spendable_sol_in: u64, min_tokens_out: u64)
             // Spend exactly the input SOL amount, get at least min_tokens_out
-            let min_tokens_out = calculate_with_slippage_sell(
-                buy_token_amount,
-                params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
-            );
+            let min_tokens_out = if params.use_exact_sol_amount == Some(true) {
+                // Preset explicitly requested exact SOL mode: disable min output guard.
+                1
+            } else {
+                calculate_with_slippage_sell(
+                    buy_token_amount,
+                    params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
+                )
+            };
             buy_data[..8].copy_from_slice(&BUY_EXACT_SOL_IN_DISCRIMINATOR);
             buy_data[8..16].copy_from_slice(&params.input_amount.unwrap_or(0).to_le_bytes());
             buy_data[16..24].copy_from_slice(&min_tokens_out.to_le_bytes());
@@ -294,11 +301,7 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             accounts.push(AccountMeta::new(user_volume_accumulator, false));
         }
 
-        instructions.push(Instruction::new_with_bytes(
-            accounts::PUMPFUN,
-            &sell_data,
-            accounts,
-        ));
+        instructions.push(Instruction::new_with_bytes(accounts::PUMPFUN, &sell_data, accounts));
 
         // Optional: Close token account
         if protocol_params.close_token_account_when_sell.unwrap_or(false)
@@ -319,13 +322,16 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::TryInto;
     use std::sync::Arc;
 
     use super::PumpFunInstructionBuilder;
     use crate::common::GasFeeStrategy;
     use crate::instruction::hookie_precheck::DEFAULT_PRECHECK_PROGRAM_ID;
-    use crate::instruction::utils::pumpfun::get_creator_vault_pda;
     use crate::instruction::utils::pumpfun::global_constants::FEE_RECIPIENT;
+    use crate::instruction::utils::pumpfun::{
+        get_creator_vault_pda, BUY_EXACT_SOL_IN_DISCRIMINATOR,
+    };
     use crate::trading::core::params::{DexParamEnum, PumpFunParams, SwapParams};
     use crate::trading::core::traits::InstructionBuilder;
     use crate::PrecheckConfig;
@@ -423,6 +429,21 @@ mod tests {
             crate::instruction::utils::pumpfun::accounts::PUMPFUN
         );
     }
+
+    #[tokio::test]
+    async fn pumpfun_buy_exact_sol_from_preset_sets_min_tokens_out_to_one() {
+        let builder = PumpFunInstructionBuilder;
+        let mut params = make_buy_params(false);
+        params.use_exact_sol_amount = Some(true);
+        let instructions =
+            builder.build_buy_instructions(&params).await.expect("build buy instructions");
+
+        assert_eq!(instructions.len(), 1);
+        let data = &instructions[0].data;
+        assert_eq!(&data[..8], &BUY_EXACT_SOL_IN_DISCRIMINATOR);
+        let min_tokens_out = u64::from_le_bytes(data[16..24].try_into().unwrap());
+        assert_eq!(min_tokens_out, 1);
+    }
 }
 
 /// Claim cashback for Bonding Curve (Pump program). Transfers native lamports from UserVolumeAccumulator to user.
@@ -430,15 +451,11 @@ pub fn claim_cashback_pumpfun_instruction(payer: &Pubkey) -> Option<Instruction>
     const CLAIM_CASHBACK_DISCRIMINATOR: [u8; 8] = [37, 58, 35, 126, 190, 53, 228, 197];
     let user_volume_accumulator = get_user_volume_accumulator_pda(payer)?;
     let accounts = vec![
-        AccountMeta::new(*payer, true),           // user (signer, writable)
+        AccountMeta::new(*payer, true), // user (signer, writable)
         AccountMeta::new(user_volume_accumulator, false), // user_volume_accumulator (writable, not signer)
         crate::constants::SYSTEM_PROGRAM_META,
         accounts::EVENT_AUTHORITY_META,
         accounts::PUMPFUN_META,
     ];
-    Some(Instruction::new_with_bytes(
-        accounts::PUMPFUN,
-        &CLAIM_CASHBACK_DISCRIMINATOR,
-        accounts,
-    ))
+    Some(Instruction::new_with_bytes(accounts::PUMPFUN, &CLAIM_CASHBACK_DISCRIMINATOR, accounts))
 }
