@@ -14,7 +14,7 @@ pub const PUMPFUN_PROGRAM_ID: Address = Address::new_from_array([
 ]);
 
 pub const PRECHECK_V1_DISCRIMINATOR: u8 = 1;
-pub const PRECHECK_V1_DATA_LEN: usize = 1 + 8 + 1 + 8 + 8;
+pub const PRECHECK_V1_DATA_LEN: usize = 1 + 8 + 1 + 8 + 8 + 8 + 8 + 8;
 
 /// PumpFun account layout offset for `real_sol_reserves`.
 /// Layout: [anchor_discriminator:8][virtual_token:8][virtual_sol:8][real_token:8][real_sol:8]
@@ -28,6 +28,8 @@ pub enum PrecheckError {
     LiquidityTooHigh = 7_001,
     ContextSlotDifferenceReached = 7_002,
     InvalidCurveAccount = 7_003,
+    LiquidityDifferenceTooLow = 7_004,
+    LiquidityDifferenceTooHigh = 7_005,
 }
 
 impl From<PrecheckError> for ProgramError {
@@ -43,6 +45,9 @@ pub struct PrecheckPayloadV1 {
     pub max_slot_diff: u8,
     pub min_liquidity_lamports: u64,
     pub max_liquidity_lamports: u64,
+    pub base_liquidity_lamports: u64,
+    pub min_liquidity_difference_lamports: u64,
+    pub max_liquidity_difference_lamports: u64,
 }
 
 impl PrecheckPayloadV1 {
@@ -59,8 +64,19 @@ impl PrecheckPayloadV1 {
         let max_slot_diff = instruction_data[9];
         let min_liquidity_lamports = read_u64_le(&instruction_data[10..18])?;
         let max_liquidity_lamports = read_u64_le(&instruction_data[18..26])?;
+        let base_liquidity_lamports = read_u64_le(&instruction_data[26..34])?;
+        let min_liquidity_difference_lamports = read_u64_le(&instruction_data[34..42])?;
+        let max_liquidity_difference_lamports = read_u64_le(&instruction_data[42..50])?;
 
-        Ok(Self { context_slot, max_slot_diff, min_liquidity_lamports, max_liquidity_lamports })
+        Ok(Self {
+            context_slot,
+            max_slot_diff,
+            min_liquidity_lamports,
+            max_liquidity_lamports,
+            base_liquidity_lamports,
+            min_liquidity_difference_lamports,
+            max_liquidity_difference_lamports,
+        })
     }
 
     #[inline]
@@ -69,6 +85,12 @@ impl PrecheckPayloadV1 {
             return Err(ProgramError::InvalidInstructionData);
         }
         if self.min_liquidity_lamports > self.max_liquidity_lamports {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if self.min_liquidity_difference_lamports > 0
+            && self.max_liquidity_difference_lamports > 0
+            && self.min_liquidity_difference_lamports > self.max_liquidity_difference_lamports
+        {
             return Err(ProgramError::InvalidInstructionData);
         }
         Ok(())
@@ -128,7 +150,27 @@ pub fn process_instruction(
     if real_sol_reserves > payload.max_liquidity_lamports {
         return Err(PrecheckError::LiquidityTooHigh.into());
     }
+    validate_liquidity_difference(payload, real_sol_reserves)?;
 
+    Ok(())
+}
+
+#[inline]
+fn validate_liquidity_difference(
+    payload: PrecheckPayloadV1,
+    real_sol_reserves: u64,
+) -> Result<(), ProgramError> {
+    let liquidity_difference = real_sol_reserves as i128 - payload.base_liquidity_lamports as i128;
+    if payload.min_liquidity_difference_lamports > 0
+        && liquidity_difference < payload.min_liquidity_difference_lamports as i128
+    {
+        return Err(PrecheckError::LiquidityDifferenceTooLow.into());
+    }
+    if payload.max_liquidity_difference_lamports > 0
+        && liquidity_difference > payload.max_liquidity_difference_lamports as i128
+    {
+        return Err(PrecheckError::LiquidityDifferenceTooHigh.into());
+    }
     Ok(())
 }
 
@@ -152,6 +194,9 @@ mod tests {
         max_slot_diff: u8,
         min_liquidity_lamports: u64,
         max_liquidity_lamports: u64,
+        base_liquidity_lamports: u64,
+        min_liquidity_difference_lamports: u64,
+        max_liquidity_difference_lamports: u64,
     ) -> [u8; PRECHECK_V1_DATA_LEN] {
         let mut bytes = [0u8; PRECHECK_V1_DATA_LEN];
         bytes[0] = discriminator;
@@ -159,23 +204,29 @@ mod tests {
         bytes[9] = max_slot_diff;
         bytes[10..18].copy_from_slice(&min_liquidity_lamports.to_le_bytes());
         bytes[18..26].copy_from_slice(&max_liquidity_lamports.to_le_bytes());
+        bytes[26..34].copy_from_slice(&base_liquidity_lamports.to_le_bytes());
+        bytes[34..42].copy_from_slice(&min_liquidity_difference_lamports.to_le_bytes());
+        bytes[42..50].copy_from_slice(&max_liquidity_difference_lamports.to_le_bytes());
         bytes
     }
 
     #[test]
     fn parse_and_validate_accepts_valid_payload() {
-        let bytes = payload_bytes(PRECHECK_V1_DISCRIMINATOR, 42, 7, 1_000, 2_000);
+        let bytes = payload_bytes(PRECHECK_V1_DISCRIMINATOR, 42, 7, 1_000, 2_000, 1_500, 10, 20);
         let payload = PrecheckPayloadV1::parse(&bytes).expect("payload should parse");
         assert_eq!(payload.context_slot, 42);
         assert_eq!(payload.max_slot_diff, 7);
         assert_eq!(payload.min_liquidity_lamports, 1_000);
         assert_eq!(payload.max_liquidity_lamports, 2_000);
+        assert_eq!(payload.base_liquidity_lamports, 1_500);
+        assert_eq!(payload.min_liquidity_difference_lamports, 10);
+        assert_eq!(payload.max_liquidity_difference_lamports, 20);
         payload.validate().expect("payload should validate");
     }
 
     #[test]
     fn parse_rejects_invalid_discriminator() {
-        let bytes = payload_bytes(99, 1, 1, 1, 2);
+        let bytes = payload_bytes(99, 1, 1, 1, 2, 0, 0, 0);
         let err = PrecheckPayloadV1::parse(&bytes).expect_err("must fail");
         assert_eq!(err, ProgramError::InvalidInstructionData);
     }
@@ -194,6 +245,9 @@ mod tests {
             max_slot_diff: 0,
             min_liquidity_lamports: 1,
             max_liquidity_lamports: 2,
+            base_liquidity_lamports: 0,
+            min_liquidity_difference_lamports: 0,
+            max_liquidity_difference_lamports: 0,
         };
         let err = payload.validate().expect_err("must fail");
         assert_eq!(err, ProgramError::InvalidInstructionData);
@@ -206,9 +260,72 @@ mod tests {
             max_slot_diff: 1,
             min_liquidity_lamports: 3,
             max_liquidity_lamports: 2,
+            base_liquidity_lamports: 0,
+            min_liquidity_difference_lamports: 0,
+            max_liquidity_difference_lamports: 0,
         };
         let err = payload.validate().expect_err("must fail");
         assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn validate_rejects_invalid_liquidity_difference_range_when_both_enabled() {
+        let payload = PrecheckPayloadV1 {
+            context_slot: 1,
+            max_slot_diff: 1,
+            min_liquidity_lamports: 1,
+            max_liquidity_lamports: 2,
+            base_liquidity_lamports: 1,
+            min_liquidity_difference_lamports: 3,
+            max_liquidity_difference_lamports: 2,
+        };
+        let err = payload.validate().expect_err("must fail");
+        assert_eq!(err, ProgramError::InvalidInstructionData);
+    }
+
+    #[test]
+    fn directional_difference_does_not_use_abs_for_max_check() {
+        let payload = PrecheckPayloadV1 {
+            context_slot: 1,
+            max_slot_diff: 1,
+            min_liquidity_lamports: 1,
+            max_liquidity_lamports: 10_000,
+            base_liquidity_lamports: 2_000,
+            min_liquidity_difference_lamports: 0,
+            max_liquidity_difference_lamports: 100,
+        };
+        let result = validate_liquidity_difference(payload, 1_800);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn directional_difference_rejects_when_below_min() {
+        let payload = PrecheckPayloadV1 {
+            context_slot: 1,
+            max_slot_diff: 1,
+            min_liquidity_lamports: 1,
+            max_liquidity_lamports: 10_000,
+            base_liquidity_lamports: 2_000,
+            min_liquidity_difference_lamports: 100,
+            max_liquidity_difference_lamports: 0,
+        };
+        let err = validate_liquidity_difference(payload, 1_800).expect_err("must fail");
+        assert_eq!(err, ProgramError::Custom(PrecheckError::LiquidityDifferenceTooLow as u32));
+    }
+
+    #[test]
+    fn directional_difference_rejects_when_above_max() {
+        let payload = PrecheckPayloadV1 {
+            context_slot: 1,
+            max_slot_diff: 1,
+            min_liquidity_lamports: 1,
+            max_liquidity_lamports: 10_000,
+            base_liquidity_lamports: 2_000,
+            min_liquidity_difference_lamports: 0,
+            max_liquidity_difference_lamports: 100,
+        };
+        let err = validate_liquidity_difference(payload, 2_200).expect_err("must fail");
+        assert_eq!(err, ProgramError::Custom(PrecheckError::LiquidityDifferenceTooHigh as u32));
     }
 
     #[test]

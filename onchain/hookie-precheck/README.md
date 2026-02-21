@@ -10,6 +10,11 @@ Pinocchio on-chain precheck program for PumpFun buy flow.
   - `max_slot_diff: u8`
   - `min_liquidity_lamports: u64`
   - `max_liquidity_lamports: u64`
+  - `base_liquidity_lamports: u64`
+  - `min_liquidity_difference_lamports: u64` (`0` disables lower-bound check)
+  - `max_liquidity_difference_lamports: u64` (`0` disables upper-bound check)
+- Difference formula:
+  - `liquidity_difference = current_real_sol_reserves - base_liquidity_lamports` (directional, no `abs`)
 - Accounts:
   - `SysvarClock` (readonly)
   - `bonding_curve` (readonly, owner must be PumpFun program `6EF8...`)
@@ -18,6 +23,8 @@ Pinocchio on-chain precheck program for PumpFun buy flow.
   - `LiquidityTooHigh` (`7001`)
   - `ContextSlotDifferenceReached` (`7002`)
   - `InvalidCurveAccount` (`7003`)
+  - `LiquidityDifferenceTooLow` (`7004`)
+  - `LiquidityDifferenceTooHigh` (`7005`)
 
 ## Build
 

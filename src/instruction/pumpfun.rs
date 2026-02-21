@@ -392,6 +392,9 @@ mod tests {
                     max_slot_diff: 5,
                     min_liquidity_lamports: 1_000_000_000,
                     max_liquidity_lamports: 2_000_000_000,
+                    base_liquidity_lamports: 0,
+                    min_liquidity_difference_lamports: 0,
+                    max_liquidity_difference_lamports: 0,
                 })
             } else {
                 None

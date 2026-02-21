@@ -1,4 +1,4 @@
-use solana_sdk::{native_token::sol_str_to_lamports, pubkey::Pubkey};
+use solana_sdk::pubkey::Pubkey;
 
 use crate::{
     instruction::utils::pumpfun::global_constants::{CREATOR_FEE, FEE_BASIS_POINTS},
@@ -53,14 +53,6 @@ pub fn get_buy_token_amount_from_sol_amount(
 
     tokens_received = tokens_received.min(real_token_reserves);
 
-    if tokens_received <= 100 * 1_000_000_u128 {
-        tokens_received = if amount > sol_str_to_lamports("0.01").unwrap_or(0) {
-            25547619 * 1_000_000_u128
-        } else {
-            255476 * 1_000_000_u128
-        };
-    }
-
     tokens_received as u64
 }
 
@@ -107,4 +99,51 @@ pub fn get_sell_sol_amount_from_token_amount(
     let fee = compute_fee(sol_cost, total_fee_basis_points_128);
 
     sol_cost.saturating_sub(fee) as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::instruction::utils::pumpfun::global_constants::{
+        INITIAL_REAL_TOKEN_RESERVES, INITIAL_VIRTUAL_SOL_RESERVES, INITIAL_VIRTUAL_TOKEN_RESERVES,
+    };
+
+    #[test]
+    fn buy_amount_uses_curve_result_without_hardcoded_floor() {
+        let creator = Pubkey::default();
+        let amount_lamports = 20_000_000; // 0.02 SOL
+        let result = get_buy_token_amount_from_sol_amount(
+            INITIAL_VIRTUAL_TOKEN_RESERVES as u128,
+            INITIAL_VIRTUAL_SOL_RESERVES as u128,
+            INITIAL_REAL_TOKEN_RESERVES as u128,
+            creator,
+            amount_lamports,
+        );
+
+        // The curve output for small buys should stay in a realistic range and never exceed real reserves.
+        assert!(result > 0);
+        assert!(result <= INITIAL_REAL_TOKEN_RESERVES);
+        assert!(result < 1_000_000_000_000_000);
+    }
+
+    #[test]
+    fn buy_amount_is_monotonic_by_input_amount() {
+        let creator = Pubkey::default();
+        let small = get_buy_token_amount_from_sol_amount(
+            INITIAL_VIRTUAL_TOKEN_RESERVES as u128,
+            INITIAL_VIRTUAL_SOL_RESERVES as u128,
+            INITIAL_REAL_TOKEN_RESERVES as u128,
+            creator,
+            10_000_000, // 0.01 SOL
+        );
+        let large = get_buy_token_amount_from_sol_amount(
+            INITIAL_VIRTUAL_TOKEN_RESERVES as u128,
+            INITIAL_VIRTUAL_SOL_RESERVES as u128,
+            INITIAL_REAL_TOKEN_RESERVES as u128,
+            creator,
+            100_000_000, // 0.1 SOL
+        );
+
+        assert!(large >= small);
+    }
 }

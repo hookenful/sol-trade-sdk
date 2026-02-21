@@ -61,6 +61,17 @@ pub struct PrecheckConfig {
     pub min_liquidity_lamports: u64,
     /// Maximum allowed bonding curve real SOL reserves.
     pub max_liquidity_lamports: u64,
+    /// Base liquidity snapshot used for directional delta checks.
+    /// For AFK launch flow this should come from creator `is_created_buy` trade event.
+    pub base_liquidity_lamports: u64,
+    /// Minimum allowed directional liquidity delta from `base_liquidity_lamports`.
+    /// Delta formula: `current_real_sol_reserves - base_liquidity_lamports`.
+    /// `0` disables this lower-bound filter.
+    pub min_liquidity_difference_lamports: u64,
+    /// Maximum allowed directional liquidity delta from `base_liquidity_lamports`.
+    /// Delta formula: `current_real_sol_reserves - base_liquidity_lamports`.
+    /// `0` disables this upper-bound filter.
+    pub max_liquidity_difference_lamports: u64,
 }
 
 impl PrecheckConfig {
@@ -72,6 +83,14 @@ impl PrecheckConfig {
         if self.min_liquidity_lamports > self.max_liquidity_lamports {
             return Err(anyhow::anyhow!(
                 "precheck.min_liquidity_lamports must be <= precheck.max_liquidity_lamports"
+            ));
+        }
+        if self.min_liquidity_difference_lamports > 0
+            && self.max_liquidity_difference_lamports > 0
+            && self.min_liquidity_difference_lamports > self.max_liquidity_difference_lamports
+        {
+            return Err(anyhow::anyhow!(
+                "precheck.min_liquidity_difference_lamports must be <= precheck.max_liquidity_difference_lamports when both are > 0"
             ));
         }
         Ok(())
