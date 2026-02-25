@@ -1,3 +1,22 @@
+// Route legacy SDK stdout/stderr prints into tracing so alternate-screen UIs stay stable.
+macro_rules! println {
+    () => {{
+        tracing::info!("")
+    }};
+    ($($arg:tt)*) => {{
+        tracing::info!("{}", format_args!($($arg)*))
+    }};
+}
+
+macro_rules! eprintln {
+    () => {{
+        tracing::warn!("")
+    }};
+    ($($arg:tt)*) => {{
+        tracing::warn!("{}", format_args!($($arg)*))
+    }};
+}
+
 pub mod common;
 pub mod constants;
 pub mod instruction;
@@ -7,7 +26,7 @@ pub mod trading;
 pub mod utils;
 use crate::common::nonce_cache::DurableNonceInfo;
 use crate::common::GasFeeStrategy;
-use crate::common::{TradeConfig, InfrastructureConfig};
+use crate::common::{InfrastructureConfig, TradeConfig};
 #[cfg(feature = "perf-trace")]
 use crate::constants::trade::trade::DEFAULT_SLIPPAGE;
 use crate::constants::SOL_TOKEN_ACCOUNT;
@@ -19,12 +38,12 @@ use crate::swqos::SwqosClient;
 use crate::swqos::SwqosConfig;
 use crate::swqos::TradeType;
 use crate::trading::core::params::BonkParams;
+use crate::trading::core::params::DexParamEnum;
 use crate::trading::core::params::MeteoraDammV2Params;
 use crate::trading::core::params::PumpFunParams;
 use crate::trading::core::params::PumpSwapParams;
 use crate::trading::core::params::RaydiumAmmV4Params;
 use crate::trading::core::params::RaydiumCpmmParams;
-use crate::trading::core::params::DexParamEnum;
 use crate::trading::factory::DexType;
 use crate::trading::MiddlewareManager;
 use crate::trading::SwapParams;
@@ -140,14 +159,19 @@ impl TradingInfrastructure {
         for swqos in &config.swqos_configs {
             // Check blacklist, skip disabled providers
             if swqos.is_blacklisted() {
-                eprintln!("\u{26a0}\u{fe0f} SWQOS {:?} is blacklisted, skipping", swqos.swqos_type());
+                eprintln!(
+                    "\u{26a0}\u{fe0f} SWQOS {:?} is blacklisted, skipping",
+                    swqos.swqos_type()
+                );
                 continue;
             }
             match SwqosConfig::get_swqos_client(
                 config.rpc_url.clone(),
                 config.commitment.clone(),
                 swqos.clone(),
-            ).await {
+            )
+            .await
+            {
                 Ok(swqos_client) => swqos_clients.push(swqos_client),
                 Err(err) => eprintln!(
                     "failed to create {:?} swqos client: {err}. Excluding from swqos list",
@@ -156,11 +180,7 @@ impl TradingInfrastructure {
             }
         }
 
-        Self {
-            rpc,
-            swqos_clients,
-            config,
-        }
+        Self { rpc, swqos_clients, config }
     }
 }
 
@@ -313,12 +333,7 @@ impl TradingClient {
         // Initialize wallet-specific caches (fast, synchronous)
         crate::common::fast_fn::fast_init(&payer.pubkey());
 
-        Self {
-            payer,
-            infrastructure,
-            middleware_manager: None,
-            use_seed_optimize,
-        }
+        Self { payer, infrastructure, middleware_manager: None, use_seed_optimize }
     }
 
     /// Create a TradingClient from shared infrastructure with optional WSOL ATA setup
@@ -348,22 +363,16 @@ impl TradingClient {
             println!("ℹ️ WSOL ATA 创建已在后台启动，不阻塞机器人启动");
         }
 
-        Self {
-            payer,
-            infrastructure,
-            middleware_manager: None,
-            use_seed_optimize,
-        }
+        Self { payer, infrastructure, middleware_manager: None, use_seed_optimize }
     }
 
     /// Helper to ensure WSOL ATA exists for a wallet
     async fn ensure_wsol_ata(payer: &Arc<Keypair>, rpc: &Arc<SolanaRpcClient>) {
-        let wsol_ata =
-            crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
-                &payer.pubkey(),
-                &WSOL_TOKEN_ACCOUNT,
-                &crate::constants::TOKEN_PROGRAM,
-            );
+        let wsol_ata = crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
+            &payer.pubkey(),
+            &WSOL_TOKEN_ACCOUNT,
+            &crate::constants::TOKEN_PROGRAM,
+        );
 
         match rpc.get_account(&wsol_ata).await {
             Ok(_) => {
@@ -408,8 +417,9 @@ impl TradingClient {
                         // 使用超时包装 send_and_confirm_transaction
                         let send_result = tokio::time::timeout(
                             tokio::time::Duration::from_secs(TIMEOUT_SECS),
-                            rpc.send_and_confirm_transaction(&tx)
-                        ).await;
+                            rpc.send_and_confirm_transaction(&tx),
+                        )
+                        .await;
 
                         match send_result {
                             Ok(Ok(signature)) => {
@@ -453,10 +463,7 @@ impl TradingClient {
                         eprintln!("      3. 检查RPC节点连接");
                         eprintln!("   ⚠️ 程序将在5秒后退出，请解决上述问题后重启");
                         std::thread::sleep(std::time::Duration::from_secs(5));
-                        panic!(
-                            "❌ WSOL ATA创建失败且账户不存在: {}. 错误: {}",
-                            wsol_ata, err
-                        );
+                        panic!("❌ WSOL ATA创建失败且账户不存在: {}. 错误: {}", wsol_ata, err);
                     }
                 } else {
                     println!("ℹ️ WSOL ATA已存在（无需创建）");
@@ -929,8 +936,10 @@ impl TradingClient {
     /// - 交易执行或确认失败
     /// - 网络或 RPC 错误
     pub async fn wrap_wsol_to_sol(&self, amount: u64) -> Result<String, anyhow::Error> {
-        use crate::trading::common::wsol_manager::{wrap_wsol_to_sol as wrap_wsol_to_sol_internal, wrap_wsol_to_sol_without_create};
         use crate::common::seed::get_associated_token_address_with_program_id_use_seed;
+        use crate::trading::common::wsol_manager::{
+            wrap_wsol_to_sol as wrap_wsol_to_sol_internal, wrap_wsol_to_sol_without_create,
+        };
         use solana_sdk::transaction::Transaction;
 
         // 检查临时seed账户是否已存在
@@ -951,7 +960,8 @@ impl TradingClient {
         };
 
         let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
-        let mut transaction = Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
+        let mut transaction =
+            Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
         transaction.sign(&[&*self.payer], recent_blockhash);
         let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
         Ok(signature.to_string())
@@ -967,8 +977,10 @@ impl TradingClient {
     /// * `Err(anyhow::Error)` - Build or send failure (e.g. invalid PDA)
     pub async fn claim_cashback_pumpfun(&self) -> Result<String, anyhow::Error> {
         use solana_sdk::transaction::Transaction;
-        let ix = crate::instruction::pumpfun::claim_cashback_pumpfun_instruction(&self.payer.pubkey())
-            .ok_or_else(|| anyhow::anyhow!("Failed to build PumpFun claim_cashback instruction"))?;
+        let ix = crate::instruction::pumpfun::claim_cashback_pumpfun_instruction(
+            &self.payer.pubkey(),
+        )
+        .ok_or_else(|| anyhow::anyhow!("Failed to build PumpFun claim_cashback instruction"))?;
         let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
         let mut transaction = Transaction::new_with_payer(&[ix], Some(&self.payer.pubkey()));
         transaction.sign(&[&*self.payer], recent_blockhash);
@@ -986,21 +998,24 @@ impl TradingClient {
     /// * `Err(anyhow::Error)` - Build or send failure
     pub async fn claim_cashback_pumpswap(&self) -> Result<String, anyhow::Error> {
         use solana_sdk::transaction::Transaction;
-        let mut instructions = crate::common::fast_fn::create_associated_token_account_idempotent_fast_use_seed(
-            &self.payer.pubkey(),
-            &self.payer.pubkey(),
-            &WSOL_TOKEN_ACCOUNT,
-            &crate::constants::TOKEN_PROGRAM,
-            self.use_seed_optimize,
-        );
+        let mut instructions =
+            crate::common::fast_fn::create_associated_token_account_idempotent_fast_use_seed(
+                &self.payer.pubkey(),
+                &self.payer.pubkey(),
+                &WSOL_TOKEN_ACCOUNT,
+                &crate::constants::TOKEN_PROGRAM,
+                self.use_seed_optimize,
+            );
         let ix = crate::instruction::pumpswap::claim_cashback_pumpswap_instruction(
             &self.payer.pubkey(),
             WSOL_TOKEN_ACCOUNT,
             crate::constants::TOKEN_PROGRAM,
-        ).ok_or_else(|| anyhow::anyhow!("Failed to build PumpSwap claim_cashback instruction"))?;
+        )
+        .ok_or_else(|| anyhow::anyhow!("Failed to build PumpSwap claim_cashback instruction"))?;
         instructions.push(ix);
         let recent_blockhash = self.infrastructure.rpc.get_latest_blockhash().await?;
-        let mut transaction = Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
+        let mut transaction =
+            Transaction::new_with_payer(&instructions, Some(&self.payer.pubkey()));
         transaction.sign(&[&*self.payer], recent_blockhash);
         let signature = self.infrastructure.rpc.send_and_confirm_transaction(&transaction).await?;
         Ok(signature.to_string())
