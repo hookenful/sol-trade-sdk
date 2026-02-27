@@ -90,7 +90,7 @@ impl ResultCollector {
     async fn wait_for_success(&self) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>)> {
         let start = Instant::now();
         let timeout = std::time::Duration::from_secs(5);
-        let poll_interval = std::time::Duration::from_millis(1000);
+        let poll_interval = std::time::Duration::from_millis(100);
 
         loop {
             if self.success_flag.load(Ordering::Acquire) {

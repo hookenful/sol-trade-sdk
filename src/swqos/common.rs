@@ -109,7 +109,7 @@ pub async fn poll_any_transaction_confirmation(
     }
 
     let timeout: Duration = Duration::from_secs(15);
-    let interval: Duration = Duration::from_millis(1000);
+    let interval: Duration = Duration::from_millis(100);
     let start: Instant = Instant::now();
     let mut poll_count = 0u32;
     // Track which signature landed (confirmed or failed on-chain)
