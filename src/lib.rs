@@ -225,6 +225,8 @@ pub struct TradingClient {
     pub use_core_affinity: bool,
     /// Whether to output all SDK logs (from TradeConfig.log_enabled).
     pub log_enabled: bool,
+    /// Whether to check minimum tip per SWQOS (from TradeConfig.check_min_tip). Default false for lower latency.
+    pub check_min_tip: bool,
 }
 
 static INSTANCE: Mutex<Option<Arc<TradingClient>>> = Mutex::new(None);
@@ -241,6 +243,7 @@ impl Clone for TradingClient {
             use_seed_optimize: self.use_seed_optimize,
             use_core_affinity: self.use_core_affinity,
             log_enabled: self.log_enabled,
+            check_min_tip: self.check_min_tip,
         }
     }
 }
@@ -371,6 +374,7 @@ impl TradingClient {
             use_seed_optimize,
             use_core_affinity: true,
             log_enabled: true,
+            check_min_tip: false,
         }
     }
 
@@ -410,6 +414,7 @@ impl TradingClient {
             use_seed_optimize,
             use_core_affinity: true,
             log_enabled: true,
+            check_min_tip: false,
         }
     }
 
@@ -570,6 +575,7 @@ impl TradingClient {
             use_seed_optimize: trade_config.use_seed_optimize,
             use_core_affinity: trade_config.use_core_affinity,
             log_enabled: trade_config.log_enabled,
+            check_min_tip: trade_config.check_min_tip,
         };
 
         let mut current = INSTANCE.lock();
@@ -703,6 +709,7 @@ impl TradingClient {
             simulate: params.simulate,
             log_enabled: self.log_enabled,
             use_core_affinity: self.use_core_affinity,
+            check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: params.use_exact_sol_amount,
             precheck: params.precheck,
@@ -800,6 +807,7 @@ impl TradingClient {
             simulate: params.simulate,
             log_enabled: self.log_enabled,
             use_core_affinity: self.use_core_affinity,
+            check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: None,
             precheck: None,

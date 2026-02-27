@@ -72,6 +72,8 @@ pub struct SwapParams {
     pub log_enabled: bool,
     /// Whether to pin parallel submit tasks to cores (from TradeConfig.use_core_affinity).
     pub use_core_affinity: bool,
+    /// Whether to check minimum tip per SWQOS (from TradeConfig.check_min_tip). When false, skip filter for lower latency.
+    pub check_min_tip: bool,
     /// Optional event receive time in microseconds (same scale as sol-parser-sdk clock::now_micros). Used as timing start when log_enabled.
     pub grpc_recv_us: Option<i64>,
     /// Use exact SOL amount instructions (buy_exact_sol_in for PumpFun, buy_exact_quote_in for PumpSwap).
@@ -279,6 +281,7 @@ impl PumpSwapParams {
         base_token_program: Pubkey,
         quote_token_program: Pubkey,
         fee_recipient: Pubkey,
+        is_cashback_coin: bool,
     ) -> Self {
         let is_mayhem_mode = fee_recipient == MAYHEM_FEE_RECIPIENT_SWAP;
         Self {
@@ -294,8 +297,49 @@ impl PumpSwapParams {
             base_token_program,
             quote_token_program,
             is_mayhem_mode,
-            is_cashback_coin: false,
+            is_cashback_coin,
         }
+    }
+
+    /// Fast-path constructor for building PumpSwap parameters directly from decoded
+    /// trade/event data and the accompanying instruction accounts, avoiding RPC
+    /// lookups and associated latency. Token program IDs should be sourced from
+    /// the instruction accounts themselves to respect Token Program vs Token-2022
+    /// differences.
+    ///
+    /// When building from event/parser (e.g. sol-parser-sdk), pass `is_cashback_coin`
+    /// from the event so that buy/sell instructions include the correct remaining
+    /// accounts for cashback.
+    pub fn from_trade(
+        pool: Pubkey,
+        base_mint: Pubkey,
+        quote_mint: Pubkey,
+        pool_base_token_account: Pubkey,
+        pool_quote_token_account: Pubkey,
+        pool_base_token_reserves: u64,
+        pool_quote_token_reserves: u64,
+        coin_creator_vault_ata: Pubkey,
+        coin_creator_vault_authority: Pubkey,
+        base_token_program: Pubkey,
+        quote_token_program: Pubkey,
+        fee_recipient: Pubkey,
+        is_cashback_coin: bool,
+    ) -> Self {
+        Self::new(
+            pool,
+            base_mint,
+            quote_mint,
+            pool_base_token_account,
+            pool_quote_token_account,
+            pool_base_token_reserves,
+            pool_quote_token_reserves,
+            coin_creator_vault_ata,
+            coin_creator_vault_authority,
+            base_token_program,
+            quote_token_program,
+            fee_recipient,
+            is_cashback_coin,
+        )
     }
 
     pub async fn from_mint_by_rpc(

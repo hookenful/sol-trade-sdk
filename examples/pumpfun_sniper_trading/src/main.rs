@@ -27,7 +27,6 @@ static ALREADY_EXECUTED: AtomicBool = AtomicBool::new(false);
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
     println!("PumpFun 狙击示例（sol-parser-sdk gRPC）...");
 
     let config = ClientConfig {
@@ -148,6 +147,7 @@ async fn pumpfun_sniper_trade(
         simulate: false,
         use_exact_sol_amount: None,
         precheck: None,
+        grpc_recv_us: None,
     };
     client.buy(buy_params).await?;
 
@@ -189,6 +189,7 @@ async fn pumpfun_sniper_trade(
         fixed_output_token_amount: None,
         gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     client.sell(sell_params).await?;
 

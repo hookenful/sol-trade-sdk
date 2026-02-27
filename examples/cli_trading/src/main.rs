@@ -636,6 +636,7 @@ async fn handle_buy_pumpfun(
         simulate: false,
         use_exact_sol_amount: None,
         precheck: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -692,6 +693,7 @@ async fn handle_buy_pumpswap(
         simulate: false,
         use_exact_sol_amount: None,
         precheck: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -747,6 +749,7 @@ async fn handle_buy_bonk(
         simulate: false,
         use_exact_sol_amount: None,
         precheck: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -806,6 +809,7 @@ async fn handle_buy_raydium_v4(
         simulate: false,
         use_exact_sol_amount: None,
         precheck: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -865,6 +869,7 @@ async fn handle_buy_raydium_cpmm(
         simulate: false,
         use_exact_sol_amount: None,
         precheck: None,
+        grpc_recv_us: None,
     };
     match client.buy(buy_params).await {
         Ok((_, signature, _)) => {
@@ -1033,6 +1038,7 @@ async fn handle_sell_pumpfun(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
 
     match client.sell(sell_params).await {
@@ -1091,6 +1097,7 @@ async fn handle_sell_pumpswap(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
@@ -1148,6 +1155,7 @@ async fn handle_sell_bonk(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
@@ -1208,6 +1216,7 @@ async fn handle_sell_raydium_v4(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
@@ -1268,6 +1277,7 @@ async fn handle_sell_raydium_cpmm(
         fixed_output_token_amount: None,
         gas_fee_strategy: gas_fee_strategy,
         simulate: false,
+        grpc_recv_us: None,
     };
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
