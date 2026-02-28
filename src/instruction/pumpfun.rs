@@ -9,9 +9,9 @@ use crate::{
 use crate::{
     instruction::utils::pumpfun::{
         accounts, get_bonding_curve_pda, get_bonding_curve_v2_pda, get_creator,
-        get_user_volume_accumulator_pda, global_constants::{self},
-        BUY_DISCRIMINATOR,
-        BUY_EXACT_SOL_IN_DISCRIMINATOR,
+        get_user_volume_accumulator_pda,
+        global_constants::{self},
+        BUY_DISCRIMINATOR, BUY_EXACT_SOL_IN_DISCRIMINATOR,
     },
     utils::calc::{
         common::{calculate_with_slippage_buy, calculate_with_slippage_sell},
@@ -179,11 +179,7 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         ];
         accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // bonding_curve_v2 (readonly) at end
 
-        instructions.push(Instruction::new_with_bytes(
-            accounts::PUMPFUN,
-            &buy_data,
-            accounts,
-        ));
+        instructions.push(Instruction::new_with_bytes(accounts::PUMPFUN, &buy_data, accounts));
 
         Ok(instructions)
     }
@@ -390,6 +386,10 @@ mod tests {
             fixed_output_amount: None,
             gas_fee_strategy: GasFeeStrategy::new(),
             simulate: true,
+            log_enabled: false,
+            use_core_affinity: false,
+            check_min_tip: false,
+            grpc_recv_us: None,
             use_exact_sol_amount: Some(true),
             precheck: if with_precheck {
                 Some(PrecheckConfig {
