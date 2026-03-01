@@ -111,13 +111,33 @@ impl TradeExecutor for GenericTradeExecutor {
             if crate::common::sdk_log::sdk_log_enabled() {
                 let dir = if is_buy { "Buy" } else { "Sell" };
                 if let (Some(start_us), Some(end_us)) = (timing_start_us, build_end_us) {
-                    println!(" [SDK] {} build_instructions: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                    tracing::info!(
+                        target: "sol_trade_sdk",
+                        " [SDK] {} build_instructions: {:.4} ms",
+                        dir,
+                        (end_us - start_us) as f64 / 1000.0
+                    );
                 }
                 if let (Some(start_us), Some(end_us)) = (timing_start_us, before_submit_us) {
-                    println!(" [SDK] {} before_submit: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                    tracing::info!(
+                        target: "sol_trade_sdk",
+                        " [SDK] {} before_submit: {:.4} ms",
+                        dir,
+                        (end_us - start_us) as f64 / 1000.0
+                    );
                 }
-                println!(" [SDK] {} simulate (dry-run): {:.4} ms", dir, send_elapsed.as_secs_f64() * 1000.0);
-                println!(" [SDK] {} total: {:.4} ms", dir, total_elapsed.as_secs_f64() * 1000.0);
+                tracing::info!(
+                    target: "sol_trade_sdk",
+                    " [SDK] {} simulate (dry-run): {:.4} ms",
+                    dir,
+                    send_elapsed.as_secs_f64() * 1000.0
+                );
+                tracing::info!(
+                    target: "sol_trade_sdk",
+                    " [SDK] {} total: {:.4} ms",
+                    dir,
+                    total_elapsed.as_secs_f64() * 1000.0
+                );
             }
 
             return result;
@@ -166,23 +186,41 @@ impl TradeExecutor for GenericTradeExecutor {
                 let poll_res = poll_any_transaction_confirmation(rpc, &sigs, true).await;
                 let confirm_done_us = log_enabled.then(crate::common::clock::now_micros);
                 if log_enabled {
-                    let dir = if is_buy { "Buy" } else { "Sell" };
-                    if let Some(start_us) = timing_start_us {
-                        if let Some(end_us) = build_end_us {
-                            println!(" [SDK] {} build_instructions: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
-                        }
-                        if let Some(end_us) = before_submit_us {
-                            println!(" [SDK] {} before_submit: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
-                        }
-                        if let Some(confirm_us) = confirm_done_us {
-                            let total_ms = (confirm_us - start_us) as f64 / 1000.0;
-                            for (swqos_type, submit_done_us) in &submit_timings {
-                                let submit_ms = (*submit_done_us - start_us).max(0) as f64 / 1000.0;
-                                let confirmed_ms = (confirm_us - *submit_done_us).max(0) as f64 / 1000.0;
-                                println!(" [SDK] {} {:?} submit: {:.4} ms, confirmed: {:.4} ms, total: {:.4} ms", dir, swqos_type, submit_ms, confirmed_ms, total_ms);
+                        let dir = if is_buy { "Buy" } else { "Sell" };
+                        if let Some(start_us) = timing_start_us {
+                            if let Some(end_us) = build_end_us {
+                                tracing::info!(
+                                    target: "sol_trade_sdk",
+                                    " [SDK] {} build_instructions: {:.4} ms",
+                                    dir,
+                                    (end_us - start_us) as f64 / 1000.0
+                                );
+                            }
+                            if let Some(end_us) = before_submit_us {
+                                tracing::info!(
+                                    target: "sol_trade_sdk",
+                                    " [SDK] {} before_submit: {:.4} ms",
+                                    dir,
+                                    (end_us - start_us) as f64 / 1000.0
+                                );
+                            }
+                            if let Some(confirm_us) = confirm_done_us {
+                                let total_ms = (confirm_us - start_us) as f64 / 1000.0;
+                                for (swqos_type, submit_done_us) in &submit_timings {
+                                    let submit_ms = (*submit_done_us - start_us).max(0) as f64 / 1000.0;
+                                    let confirmed_ms = (confirm_us - *submit_done_us).max(0) as f64 / 1000.0;
+                                    tracing::info!(
+                                        target: "sol_trade_sdk",
+                                        " [SDK] {} {:?} submit: {:.4} ms, confirmed: {:.4} ms, total: {:.4} ms",
+                                        dir,
+                                        swqos_type,
+                                        submit_ms,
+                                        confirmed_ms,
+                                        total_ms
+                                    );
+                                }
                             }
                         }
-                    }
                 }
                 match poll_res {
                     Ok(_) => (true, sigs, None),
@@ -198,14 +236,31 @@ impl TradeExecutor for GenericTradeExecutor {
                 let dir = if is_buy { "Buy" } else { "Sell" };
                 if let Some(start_us) = timing_start_us {
                     if let Some(end_us) = build_end_us {
-                        println!(" [SDK] {} build_instructions: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                        tracing::info!(
+                            target: "sol_trade_sdk",
+                            " [SDK] {} build_instructions: {:.4} ms",
+                            dir,
+                            (end_us - start_us) as f64 / 1000.0
+                        );
                     }
                     if let Some(end_us) = before_submit_us {
-                        println!(" [SDK] {} before_submit: {:.4} ms", dir, (end_us - start_us) as f64 / 1000.0);
+                        tracing::info!(
+                            target: "sol_trade_sdk",
+                            " [SDK] {} before_submit: {:.4} ms",
+                            dir,
+                            (end_us - start_us) as f64 / 1000.0
+                        );
                     }
                     for (swqos_type, submit_done_us) in &submit_timings {
                         let submit_ms = (*submit_done_us - start_us).max(0) as f64 / 1000.0;
-                        println!(" [SDK] {} {:?} submit: {:.4} ms, confirmed: -, total: {:.4} ms", dir, swqos_type, submit_ms, submit_ms);
+                        tracing::info!(
+                            target: "sol_trade_sdk",
+                            " [SDK] {} {:?} submit: {:.4} ms, confirmed: -, total: {:.4} ms",
+                            dir,
+                            swqos_type,
+                            submit_ms,
+                            submit_ms
+                        );
                     }
                 }
             }

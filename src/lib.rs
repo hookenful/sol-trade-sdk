@@ -372,7 +372,7 @@ impl TradingClient {
             infrastructure,
             middleware_manager: None,
             use_seed_optimize,
-            use_core_affinity: true,
+            use_core_affinity: false,
             log_enabled: true,
             check_min_tip: false,
         }
@@ -412,7 +412,7 @@ impl TradingClient {
             infrastructure,
             middleware_manager: None,
             use_seed_optimize,
-            use_core_affinity: true,
+            use_core_affinity: false,
             log_enabled: true,
             check_min_tip: false,
         }

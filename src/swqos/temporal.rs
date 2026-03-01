@@ -106,7 +106,7 @@ impl TemporalClient {
         let handle = tokio::spawn(async move {
             // Immediate first ping to warm connection and reduce first-submit cold start latency
             if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                eprintln!("Temporal ping request failed: {}", e);
+                tracing::warn!(target: "sol_trade_sdk", "Temporal ping request failed: {}", e);
             }
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -115,7 +115,7 @@ impl TemporalClient {
                     break;
                 }
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    eprintln!("Temporal ping request failed: {}", e);
+                    tracing::warn!(target: "sol_trade_sdk", "Temporal ping request failed: {}", e);
                 }
             }
         });
@@ -147,7 +147,11 @@ impl TemporalClient {
         let status = response.status();
         let _ = response.bytes().await;
         if !status.is_success() {
-            eprintln!("Temporal ping request returned non-success status: {}", status);
+            tracing::warn!(
+                target: "sol_trade_sdk",
+                "Temporal ping request returned non-success status: {}",
+                status
+            );
         }
         Ok(())
     }
@@ -182,26 +186,52 @@ impl TemporalClient {
 
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if response_json.get("result").is_some() {
-                println!(" [nozomi] {} submitted: {:?}", trade_type, start_time.elapsed());
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    tracing::info!(
+                        target: "sol_trade_sdk",
+                        " [nozomi] {} submitted: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
+                }
             } else if let Some(_error) = response_json.get("error") {
                 // eprintln!("nozomi transaction submission failed: {:?}", _error);
             }
         } else {
-            eprintln!(" [nozomi] {} submission failed: {:?}", trade_type, response_text);
+            if crate::common::sdk_log::sdk_log_enabled() {
+                tracing::warn!(
+                    target: "sol_trade_sdk",
+                    " [nozomi] {} submission failed: {:?}",
+                    trade_type,
+                    response_text
+                );
+            }
         }
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [nozomi] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [nozomi] {} confirmation failed: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
+                }
                 return Err(e);
             },
         }
-        if wait_confirmation {
-            println!(" signature: {:?}", signature);
-            println!(" [nozomi] {} confirmed: {:?}", trade_type, start_time.elapsed());
+        if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
+            tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+            tracing::info!(
+                target: "sol_trade_sdk",
+                " [nozomi] {} confirmed: {:?}",
+                trade_type,
+                start_time.elapsed()
+            );
         }
 
         Ok(())

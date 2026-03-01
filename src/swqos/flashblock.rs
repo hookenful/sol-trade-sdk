@@ -75,26 +75,59 @@ impl FlashBlockClient {
         // Parse response
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if response_json.get("success").is_some() || response_json.get("result").is_some() {
-                println!(" [FlashBlock] {} submitted: {:?}", trade_type, start_time.elapsed());
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    tracing::info!(
+                        target: "sol_trade_sdk",
+                        " [FlashBlock] {} submitted: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
+                }
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [FlashBlock] {} submission failed: {:?}", trade_type, _error);
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [FlashBlock] {} submission failed: {:?}",
+                        trade_type,
+                        _error
+                    );
+                }
             }
         } else {
-            eprintln!(" [FlashBlock] {} submission failed: {:?}", trade_type, response_text);
+            if crate::common::sdk_log::sdk_log_enabled() {
+                tracing::warn!(
+                    target: "sol_trade_sdk",
+                    " [FlashBlock] {} submission failed: {:?}",
+                    trade_type,
+                    response_text
+                );
+            }
         }
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [FlashBlock] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [FlashBlock] {} confirmation failed: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
+                }
                 return Err(e);
             },
         }
-        if wait_confirmation {
-            println!(" signature: {:?}", signature);
-            println!(" [FlashBlock] {} confirmed: {:?}", trade_type, start_time.elapsed());
+        if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
+            tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+            tracing::info!(
+                target: "sol_trade_sdk",
+                " [FlashBlock] {} confirmed: {:?}",
+                trade_type,
+                start_time.elapsed()
+            );
         }
 
         Ok(())

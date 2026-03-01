@@ -108,7 +108,7 @@ impl HeliusClient {
 
         if !status.is_success() {
             if crate::common::sdk_log::sdk_log_enabled() {
-                eprintln!(
+                tracing::warn!(
                     " [helius] {} submission failed status={} body={}",
                     trade_type, status, response_text
                 );
@@ -127,19 +127,24 @@ impl HeliusClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown");
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!(" [helius] {} submission error: {}", trade_type, err_msg);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [helius] {} submission error: {}",
+                        trade_type,
+                        err_msg
+                    );
                 }
                 return Err(anyhow::anyhow!("Helius Sender error: {}", err_msg));
             }
             if response_json.get("result").is_some() && crate::common::sdk_log::sdk_log_enabled() {
-                println!(
+                tracing::info!(
                     " [helius] {} submitted: {:?}",
                     trade_type,
                     start_time.elapsed()
                 );
             }
         } else if crate::common::sdk_log::sdk_log_enabled() {
-            eprintln!(
+            tracing::warn!(
                 " [helius] {} submission failed: {:?}",
                 trade_type, response_text
             );
@@ -149,7 +154,7 @@ impl HeliusClient {
             Ok(_) => (),
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!(
+                    tracing::warn!(
                         " [helius] {} confirmation failed: {:?}",
                         trade_type,
                         start_time.elapsed()
@@ -159,11 +164,11 @@ impl HeliusClient {
             }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-            println!(
+            tracing::info!(
                 " signature: {:?}",
                 signature
             );
-            println!(
+            tracing::info!(
                 " [helius] {} confirmed: {:?}",
                 trade_type,
                 start_time.elapsed()

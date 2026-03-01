@@ -80,7 +80,7 @@ impl BlockRazorClient {
             // Immediate first ping to warm connection and reduce first-submit cold start latency
             if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!("BlockRazor ping request failed: {}", e);
+                    tracing::warn!(target: "sol_trade_sdk", "BlockRazor ping request failed: {}", e);
                 }
             }
             let mut interval = tokio::time::interval(Duration::from_secs(30));  // 30s keepalive to avoid server ~5min idle close
@@ -91,7 +91,7 @@ impl BlockRazorClient {
                 }
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
                     if crate::common::sdk_log::sdk_log_enabled() {
-                        eprintln!("BlockRazor ping request failed: {}", e);
+                        tracing::warn!(target: "sol_trade_sdk", "BlockRazor ping request failed: {}", e);
                     }
                 }
             }
@@ -121,7 +121,11 @@ impl BlockRazorClient {
         let status = response.status();
         let _ = response.bytes().await;
         if !status.is_success() {
-            eprintln!("BlockRazor ping request failed with status: {}", status);
+            tracing::warn!(
+                target: "sol_trade_sdk",
+                "BlockRazor ping request failed with status: {}",
+                status
+            );
         }
         Ok(())
     }
@@ -143,11 +147,21 @@ impl BlockRazorClient {
         let _ = response.bytes().await;
         if status.is_success() {
             if crate::common::sdk_log::sdk_log_enabled() {
-                println!(" [blockrazor] {} submitted: {:?}", trade_type, start_time.elapsed());
+                tracing::info!(
+                    target: "sol_trade_sdk",
+                    " [blockrazor] {} submitted: {:?}",
+                    trade_type,
+                    start_time.elapsed()
+                );
             }
         } else {
             if crate::common::sdk_log::sdk_log_enabled() {
-                eprintln!(" [blockrazor] {} submission failed: status {}", trade_type, status);
+                tracing::warn!(
+                    target: "sol_trade_sdk",
+                    " [blockrazor] {} submission failed: status {}",
+                    trade_type,
+                    status
+                );
             }
             return Err(anyhow::anyhow!("BlockRazor sendTransaction failed: {}", status));
         }
@@ -157,15 +171,25 @@ impl BlockRazorClient {
             Ok(_) => (),
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    println!(" signature: {:?}", signature);
-                    println!(" [blockrazor] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                    tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [blockrazor] {} confirmation failed: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
                 }
                 return Err(e);
             },
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-            println!(" signature: {:?}", signature);
-            println!(" [blockrazor] {} confirmed: {:?}", trade_type, start_time.elapsed());
+            tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+            tracing::info!(
+                target: "sol_trade_sdk",
+                " [blockrazor] {} confirmed: {:?}",
+                trade_type,
+                start_time.elapsed()
+            );
         }
 
         Ok(())

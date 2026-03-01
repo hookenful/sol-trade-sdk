@@ -87,7 +87,7 @@ impl AstralaneClient {
                     break;
                 }
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                    eprintln!("Astralane ping request failed: {}", e);
+                    tracing::warn!(target: "sol_trade_sdk", "Astralane ping request failed: {}", e);
                 }
             }
         });
@@ -114,7 +114,11 @@ impl AstralaneClient {
         let status = response.status();
         let _ = response.bytes().await; // consume body so connection returns to pool
         if !status.is_success() {
-            eprintln!("Astralane ping request returned non-success status: {}", status);
+            tracing::warn!(
+                target: "sol_trade_sdk",
+                "Astralane ping request returned non-success status: {}",
+                status
+            );
         }
         Ok(())
     }
@@ -137,9 +141,23 @@ impl AstralaneClient {
         let status = response.status();
         let _ = response.bytes().await;
         if status.is_success() {
-            println!(" [astralane] {} submitted: {:?}", trade_type, start_time.elapsed());
+            if crate::common::sdk_log::sdk_log_enabled() {
+                tracing::info!(
+                    target: "sol_trade_sdk",
+                    " [astralane] {} submitted: {:?}",
+                    trade_type,
+                    start_time.elapsed()
+                );
+            }
         } else {
-            eprintln!(" [astralane] {} submission failed: status {}", trade_type, status);
+            if crate::common::sdk_log::sdk_log_enabled() {
+                tracing::warn!(
+                    target: "sol_trade_sdk",
+                    " [astralane] {} submission failed: status {}",
+                    trade_type,
+                    status
+                );
+            }
             return Err(anyhow::anyhow!("Astralane sendTransaction failed: {}", status));
         }
 
@@ -147,14 +165,26 @@ impl AstralaneClient {
         match poll_transaction_confirmation(&self.rpc_client, *signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [astralane] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [astralane] {} confirmation failed: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
+                }
                 return Err(e);
             },
         }
-        if wait_confirmation {
-            println!(" signature: {:?}", signature);
-            println!(" [astralane] {} confirmed: {:?}", trade_type, start_time.elapsed());
+        if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
+            tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+            tracing::info!(
+                target: "sol_trade_sdk",
+                " [astralane] {} confirmed: {:?}",
+                trade_type,
+                start_time.elapsed()
+            );
         }
 
         Ok(())

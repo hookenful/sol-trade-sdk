@@ -83,7 +83,11 @@ impl StelliumClient {
                 let status = resp.status();
                 let _ = resp.bytes().await;
                 if !status.is_success() && crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!(" [Stellium] Ping failed with status: {}", status);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [Stellium] Ping failed with status: {}",
+                        status
+                    );
                 }
             }
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -98,12 +102,20 @@ impl StelliumClient {
                         let status = response.status();
                         let _ = response.bytes().await;
                         if !status.is_success() && crate::common::sdk_log::sdk_log_enabled() {
-                            eprintln!(" [Stellium] Ping failed with status: {}", status);
+                            tracing::warn!(
+                                target: "sol_trade_sdk",
+                                " [Stellium] Ping failed with status: {}",
+                                status
+                            );
                         }
                     }
                     Err(e) => {
                         if crate::common::sdk_log::sdk_log_enabled() {
-                            eprintln!(" [Stellium] Ping request error: {:?}", e);
+                            tracing::warn!(
+                                target: "sol_trade_sdk",
+                                " [Stellium] Ping request error: {:?}",
+                                e
+                            );
                         }
                     }
                 }
@@ -144,13 +156,28 @@ impl StelliumClient {
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if crate::common::sdk_log::sdk_log_enabled() {
                 if response_json.get("result").is_some() {
-                    println!(" [Stellium] {} submitted: {:?}", trade_type, start_time.elapsed());
+                    tracing::info!(
+                        target: "sol_trade_sdk",
+                        " [Stellium] {} submitted: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
                 } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(" [Stellium] {} submission failed: {:?}", trade_type, _error);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [Stellium] {} submission failed: {:?}",
+                        trade_type,
+                        _error
+                    );
                 }
             }
         } else if crate::common::sdk_log::sdk_log_enabled() {
-            eprintln!(" [Stellium] {} submission failed: {:?}", trade_type, response_text);
+            tracing::warn!(
+                target: "sol_trade_sdk",
+                " [Stellium] {} submission failed: {:?}",
+                trade_type,
+                response_text
+            );
         }
 
         let start_time: Instant = Instant::now();
@@ -158,15 +185,25 @@ impl StelliumClient {
             Ok(_) => (),
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    println!(" signature: {:?}", signature);
-                    println!(" [Stellium] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                    tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
+                        " [Stellium] {} confirmation failed: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
                 }
                 return Err(e);
             },
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-            println!(" signature: {:?}", signature);
-            println!(" [Stellium] {} confirmed: {:?}", trade_type, start_time.elapsed());
+            tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+            tracing::info!(
+                target: "sol_trade_sdk",
+                " [Stellium] {} confirmed: {:?}",
+                trade_type,
+                start_time.elapsed()
+            );
         }
 
         Ok(())
