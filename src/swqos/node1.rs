@@ -196,6 +196,11 @@ impl Node1Client {
 
 impl Drop for Node1Client {
     fn drop(&mut self) {
+        // Only the last client instance should stop the shared ping task.
+        if Arc::strong_count(&self.ping_handle) != 1 {
+            return;
+        }
+
         // Ensure ping task stops when client is destroyed
         self.stop_ping.store(true, Ordering::Relaxed);
         
