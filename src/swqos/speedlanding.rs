@@ -125,7 +125,11 @@ impl SwqosClientTrait for SpeedlandingClient {
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
                     println!(" signature: {:?}", signature);
-                    println!(" [speedlanding] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                    println!(
+                        " [speedlanding] {} confirmation failed: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
                 }
                 return Err(e);
             }

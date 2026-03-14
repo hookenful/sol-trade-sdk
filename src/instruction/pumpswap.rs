@@ -2,8 +2,8 @@ use crate::{
     constants::trade::trade::DEFAULT_SLIPPAGE,
     instruction::utils::pumpswap::{
         accounts, fee_recipient_ata, get_pool_v2_pda, get_user_volume_accumulator_pda,
-        get_user_volume_accumulator_wsol_ata, BUY_DISCRIMINATOR,
-        BUY_EXACT_QUOTE_IN_DISCRIMINATOR, SELL_DISCRIMINATOR,
+        get_user_volume_accumulator_wsol_ata, BUY_DISCRIMINATOR, BUY_EXACT_QUOTE_IN_DISCRIMINATOR,
+        SELL_DISCRIMINATOR,
     },
     trading::{
         common::wsol_manager,
@@ -191,10 +191,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             }
         }
         // Program upgrade: pool_v2 (readonly) at end of account list
-        accounts.push(AccountMeta::new_readonly(
-            get_pool_v2_pda(&base_mint).unwrap(),
-            false,
-        ));
+        accounts.push(AccountMeta::new_readonly(get_pool_v2_pda(&base_mint).unwrap(), false));
 
         // Create instruction data
         let mut data = [0u8; 24];
@@ -398,10 +395,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             }
         }
         // Program upgrade: pool_v2 (readonly) at end of account list
-        accounts.push(AccountMeta::new_readonly(
-            get_pool_v2_pda(&base_mint).unwrap(),
-            false,
-        ));
+        accounts.push(AccountMeta::new_readonly(get_pool_v2_pda(&base_mint).unwrap(), false));
 
         // Create instruction data
         let mut data = [0u8; 24];
@@ -465,12 +459,12 @@ pub fn claim_cashback_pumpswap_instruction(
     // IDL order: user, user_volume_accumulator, quote_mint, quote_token_program,
     // user_volume_accumulator_wsol_token_account, user_wsol_token_account, system_program, event_authority, program
     let accounts = vec![
-        AccountMeta::new(*payer, true),                              // user (signer, writable)
-        AccountMeta::new(user_volume_accumulator, false),            // user_volume_accumulator (writable)
+        AccountMeta::new(*payer, true), // user (signer, writable)
+        AccountMeta::new(user_volume_accumulator, false), // user_volume_accumulator (writable)
         AccountMeta::new_readonly(quote_mint, false),
         AccountMeta::new_readonly(quote_token_program, false),
-        AccountMeta::new(user_volume_accumulator_wsol_ata, false),   // writable
-        AccountMeta::new(user_wsol_ata, false),                      // writable
+        AccountMeta::new(user_volume_accumulator_wsol_ata, false), // writable
+        AccountMeta::new(user_wsol_ata, false),                    // writable
         crate::constants::SYSTEM_PROGRAM_META,
         accounts::EVENT_AUTHORITY_META,
         accounts::AMM_PROGRAM_META,

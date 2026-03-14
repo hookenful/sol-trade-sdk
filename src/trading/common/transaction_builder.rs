@@ -1,6 +1,8 @@
 use solana_hash::Hash;
 use solana_sdk::{
-    instruction::Instruction, message::AddressLookupTableAccount, native_token::sol_str_to_lamports, pubkey::Pubkey, signature::Keypair, signer::Signer, transaction::VersionedTransaction
+    instruction::Instruction, message::AddressLookupTableAccount,
+    native_token::sol_str_to_lamports, pubkey::Pubkey, signature::Keypair, signer::Signer,
+    transaction::VersionedTransaction,
 };
 use solana_system_interface::instruction::transfer;
 use std::sync::Arc;
@@ -11,7 +13,10 @@ use super::{
 };
 use crate::{
     common::{nonce_cache::DurableNonceInfo, SolanaRpcClient},
-    trading::{MiddlewareManager, core::transaction_pool::{acquire_builder, release_builder}},
+    trading::{
+        core::transaction_pool::{acquire_builder, release_builder},
+        MiddlewareManager,
+    },
 };
 
 /// Build standard RPC transaction.
@@ -37,8 +42,7 @@ pub async fn build_transaction(
     let mut instructions = Vec::with_capacity(business_instructions.len() + 5);
 
     // Add nonce instruction
-    if let Err(e) =
-        add_nonce_instruction(&mut instructions, payer.as_ref(), durable_nonce.clone())
+    if let Err(e) = add_nonce_instruction(&mut instructions, payer.as_ref(), durable_nonce.clone())
     {
         return Err(e);
     }
@@ -53,10 +57,7 @@ pub async fn build_transaction(
     }
 
     // Add compute budget instructions
-    instructions.extend(compute_budget_instructions(
-        unit_price,
-        unit_limit,
-    ));
+    instructions.extend(compute_budget_instructions(unit_price, unit_limit));
 
     // Add business instructions (clone only here; avoids per-task Vec clone in execute_parallel)
     instructions.extend_from_slice(business_instructions);

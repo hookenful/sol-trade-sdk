@@ -12,7 +12,8 @@ use sol_trade_sdk::{
     swqos::SwqosConfig,
     trading::{
         core::params::{
-            BonkParams, PumpFunParams, PumpSwapParams, RaydiumAmmV4Params, RaydiumCpmmParams, DexParamEnum,
+            BonkParams, DexParamEnum, PumpFunParams, PumpSwapParams, RaydiumAmmV4Params,
+            RaydiumCpmmParams,
         },
         factory::DexType,
     },
@@ -723,7 +724,8 @@ async fn handle_buy_bonk(
         println!("   Slippage: {}%", slippage.unwrap());
     }
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
+    let param =
+        BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
@@ -783,7 +785,8 @@ async fn handle_buy_raydium_v4(
 
     let mint_pubkey = Pubkey::from_str(mint)?;
     let amm_pubkey = Pubkey::from_str(amm)?;
-    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
+    let param =
+        RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
@@ -843,7 +846,9 @@ async fn handle_buy_raydium_cpmm(
 
     let mint_pubkey = Pubkey::from_str(mint)?;
     let pool_pubkey = Pubkey::from_str(pool_address)?;
-    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey).await?;
+    let param =
+        RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey)
+            .await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
     let sol_lamports = sol_str_to_lamports(sol_amount.to_string().as_str()).unwrap();
 
@@ -1102,7 +1107,7 @@ async fn handle_sell_pumpswap(
     match client.sell(sell_params).await {
         Ok((_, signature, _)) => {
             println!("   ✅ Successfully sold tokens from PumpSwap!");
-            println!("   ✅ Transaction Signature: {:?}", signature);  
+            println!("   ✅ Transaction Signature: {:?}", signature);
         }
         Err(e) => {
             println!("   ❌ Failed to sell tokens from PumpSwap: {}", e);
@@ -1131,7 +1136,8 @@ async fn handle_sell_bonk(
     }
     let client = initialize_real_client().await?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
+    let param =
+        BonkParams::from_mint_by_rpc(&client.infrastructure.rpc, &mint_pubkey, false).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
@@ -1192,7 +1198,8 @@ async fn handle_sell_raydium_v4(
     let client = initialize_real_client().await?;
     let amm_pubkey = Pubkey::from_str(amm)?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
+    let param =
+        RaydiumAmmV4Params::from_amm_address_by_rpc(&client.infrastructure.rpc, amm_pubkey).await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();
@@ -1253,7 +1260,9 @@ async fn handle_sell_raydium_cpmm(
     let client = initialize_real_client().await?;
     let pool_pubkey = Pubkey::from_str(pool_address)?;
     let mint_pubkey = Pubkey::from_str(mint)?;
-    let param = RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey).await?;
+    let param =
+        RaydiumCpmmParams::from_pool_address_by_rpc(&client.infrastructure.rpc, &pool_pubkey)
+            .await?;
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let gas_fee_strategy = sol_trade_sdk::common::GasFeeStrategy::new();

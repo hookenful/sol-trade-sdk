@@ -17,11 +17,7 @@ impl InfrastructureConfig {
         swqos_configs: Vec<SwqosConfig>,
         commitment: CommitmentConfig,
     ) -> Self {
-        Self {
-            rpc_url,
-            swqos_configs,
-            commitment,
-        }
+        Self { rpc_url, swqos_configs, commitment }
     }
 
     /// Create from TradeConfig (extract infrastructure-only settings)
@@ -100,11 +96,11 @@ impl TradeConfig {
             rpc_url,
             swqos_configs,
             commitment,
-            create_wsol_ata_on_startup: true,  // default: check and create on startup
-            use_seed_optimize: true,           // default: use seed optimization
-            use_core_affinity: false,          // default: do not pin; avoids scheduler jitter on async HTTP paths
-            log_enabled: true,                 // default: enable all SDK logs
-            check_min_tip: false,              // default: skip min tip check to reduce latency
+            create_wsol_ata_on_startup: true, // default: check and create on startup
+            use_seed_optimize: true,          // default: use seed optimization
+            use_core_affinity: false, // default: do not pin; avoids scheduler jitter on async HTTP paths
+            log_enabled: true,        // default: enable all SDK logs
+            check_min_tip: false,     // default: skip min tip check to reduce latency
         }
     }
 

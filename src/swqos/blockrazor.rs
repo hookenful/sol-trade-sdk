@@ -1,20 +1,22 @@
-use crate::swqos::common::{default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode};
+use crate::swqos::common::{
+    default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode,
+};
 use rand::seq::IndexedRandom;
 use reqwest::Client;
 use std::{sync::Arc, time::Instant};
 
-use std::time::Duration;
 use solana_transaction_status::UiTransactionEncoding;
+use std::time::Duration;
 
+use crate::swqos::SwqosClientTrait;
+use crate::swqos::{SwqosType, TradeType};
 use anyhow::Result;
 use solana_sdk::transaction::VersionedTransaction;
-use crate::swqos::{SwqosType, TradeType};
-use crate::swqos::SwqosClientTrait;
 
 use crate::{common::SolanaRpcClient, constants::swqos::BLOCKRAZOR_TIP_ACCOUNTS};
 
-use tokio::task::JoinHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::JoinHandle;
 
 #[derive(Clone)]
 pub struct BlockRazorClient {
@@ -28,16 +30,29 @@ pub struct BlockRazorClient {
 
 #[async_trait::async_trait]
 impl SwqosClientTrait for BlockRazorClient {
-    async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
+    async fn send_transaction(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         self.send_transaction(trade_type, transaction, wait_confirmation).await
     }
 
-    async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()> {
+    async fn send_transactions(
+        &self,
+        trade_type: TradeType,
+        transactions: &Vec<VersionedTransaction>,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         self.send_transactions(trade_type, transactions, wait_confirmation).await
     }
 
     fn get_tip_account(&self) -> Result<String> {
-        let tip_account = *BLOCKRAZOR_TIP_ACCOUNTS.choose(&mut rand::rng()).or_else(|| BLOCKRAZOR_TIP_ACCOUNTS.first()).unwrap();
+        let tip_account = *BLOCKRAZOR_TIP_ACCOUNTS
+            .choose(&mut rand::rng())
+            .or_else(|| BLOCKRAZOR_TIP_ACCOUNTS.first())
+            .unwrap();
         Ok(tip_account.to_string())
     }
 
@@ -50,22 +65,22 @@ impl BlockRazorClient {
     pub fn new(rpc_url: String, endpoint: String, auth_token: String) -> Self {
         let rpc_client = SolanaRpcClient::new(rpc_url);
         let http_client = default_http_client_builder().build().unwrap();
-        
-        let client = Self { 
-            rpc_client: Arc::new(rpc_client), 
-            endpoint, 
-            auth_token, 
+
+        let client = Self {
+            rpc_client: Arc::new(rpc_client),
+            endpoint,
+            auth_token,
             http_client,
             ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
             stop_ping: Arc::new(AtomicBool::new(false)),
         };
-        
+
         // Start ping task
         let client_clone = client.clone();
         tokio::spawn(async move {
             client_clone.start_ping_task().await;
         });
-        
+
         client
     }
 
@@ -75,7 +90,7 @@ impl BlockRazorClient {
         let auth_token = self.auth_token.clone();
         let http_client = self.http_client.clone();
         let stop_ping = self.stop_ping.clone();
-        
+
         let handle = tokio::spawn(async move {
             // Immediate first ping to warm connection and reduce first-submit cold start latency
             if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
@@ -83,20 +98,21 @@ impl BlockRazorClient {
                     tracing::warn!(target: "sol_trade_sdk", "BlockRazor ping request failed: {}", e);
                 }
             }
-            let mut interval = tokio::time::interval(Duration::from_secs(30));  // 30s keepalive to avoid server ~5min idle close
+            let mut interval = tokio::time::interval(Duration::from_secs(30)); // 30s keepalive to avoid server ~5min idle close
             loop {
                 interval.tick().await;
                 if stop_ping.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
+                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await
+                {
                     if crate::common::sdk_log::sdk_log_enabled() {
                         tracing::warn!(target: "sol_trade_sdk", "BlockRazor ping request failed: {}", e);
                     }
                 }
             }
         });
-        
+
         // Update ping_handle - use Mutex to safely update
         {
             let mut ping_guard = self.ping_handle.lock().await;
@@ -108,7 +124,11 @@ impl BlockRazorClient {
     }
 
     /// Send ping request: POST /v2/health?auth=... (Keep Alive). Only required param: auth.
-    async fn send_ping_request(http_client: &Client, endpoint: &str, auth_token: &str) -> Result<()> {
+    async fn send_ping_request(
+        http_client: &Client,
+        endpoint: &str,
+        auth_token: &str,
+    ) -> Result<()> {
         let ping_url = endpoint.replace("/v2/sendTransaction", "/v2/health");
         let response = http_client
             .post(&ping_url)
@@ -131,11 +151,18 @@ impl BlockRazorClient {
     }
 
     /// Send transaction via v2 API: plain Base64 body, Content-Type: text/plain. Only required URI param: auth.
-    pub async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
+    pub async fn send_transaction(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         let start_time = Instant::now();
-        let (content, signature) = serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64)?;
+        let (content, signature) =
+            serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64)?;
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&self.endpoint)
             .query(&[("auth", self.auth_token.as_str())])
             .header("Content-Type", "text/plain")
@@ -180,7 +207,7 @@ impl BlockRazorClient {
                     );
                 }
                 return Err(e);
-            },
+            }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
             tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
@@ -195,7 +222,12 @@ impl BlockRazorClient {
         Ok(())
     }
 
-    pub async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()> {
+    pub async fn send_transactions(
+        &self,
+        trade_type: TradeType,
+        transactions: &Vec<VersionedTransaction>,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         for transaction in transactions {
             self.send_transaction(trade_type, transaction, wait_confirmation).await?;
         }
@@ -212,7 +244,7 @@ impl Drop for BlockRazorClient {
 
         // Ensure ping task stops when client is destroyed
         self.stop_ping.store(true, Ordering::Relaxed);
-        
+
         // Try to stop ping task immediately
         // Use tokio::spawn to avoid blocking Drop
         let ping_handle = self.ping_handle.clone();

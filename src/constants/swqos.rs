@@ -1,7 +1,6 @@
 use solana_program::pubkey;
 use solana_sdk::pubkey::Pubkey;
 
-
 pub const JITO_TIP_ACCOUNTS: &[Pubkey] = &[
     pubkey!("96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5"),
     pubkey!("HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe"),
@@ -165,13 +164,13 @@ pub const SPEEDLANDING_TIP_ACCOUNTS: &[Pubkey] = &[
 // Default,
 
 pub const SWQOS_ENDPOINTS_JITO: [&str; 8] = [
-    "https://ny.mainnet.block-engine.jito.wtf", 
+    "https://ny.mainnet.block-engine.jito.wtf",
     "https://frankfurt.mainnet.block-engine.jito.wtf",
     "https://amsterdam.mainnet.block-engine.jito.wtf",
     "https://slc.mainnet.block-engine.jito.wtf",
     "https://tokyo.mainnet.block-engine.jito.wtf",
     "https://london.mainnet.block-engine.jito.wtf",
-    "https://ny.mainnet.block-engine.jito.wtf", 
+    "https://ny.mainnet.block-engine.jito.wtf",
     "https://mainnet.block-engine.jito.wtf",
 ];
 
@@ -180,8 +179,8 @@ pub const SWQOS_ENDPOINTS_NEXTBLOCK: [&str; 8] = [
     "http://frankfurt.nextblock.io",
     "http://amsterdam.nextblock.io",
     "http://slc.nextblock.io",
-    "http://tokyo.nextblock.io",  
-    "http://london.nextblock.io", 
+    "http://tokyo.nextblock.io",
+    "http://london.nextblock.io",
     "http://singapore.nextblock.io",
     "http://frankfurt.nextblock.io",
 ];

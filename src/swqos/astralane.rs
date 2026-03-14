@@ -3,18 +3,18 @@ use rand::seq::IndexedRandom;
 use reqwest::Client;
 use std::{sync::Arc, time::Instant};
 
-use std::time::Duration;
+use crate::swqos::SwqosClientTrait;
+use crate::swqos::{SwqosType, TradeType};
 use anyhow::Result;
 use bincode::serialize as bincode_serialize;
 use solana_client::rpc_client::SerializableTransaction;
 use solana_sdk::transaction::VersionedTransaction;
-use crate::swqos::{SwqosType, TradeType};
-use crate::swqos::SwqosClientTrait;
+use std::time::Duration;
 
 use crate::{common::SolanaRpcClient, constants::swqos::ASTRALANE_TIP_ACCOUNTS};
 
-use tokio::task::JoinHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::task::JoinHandle;
 
 /// Empty body for getHealth POST; avoid per-request allocation.
 static PING_BODY: &[u8] = &[];
@@ -31,16 +31,29 @@ pub struct AstralaneClient {
 
 #[async_trait::async_trait]
 impl SwqosClientTrait for AstralaneClient {
-    async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
+    async fn send_transaction(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         self.send_transaction(trade_type, transaction, wait_confirmation).await
     }
 
-    async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()> {
+    async fn send_transactions(
+        &self,
+        trade_type: TradeType,
+        transactions: &Vec<VersionedTransaction>,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         self.send_transactions(trade_type, transactions, wait_confirmation).await
     }
 
     fn get_tip_account(&self) -> Result<String> {
-        let tip_account = *ASTRALANE_TIP_ACCOUNTS.choose(&mut rand::rng()).or_else(|| ASTRALANE_TIP_ACCOUNTS.first()).unwrap();
+        let tip_account = *ASTRALANE_TIP_ACCOUNTS
+            .choose(&mut rand::rng())
+            .or_else(|| ASTRALANE_TIP_ACCOUNTS.first())
+            .unwrap();
         Ok(tip_account.to_string())
     }
 
@@ -53,22 +66,22 @@ impl AstralaneClient {
     pub fn new(rpc_url: String, endpoint: String, auth_token: String) -> Self {
         let rpc_client = SolanaRpcClient::new(rpc_url);
         let http_client = default_http_client_builder().build().unwrap();
-        
-        let client = Self { 
-            rpc_client: Arc::new(rpc_client), 
-            endpoint, 
-            auth_token, 
+
+        let client = Self {
+            rpc_client: Arc::new(rpc_client),
+            endpoint,
+            auth_token,
             http_client,
             ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
             stop_ping: Arc::new(AtomicBool::new(false)),
         };
-        
+
         // Start ping task
         let client_clone = client.clone();
         tokio::spawn(async move {
             client_clone.start_ping_task().await;
         });
-        
+
         client
     }
 
@@ -78,7 +91,7 @@ impl AstralaneClient {
         let auth_token = self.auth_token.clone();
         let http_client = self.http_client.clone();
         let stop_ping = self.stop_ping.clone();
-        
+
         let handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -86,12 +99,13 @@ impl AstralaneClient {
                 if stop_ping.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
+                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await
+                {
                     tracing::warn!(target: "sol_trade_sdk", "Astralane ping request failed: {}", e);
                 }
             }
         });
-        
+
         // Update ping_handle - use Mutex to safely update
         {
             let mut ping_guard = self.ping_handle.lock().await;
@@ -103,7 +117,11 @@ impl AstralaneClient {
     }
 
     /// Send ping request: POST endpoint?api-key=...&method=getHealth (endpoint is irisb from constants).
-    async fn send_ping_request(http_client: &Client, endpoint: &str, auth_token: &str) -> Result<()> {
+    async fn send_ping_request(
+        http_client: &Client,
+        endpoint: &str,
+        auth_token: &str,
+    ) -> Result<()> {
         let response = http_client
             .post(endpoint)
             .query(&[("api-key", auth_token), ("method", "getHealth")])
@@ -124,13 +142,20 @@ impl AstralaneClient {
     }
 
     /// Send transaction via /irisb binary API (no Base64; lower latency).
-    pub async fn send_transaction(&self, trade_type: TradeType, transaction: &VersionedTransaction, wait_confirmation: bool) -> Result<()> {
+    pub async fn send_transaction(
+        &self,
+        trade_type: TradeType,
+        transaction: &VersionedTransaction,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         let start_time = Instant::now();
         let signature = transaction.get_signature();
 
-        let body_bytes = bincode_serialize(transaction).map_err(|e| anyhow::anyhow!("Astralane binary serialize failed: {}", e))?;
+        let body_bytes = bincode_serialize(transaction)
+            .map_err(|e| anyhow::anyhow!("Astralane binary serialize failed: {}", e))?;
 
-        let response = self.http_client
+        let response = self
+            .http_client
             .post(&self.endpoint)
             .query(&[("api-key", self.auth_token.as_str()), ("method", "sendTransaction")])
             .header("Content-Type", "application/octet-stream")
@@ -175,7 +200,7 @@ impl AstralaneClient {
                     );
                 }
                 return Err(e);
-            },
+            }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
             tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
@@ -190,7 +215,12 @@ impl AstralaneClient {
         Ok(())
     }
 
-    pub async fn send_transactions(&self, trade_type: TradeType, transactions: &Vec<VersionedTransaction>, wait_confirmation: bool) -> Result<()> {
+    pub async fn send_transactions(
+        &self,
+        trade_type: TradeType,
+        transactions: &Vec<VersionedTransaction>,
+        wait_confirmation: bool,
+    ) -> Result<()> {
         for transaction in transactions {
             self.send_transaction(trade_type, transaction, wait_confirmation).await?;
         }
@@ -207,7 +237,7 @@ impl Drop for AstralaneClient {
 
         // Ensure ping task stops when client is destroyed
         self.stop_ping.store(true, Ordering::Relaxed);
-        
+
         // Try to stop ping task immediately
         // Use tokio::spawn to avoid blocking Drop
         let ping_handle = self.ping_handle.clone();

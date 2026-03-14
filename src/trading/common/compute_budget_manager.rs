@@ -1,8 +1,8 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use smallvec::SmallVec;
-use solana_sdk::instruction::Instruction;
 use solana_compute_budget_interface::ComputeBudgetInstruction;
+use solana_sdk::instruction::Instruction;
 
 /// Cache key containing all parameters for compute budget instructions
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -17,15 +17,9 @@ static COMPUTE_BUDGET_CACHE: Lazy<DashMap<ComputeBudgetCacheKey, SmallVec<[Instr
     Lazy::new(|| DashMap::new());
 
 #[inline(always)]
-pub fn compute_budget_instructions(
-    unit_price: u64,
-    unit_limit: u32,
-) -> SmallVec<[Instruction; 2]> {
+pub fn compute_budget_instructions(unit_price: u64, unit_limit: u32) -> SmallVec<[Instruction; 2]> {
     // Create cache key
-    let cache_key = ComputeBudgetCacheKey {
-        unit_price: unit_price,
-        unit_limit: unit_limit,
-    };
+    let cache_key = ComputeBudgetCacheKey { unit_price: unit_price, unit_limit: unit_limit };
 
     // Try to get from cache first
     if let Some(cached_insts) = COMPUTE_BUDGET_CACHE.get(&cache_key) {

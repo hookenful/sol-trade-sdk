@@ -177,8 +177,9 @@ impl TradingInfrastructure {
             if swqos.is_blacklisted() {
                 if sdk_log::sdk_log_enabled() {
                     warn!(target: "sol_trade_sdk", "⚠️ SWQOS {:?} is blacklisted, skipping",
-                    swqos.swqos_type()
-                );}
+                        swqos.swqos_type()
+                    );
+                }
                 continue;
             }
             match SwqosConfig::get_swqos_client(
@@ -504,7 +505,10 @@ impl TradingClient {
                                 }
                             }
                             Err(_) => {
-                                last_error = Some(format!("Transaction confirmation timeout ({}s)", TIMEOUT_SECS));
+                                last_error = Some(format!(
+                                    "Transaction confirmation timeout ({}s)",
+                                    TIMEOUT_SECS
+                                ));
                                 if sdk_log::sdk_log_enabled() {
                                     warn!(target: "sol_trade_sdk", "⚠️ Attempt {} timed out", attempt);
                                 }
@@ -528,7 +532,10 @@ impl TradingClient {
                             error!(target: "sol_trade_sdk", "   ⚠️ Process will exit in 5 seconds, restart after fixing the above");
                         }
                         std::thread::sleep(std::time::Duration::from_secs(5));
-                        panic!("❌ WSOL ATA creation failed and account does not exist: {}. Error: {}", wsol_ata, err);
+                        panic!(
+                            "❌ WSOL ATA creation failed and account does not exist: {}. Error: {}",
+                            wsol_ata, err
+                        );
                     }
                 } else {
                     if sdk_log::sdk_log_enabled() {
