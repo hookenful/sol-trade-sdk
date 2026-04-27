@@ -5,9 +5,9 @@ use rand::seq::IndexedRandom;
 use reqwest::Client;
 use std::{sync::Arc, time::Instant};
 
+use arc_swap::ArcSwap;
 use solana_transaction_status::UiTransactionEncoding;
 use std::time::Duration;
-use arc_swap::ArcSwap;
 
 use crate::swqos::SwqosClientTrait;
 use crate::swqos::{SwqosType, TradeType};
@@ -18,8 +18,8 @@ use crate::{common::SolanaRpcClient, constants::swqos::BLOCKRAZOR_TIP_ACCOUNTS};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::task::JoinHandle;
-use tonic::transport::Channel;
 use tonic::metadata::AsciiMetadataValue;
+use tonic::transport::Channel;
 
 // Include pre-generated gRPC code
 pub mod serverpb {
@@ -46,7 +46,9 @@ impl BlockRazorGrpcClient {
         let mut request = tonic::Request::new(serverpb::HealthRequest {});
         request.metadata_mut().insert("apikey", apikey);
 
-        let response = client.get_health(request).await
+        let response = client
+            .get_health(request)
+            .await
             .map_err(|e| anyhow::anyhow!("gRPC health check failed: {}", e))?;
         Ok(response.into_inner().status)
     }
@@ -60,7 +62,11 @@ impl BlockRazorGrpcClient {
     ) -> Result<String> {
         // 检查交易数据大小
         if crate::common::sdk_log::sdk_log_enabled() {
-            eprintln!("BlockRazor transaction size: {} bytes", transaction.len());
+            tracing::info!(
+                target: "sol_trade_sdk",
+                "BlockRazor transaction size: {} bytes",
+                transaction.len()
+            );
         }
 
         let mut client = serverpb::server_client::ServerClient::new(self.channel.clone());
@@ -75,7 +81,9 @@ impl BlockRazorGrpcClient {
         });
         request.metadata_mut().insert("apikey", apikey);
 
-        let response = client.send_transaction(request).await
+        let response = client
+            .send_transaction(request)
+            .await
             .map_err(|e| anyhow::anyhow!("gRPC send transaction failed: {}", e))?;
         Ok(response.into_inner().signature)
     }
@@ -151,7 +159,12 @@ impl BlockRazorClient {
         Ok(Self::new_http(rpc_url, endpoint, auth_token, false))
     }
 
-    pub async fn new_grpc(rpc_url: String, endpoint: String, auth_token: String, mev_protection: bool) -> Result<Self> {
+    pub async fn new_grpc(
+        rpc_url: String,
+        endpoint: String,
+        auth_token: String,
+        mev_protection: bool,
+    ) -> Result<Self> {
         let rpc_client = SolanaRpcClient::new(rpc_url);
 
         // 配置 Channel，增加连接超时
@@ -162,10 +175,8 @@ impl BlockRazorClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to gRPC endpoint: {}", e))?;
 
-        let grpc_client = Arc::new(ArcSwap::from_pointee(BlockRazorGrpcClient::new(
-            channel,
-            auth_token.clone(),
-        )));
+        let grpc_client =
+            Arc::new(ArcSwap::from_pointee(BlockRazorGrpcClient::new(channel, auth_token.clone())));
         let ping_handle = Arc::new(tokio::sync::Mutex::new(None));
         let stop_ping = Arc::new(AtomicBool::new(false));
 
@@ -189,7 +200,12 @@ impl BlockRazorClient {
         Ok(client)
     }
 
-    pub fn new_http(rpc_url: String, endpoint: String, auth_token: String, mev_protection: bool) -> Self {
+    pub fn new_http(
+        rpc_url: String,
+        endpoint: String,
+        auth_token: String,
+        mev_protection: bool,
+    ) -> Self {
         let rpc_client = SolanaRpcClient::new(rpc_url);
         let http_client = default_http_client_builder().user_agent("").build().unwrap();
         let ping_handle = Arc::new(tokio::sync::Mutex::new(None));
@@ -239,7 +255,11 @@ impl BlockRazorClient {
                         let client = grpc_client.load();
                         if let Err(e) = client.get_health().await {
                             if crate::common::sdk_log::sdk_log_enabled() {
-                                eprintln!("BlockRazor gRPC initial health check failed: {}", e);
+                                tracing::warn!(
+                                    target: "sol_trade_sdk",
+                                    "BlockRazor gRPC initial health check failed: {}",
+                                    e
+                                );
                             }
                         }
                     }
@@ -260,7 +280,12 @@ impl BlockRazorClient {
                             }
                             Err(e) => {
                                 if crate::common::sdk_log::sdk_log_enabled() {
-                                    eprintln!("BlockRazor gRPC health check failed: {} - reconnecting in {}s", e, delay);
+                                    tracing::warn!(
+                                        target: "sol_trade_sdk",
+                                        "BlockRazor gRPC health check failed: {} - reconnecting in {}s",
+                                        e,
+                                        delay
+                                    );
                                 }
 
                                 // 等待指数退避时间
@@ -274,12 +299,19 @@ impl BlockRazorClient {
                                         grpc_client.swap(Arc::new(new_client));
                                         delay = 1; // 重置延迟
                                         if crate::common::sdk_log::sdk_log_enabled() {
-                                            eprintln!("BlockRazor gRPC reconnected successfully");
+                                            tracing::info!(
+                                                target: "sol_trade_sdk",
+                                                "BlockRazor gRPC reconnected successfully"
+                                            );
                                         }
                                     }
                                     Err(reconnect_err) => {
                                         if crate::common::sdk_log::sdk_log_enabled() {
-                                            eprintln!("BlockRazor gRPC reconnect failed: {}", reconnect_err);
+                                            tracing::warn!(
+                                                target: "sol_trade_sdk",
+                                                "BlockRazor gRPC reconnect failed: {}",
+                                                reconnect_err
+                                            );
                                         }
                                     }
                                 }
@@ -309,9 +341,10 @@ impl BlockRazorClient {
                 let stop_ping = stop_ping.clone();
 
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = Self::send_http_ping(&http_client, &endpoint, &auth_token).await {
+                    if let Err(e) = Self::send_http_ping(&http_client, &endpoint, &auth_token).await
+                    {
                         if crate::common::sdk_log::sdk_log_enabled() {
-                            eprintln!("BlockRazor HTTP ping request failed: {}", e);
+                            crate::common::sdk_log::log_swqos_ping_failed("BlockRazor HTTP", e);
                         }
                     }
                     let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -320,9 +353,11 @@ impl BlockRazorClient {
                         if stop_ping.load(Ordering::Relaxed) {
                             break;
                         }
-                        if let Err(e) = Self::send_http_ping(&http_client, &endpoint, &auth_token).await {
+                        if let Err(e) =
+                            Self::send_http_ping(&http_client, &endpoint, &auth_token).await
+                        {
                             if crate::common::sdk_log::sdk_log_enabled() {
-                                eprintln!("BlockRazor HTTP ping request failed: {}", e);
+                                crate::common::sdk_log::log_swqos_ping_failed("BlockRazor HTTP", e);
                             }
                         }
                     }
@@ -337,11 +372,7 @@ impl BlockRazorClient {
         }
     }
 
-    async fn send_http_ping(
-        http_client: &Client,
-        endpoint: &str,
-        auth_token: &str,
-    ) -> Result<()> {
+    async fn send_http_ping(http_client: &Client, endpoint: &str, auth_token: &str) -> Result<()> {
         let ping_url = endpoint.replace("/v2/sendTransaction", "/v2/health");
         let response = http_client
             .post(&ping_url)
@@ -353,8 +384,8 @@ impl BlockRazorClient {
             .await?;
         let status = response.status();
         let _ = response.bytes().await;
-        if !status.is_success() {
-            eprintln!("BlockRazor HTTP ping request failed with status: {}", status);
+        if !status.is_success() && crate::common::sdk_log::sdk_log_enabled() {
+            crate::common::sdk_log::log_swqos_ping_status("BlockRazor HTTP", status);
         }
         Ok(())
     }
@@ -380,56 +411,73 @@ impl BlockRazorClient {
         let start_time = Instant::now();
 
         match &self.backend {
-            BlockRazorBackend::Grpc {
-                grpc_client,
-                mev_protection,
-                ..
-            } => {
+            BlockRazorBackend::Grpc { grpc_client, mev_protection, .. } => {
                 let (content, _signature) =
                     serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64)?;
 
                 // 使用 load() 无锁获取客户端引用
                 let client = grpc_client.load();
-                let signature = client.send_transaction(
-                    content,
-                    // mev_protection=true: sandwichMitigation mode skips blacklisted Leader slots (MEV protection).
-                    // revert_protection is unrelated to MEV; keep false.
-                    if *mev_protection { "sandwichMitigation".to_string() } else { "fast".to_string() },
-                    None,
-                    false,
-                ).await;
+                let signature = client
+                    .send_transaction(
+                        content,
+                        // mev_protection=true: sandwichMitigation mode skips blacklisted Leader slots (MEV protection).
+                        // revert_protection is unrelated to MEV; keep false.
+                        if *mev_protection {
+                            "sandwichMitigation".to_string()
+                        } else {
+                            "fast".to_string()
+                        },
+                        None,
+                        false,
+                    )
+                    .await;
                 match signature {
                     Ok(sig) => {
                         if !sig.is_empty() {
                             if crate::common::sdk_log::sdk_log_enabled() {
-                                crate::common::sdk_log::log_swqos_submitted("BlockRazor", trade_type, start_time.elapsed());
+                                crate::common::sdk_log::log_swqos_submitted(
+                                    "BlockRazor",
+                                    trade_type,
+                                    start_time.elapsed(),
+                                );
                             }
                         } else {
                             if crate::common::sdk_log::sdk_log_enabled() {
-                                crate::common::sdk_log::log_swqos_submission_failed("BlockRazor", trade_type, start_time.elapsed(), "empty signature".to_string());
+                                crate::common::sdk_log::log_swqos_submission_failed(
+                                    "BlockRazor",
+                                    trade_type,
+                                    start_time.elapsed(),
+                                    "empty signature".to_string(),
+                                );
                             }
-                            return Err(anyhow::anyhow!("BlockRazor gRPC returned empty signature"));
+                            return Err(anyhow::anyhow!(
+                                "BlockRazor gRPC returned empty signature"
+                            ));
                         }
                     }
                     Err(e) => {
                         if crate::common::sdk_log::sdk_log_enabled() {
-                            crate::common::sdk_log::log_swqos_submission_failed("BlockRazor", trade_type, start_time.elapsed(), format!("gRPC error: {}", e));
+                            crate::common::sdk_log::log_swqos_submission_failed(
+                                "BlockRazor",
+                                trade_type,
+                                start_time.elapsed(),
+                                format!("gRPC error: {}", e),
+                            );
                         }
-                        return Err(anyhow::anyhow!("BlockRazor gRPC sendTransaction failed: {}", e));
+                        return Err(anyhow::anyhow!(
+                            "BlockRazor gRPC sendTransaction failed: {}",
+                            e
+                        ));
                     }
                 }
             }
             BlockRazorBackend::Http {
-                endpoint,
-                auth_token,
-                http_client,
-                mev_protection,
-                ..
+                endpoint, auth_token, http_client, mev_protection, ..
             } => {
                 let (content, _signature) =
                     serialize_transaction_and_encode(transaction, UiTransactionEncoding::Base64)?;
 
-                let mut query_params: Vec<(&str, &str)> = vec![
+                let query_params: Vec<(&str, &str)> = vec![
                     ("auth", auth_token.as_str()),
                     // mev_protection=true: sandwichMitigation mode skips blacklisted Leader slots (MEV protection).
                     // revertProtection is unrelated to MEV; not set.
@@ -448,12 +496,21 @@ impl BlockRazorClient {
                 if status.is_success() {
                     let _ = response.bytes().await;
                     if crate::common::sdk_log::sdk_log_enabled() {
-                        crate::common::sdk_log::log_swqos_submitted("blockrazor", trade_type, start_time.elapsed());
+                        crate::common::sdk_log::log_swqos_submitted(
+                            "blockrazor",
+                            trade_type,
+                            start_time.elapsed(),
+                        );
                     }
                 } else {
                     let body = response.text().await.unwrap_or_default();
                     if crate::common::sdk_log::sdk_log_enabled() {
-                        crate::common::sdk_log::log_swqos_submission_failed("blockrazor", trade_type, start_time.elapsed(), format!("status {} body: {}", status, body));
+                        crate::common::sdk_log::log_swqos_submission_failed(
+                            "blockrazor",
+                            trade_type,
+                            start_time.elapsed(),
+                            format!("status {} body: {}", status, body),
+                        );
                     }
                     return Err(anyhow::anyhow!(
                         "BlockRazor HTTP sendTransaction failed: status {} body: {}",
@@ -471,21 +528,23 @@ impl BlockRazorClient {
             Ok(_) => (),
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    println!(" signature: {:?}", signature);
-                    println!(
-                        " [{:width$}] {} confirmation failed: {:?}",
+                    crate::common::sdk_log::log_signature(signature);
+                    crate::common::sdk_log::log_swqos_confirmation_failed(
                         "blockrazor",
                         trade_type,
                         start_time.elapsed(),
-                        width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
                     );
                 }
                 return Err(e);
             }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-            println!(" signature: {:?}", signature);
-            println!(" [{:width$}] {} confirmed: {:?}", "blockrazor", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+            crate::common::sdk_log::log_signature(signature);
+            crate::common::sdk_log::log_swqos_confirmed(
+                "blockrazor",
+                trade_type,
+                start_time.elapsed(),
+            );
         }
 
         Ok(())
@@ -495,7 +554,12 @@ impl BlockRazorClient {
 impl Drop for BlockRazorClient {
     fn drop(&mut self) {
         match &self.backend {
-            BlockRazorBackend::Grpc { stop_ping, ping_handle, .. } | BlockRazorBackend::Http { stop_ping, ping_handle, .. } => {
+            BlockRazorBackend::Grpc { stop_ping, ping_handle, .. }
+            | BlockRazorBackend::Http { stop_ping, ping_handle, .. } => {
+                if Arc::strong_count(ping_handle) != 1 {
+                    return;
+                }
+
                 stop_ping.store(true, Ordering::Relaxed);
 
                 let ping_handle = ping_handle.clone();

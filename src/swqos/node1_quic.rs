@@ -193,7 +193,8 @@ impl SwqosClientTrait for Node1QuicClient {
 
         if status != 200 {
             if crate::common::sdk_log::sdk_log_enabled() {
-                eprintln!(
+                tracing::warn!(
+                    target: "sol_trade_sdk",
                     " [node1-quic] {} submit failed: status={} msg={}",
                     trade_type, status, msg
                 );
@@ -202,23 +203,27 @@ impl SwqosClientTrait for Node1QuicClient {
         }
 
         if crate::common::sdk_log::sdk_log_enabled() {
-            println!(" [node1-quic] {} submitted: {:?}", trade_type, start.elapsed());
+            crate::common::sdk_log::log_swqos_submitted("node1-quic", trade_type, start.elapsed());
         }
 
         let start = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => {
                 if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-                    println!(" [node1-quic] {} confirmed: {:?}", trade_type, start.elapsed());
+                    crate::common::sdk_log::log_swqos_confirmed(
+                        "node1-quic",
+                        trade_type,
+                        start.elapsed(),
+                    );
                 }
                 Ok(())
             }
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!(
-                        " [node1-quic] {} confirmation failed: {:?}",
+                    crate::common::sdk_log::log_swqos_confirmation_failed(
+                        "node1-quic",
                         trade_type,
-                        start.elapsed()
+                        start.elapsed(),
                     );
                 }
                 Err(e)

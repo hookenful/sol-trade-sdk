@@ -34,10 +34,7 @@ fn extract_swqos_error_message(s: &str) -> String {
     // Try parse as JSON only when input looks like JSON (avoid parsing long non-JSON strings)
     if s.starts_with('{') {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(s) {
-            let obj = v
-                .get("error")
-                .and_then(|e| e.as_object())
-                .or_else(|| v.as_object());
+            let obj = v.get("error").and_then(|e| e.as_object()).or_else(|| v.as_object());
             if let Some(o) = obj {
                 if let Some(m) = o.get("message").and_then(|x| x.as_str()) {
                     return m.to_string();
@@ -69,12 +66,12 @@ pub fn set_sdk_log_enabled(enabled: bool) {
 
 /// Aligned log: ` [Soyas        ] Buy submitted: 13.936 µs`. Call only when sdk_log_enabled().
 #[inline]
-pub fn log_swqos_submitted(
-    provider: &str,
-    trade_type: impl fmt::Display,
-    elapsed: Duration,
-) {
-    println!(
+pub fn log_swqos_submitted(provider: &str, trade_type: impl fmt::Display, elapsed: Duration) {
+    if !sdk_log_enabled() {
+        return;
+    }
+    tracing::info!(
+        target: "sol_trade_sdk",
         " [{:width$}] {} submitted: {}",
         provider,
         trade_type,
@@ -94,13 +91,16 @@ pub fn print_sdk_timing_block(
     submit_timings: &[(crate::swqos::SwqosType, i64)],
     confirm_us: Option<i64>,
 ) {
-    println!();
+    if !sdk_log_enabled() {
+        return;
+    }
     let start_us = match start_us {
         Some(u) => u,
         None => return,
     };
     if let Some(end_us) = build_end_us {
-        println!(
+        tracing::info!(
+            target: "sol_trade_sdk",
             " [SDK][{:width$}] {} build_instructions: {:.4} ms",
             "-",
             dir,
@@ -109,7 +109,8 @@ pub fn print_sdk_timing_block(
         );
     }
     if let Some(end_us) = before_submit_us {
-        println!(
+        tracing::info!(
+            target: "sol_trade_sdk",
             " [SDK][{:width$}] {} before_submit: {:.4} ms",
             "-",
             dir,
@@ -122,7 +123,8 @@ pub fn print_sdk_timing_block(
         for (swqos_type, submit_done_us) in submit_timings {
             let submit_ms = (*submit_done_us - start_us).max(0) as f64 / 1000.0;
             let confirmed_ms = (confirm_done_us - *submit_done_us).max(0) as f64 / 1000.0;
-            println!(
+            tracing::info!(
+                target: "sol_trade_sdk",
                 " [SDK][{:width$}] {} submit_done: {:.4} ms, confirmed: {:.4} ms, total: {:.4} ms",
                 swqos_type.as_str(),
                 dir,
@@ -135,7 +137,8 @@ pub fn print_sdk_timing_block(
     } else {
         for (swqos_type, submit_done_us) in submit_timings {
             let submit_ms = (*submit_done_us - start_us).max(0) as f64 / 1000.0;
-            println!(
+            tracing::info!(
+                target: "sol_trade_sdk",
                 " [SDK][{:width$}] {} submit_done: {:.4} ms, confirmed: -, total: {:.4} ms",
                 swqos_type.as_str(),
                 dir,
@@ -156,13 +159,80 @@ pub fn log_swqos_submission_failed(
     elapsed: Duration,
     err: impl fmt::Display,
 ) {
+    if !sdk_log_enabled() {
+        return;
+    }
     let msg = extract_swqos_error_message(&format!("{}", err));
-    eprintln!(
+    tracing::warn!(
+        target: "sol_trade_sdk",
         " [{:width$}] {} submission failed after {}, error: {}",
         provider,
         trade_type,
         format_elapsed(elapsed),
         msg,
         width = SWQOS_LABEL_WIDTH
+    );
+}
+
+#[inline]
+pub fn log_signature(signature: impl fmt::Debug) {
+    if !sdk_log_enabled() {
+        return;
+    }
+    tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+}
+
+#[inline]
+pub fn log_swqos_confirmation_failed(
+    provider: &str,
+    trade_type: impl fmt::Display,
+    elapsed: Duration,
+) {
+    if !sdk_log_enabled() {
+        return;
+    }
+    tracing::warn!(
+        target: "sol_trade_sdk",
+        " [{:width$}] {} confirmation failed: {:?}",
+        provider,
+        trade_type,
+        elapsed,
+        width = SWQOS_LABEL_WIDTH
+    );
+}
+
+#[inline]
+pub fn log_swqos_confirmed(provider: &str, trade_type: impl fmt::Display, elapsed: Duration) {
+    if !sdk_log_enabled() {
+        return;
+    }
+    tracing::info!(
+        target: "sol_trade_sdk",
+        " [{:width$}] {} confirmed: {:?}",
+        provider,
+        trade_type,
+        elapsed,
+        width = SWQOS_LABEL_WIDTH
+    );
+}
+
+#[inline]
+pub fn log_swqos_ping_failed(provider: &str, err: impl fmt::Display) {
+    if !sdk_log_enabled() {
+        return;
+    }
+    tracing::warn!(target: "sol_trade_sdk", "{} ping request failed: {}", provider, err);
+}
+
+#[inline]
+pub fn log_swqos_ping_status(provider: &str, status: impl fmt::Display) {
+    if !sdk_log_enabled() {
+        return;
+    }
+    tracing::warn!(
+        target: "sol_trade_sdk",
+        "{} ping request returned non-success status: {}",
+        provider,
+        status
     );
 }

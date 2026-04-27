@@ -122,7 +122,7 @@ impl TemporalClient {
         let handle = tokio::spawn(async move {
             // Immediate first ping to warm connection and reduce first-submit cold start latency
             if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
-                eprintln!("Temporal ping request failed: {}", e);
+                crate::common::sdk_log::log_swqos_ping_failed("Temporal", e);
             }
             let mut interval = tokio::time::interval(Duration::from_secs(30));
             loop {
@@ -132,7 +132,7 @@ impl TemporalClient {
                 }
                 if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await
                 {
-                    eprintln!("Temporal ping request failed: {}", e);
+                    crate::common::sdk_log::log_swqos_ping_failed("Temporal", e);
                 }
             }
         });
@@ -166,7 +166,7 @@ impl TemporalClient {
         let status = response.status();
         let _ = response.bytes().await;
         if !status.is_success() {
-            eprintln!("Temporal ping request returned non-success status: {}", status);
+            crate::common::sdk_log::log_swqos_ping_status("Temporal", status);
         }
         Ok(())
     }
@@ -209,30 +209,44 @@ impl TemporalClient {
 
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if response_json.get("result").is_some() {
-                crate::common::sdk_log::log_swqos_submitted("nozomi", trade_type, start_time.elapsed());
+                crate::common::sdk_log::log_swqos_submitted(
+                    "nozomi",
+                    trade_type,
+                    start_time.elapsed(),
+                );
             } else if let Some(_error) = response_json.get("error") {
-                crate::common::sdk_log::log_swqos_submission_failed("nozomi", trade_type, start_time.elapsed(), _error);
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "nozomi",
+                    trade_type,
+                    start_time.elapsed(),
+                    _error,
+                );
             }
         } else {
-            crate::common::sdk_log::log_swqos_submission_failed("nozomi", trade_type, start_time.elapsed(), response_text);
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "nozomi",
+                trade_type,
+                start_time.elapsed(),
+                response_text,
+            );
         }
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(
-                    " [nozomi] {} confirmation failed: {:?}",
+                crate::common::sdk_log::log_signature(signature);
+                crate::common::sdk_log::log_swqos_confirmation_failed(
+                    "nozomi",
                     trade_type,
-                    start_time.elapsed()
+                    start_time.elapsed(),
                 );
                 return Err(e);
             }
         }
         if wait_confirmation {
-            println!(" signature: {:?}", signature);
-            println!(" [{:width$}] {} confirmed: {:?}", "nozomi", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+            crate::common::sdk_log::log_signature(signature);
+            crate::common::sdk_log::log_swqos_confirmed("nozomi", trade_type, start_time.elapsed());
         }
 
         Ok(())
@@ -253,6 +267,10 @@ impl TemporalClient {
 
 impl Drop for TemporalClient {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.ping_handle) != 1 {
+            return;
+        }
+
         // Ensure ping task stops when client is destroyed
         self.stop_ping.store(true, Ordering::Relaxed);
 

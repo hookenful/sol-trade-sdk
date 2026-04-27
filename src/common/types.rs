@@ -9,6 +9,9 @@ pub struct InfrastructureConfig {
     pub rpc_url: String,
     pub swqos_configs: Vec<SwqosConfig>,
     pub commitment: CommitmentConfig,
+    /// Enable CPU affinity for SWQOS worker jobs. Default false to avoid binding SDK threads
+    /// to user/bot cores unless explicitly requested.
+    pub use_core_affinity: bool,
     /// When true, SWQOS sender threads use the *last* N cores instead of the first N. Reduces contention with main thread / default tokio workers that often use low-numbered cores. Default false.
     pub swqos_cores_from_end: bool,
     /// Global MEV protection flag. When true, SWQOS providers that support MEV protection
@@ -27,6 +30,7 @@ impl InfrastructureConfig {
             rpc_url,
             swqos_configs,
             commitment,
+            use_core_affinity: false,
             swqos_cores_from_end: false,
             mev_protection: false,
         }
@@ -38,6 +42,7 @@ impl InfrastructureConfig {
             rpc_url: config.rpc_url.clone(),
             swqos_configs: config.swqos_configs.clone(),
             commitment: config.commitment.clone(),
+            use_core_affinity: config.use_core_affinity,
             swqos_cores_from_end: config.swqos_cores_from_end,
             mev_protection: config.mev_protection,
         }
@@ -58,6 +63,7 @@ impl Hash for InfrastructureConfig {
         self.rpc_url.hash(state);
         self.swqos_configs.hash(state);
         format!("{:?}", self.commitment).hash(state);
+        self.use_core_affinity.hash(state);
         self.swqos_cores_from_end.hash(state);
         self.mev_protection.hash(state);
     }
@@ -68,6 +74,7 @@ impl PartialEq for InfrastructureConfig {
         self.rpc_url == other.rpc_url
             && self.swqos_configs == other.swqos_configs
             && self.commitment == other.commitment
+            && self.use_core_affinity == other.use_core_affinity
             && self.swqos_cores_from_end == other.swqos_cores_from_end
             && self.mev_protection == other.mev_protection
     }
@@ -89,6 +96,9 @@ pub struct TradeConfig {
     pub log_enabled: bool,
     /// Whether to check minimum tip per SWQOS provider (filter out configs below min). Default false to save latency.
     pub check_min_tip: bool,
+    /// Enable CPU affinity for SWQOS worker jobs. Default false to avoid startup/runtime
+    /// overhead and unexpected core binding unless explicitly requested.
+    pub use_core_affinity: bool,
     /// When true, SWQOS uses the *last* N cores (instead of the first N). Use when main thread / tokio use low-numbered cores to reduce CPU contention. Default false.
     pub swqos_cores_from_end: bool,
     /// Global MEV protection flag. When true, SWQOS providers that support MEV protection
@@ -105,6 +115,7 @@ impl TradeConfig {
     /// - `.use_seed_optimize(bool)`           — seed optimization for ATA ops (default: true)
     /// - `.log_enabled(bool)`                 — SDK timing/SWQOS logs (default: true)
     /// - `.check_min_tip(bool)`               — filter SWQOS below min tip (default: false)
+    /// - `.use_core_affinity(bool)`           — bind SWQOS jobs to selected CPU cores (default: false)
     /// - `.swqos_cores_from_end(bool)`        — bind SWQOS to last N cores (default: false)
     /// - `.mev_protection(bool)`              — MEV protection for Astralane/BlockRazor (default: false)
     ///
@@ -147,6 +158,7 @@ pub struct TradeConfigBuilder {
     use_seed_optimize: bool,
     log_enabled: bool,
     check_min_tip: bool,
+    use_core_affinity: bool,
     swqos_cores_from_end: bool,
     mev_protection: bool,
 }
@@ -161,6 +173,7 @@ impl TradeConfigBuilder {
             use_seed_optimize: true,
             log_enabled: true,
             check_min_tip: false,
+            use_core_affinity: false,
             swqos_cores_from_end: false,
             mev_protection: false,
         }
@@ -191,6 +204,12 @@ impl TradeConfigBuilder {
         self
     }
 
+    /// Bind SWQOS worker jobs to a preselected subset of CPU cores. Default: `false`.
+    pub fn use_core_affinity(mut self, v: bool) -> Self {
+        self.use_core_affinity = v;
+        self
+    }
+
     /// Bind SWQOS sender threads to the *last* N CPU cores instead of the first N.
     /// Useful when main thread / tokio workers occupy low-numbered cores. Default: `false`.
     pub fn swqos_cores_from_end(mut self, v: bool) -> Self {
@@ -218,6 +237,7 @@ impl TradeConfigBuilder {
             use_seed_optimize: self.use_seed_optimize,
             log_enabled: self.log_enabled,
             check_min_tip: self.check_min_tip,
+            use_core_affinity: self.use_core_affinity,
             swqos_cores_from_end: self.swqos_cores_from_end,
             mev_protection: self.mev_protection,
         }
@@ -226,3 +246,36 @@ impl TradeConfigBuilder {
 
 pub type SolanaRpcClient = solana_client::nonblocking::rpc_client::RpcClient;
 pub type AnyResult<T> = anyhow::Result<T>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn trade_config_defaults_disable_core_affinity() {
+        let config = TradeConfig::new(
+            "http://localhost:8899".to_string(),
+            vec![],
+            CommitmentConfig::processed(),
+        );
+
+        assert!(!config.use_core_affinity);
+
+        let infrastructure_config = InfrastructureConfig::from_trade_config(&config);
+        assert!(!infrastructure_config.use_core_affinity);
+    }
+
+    #[test]
+    fn trade_config_builder_can_enable_core_affinity() {
+        let config = TradeConfig::builder(
+            "http://localhost:8899".to_string(),
+            vec![],
+            CommitmentConfig::processed(),
+        )
+        .use_core_affinity(true)
+        .build();
+
+        assert!(config.use_core_affinity);
+        assert!(InfrastructureConfig::from_trade_config(&config).use_core_affinity);
+    }
+}

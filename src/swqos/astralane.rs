@@ -202,11 +202,20 @@ impl AstralaneClient {
                 let _ = response.bytes().await;
                 if status.is_success() {
                     if crate::common::sdk_log::sdk_log_enabled() {
-                        crate::common::sdk_log::log_swqos_submitted("Astralane", trade_type, start_time.elapsed());
+                        crate::common::sdk_log::log_swqos_submitted(
+                            "Astralane",
+                            trade_type,
+                            start_time.elapsed(),
+                        );
                     }
                 } else {
                     if crate::common::sdk_log::sdk_log_enabled() {
-                        crate::common::sdk_log::log_swqos_submission_failed("Astralane", trade_type, start_time.elapsed(), format!("status {}", status));
+                        crate::common::sdk_log::log_swqos_submission_failed(
+                            "Astralane",
+                            trade_type,
+                            start_time.elapsed(),
+                            format!("status {}", status),
+                        );
                     }
                     return Err(anyhow::anyhow!("Astralane sendTransaction failed: {}", status));
                 }
@@ -214,12 +223,21 @@ impl AstralaneClient {
             AstralaneBackend::Quic(quic) => {
                 if let Err(e) = quic.send_transaction(&body_bytes).await {
                     if crate::common::sdk_log::sdk_log_enabled() {
-                        crate::common::sdk_log::log_swqos_submission_failed("Astralane", trade_type, start_time.elapsed(), &e);
+                        crate::common::sdk_log::log_swqos_submission_failed(
+                            "Astralane",
+                            trade_type,
+                            start_time.elapsed(),
+                            &e,
+                        );
                     }
                     return Err(e);
                 }
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    crate::common::sdk_log::log_swqos_submitted("Astralane", trade_type, start_time.elapsed());
+                    crate::common::sdk_log::log_swqos_submitted(
+                        "Astralane",
+                        trade_type,
+                        start_time.elapsed(),
+                    );
                 }
             }
         }
@@ -229,15 +247,23 @@ impl AstralaneClient {
             Ok(_) => (),
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    println!(" signature: {:?}", signature);
-                    println!(" [{:width$}] {} confirmation failed: {:?}", "Astralane", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+                    crate::common::sdk_log::log_signature(signature);
+                    crate::common::sdk_log::log_swqos_confirmation_failed(
+                        "Astralane",
+                        trade_type,
+                        start_time.elapsed(),
+                    );
                 }
                 return Err(e);
             }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-            println!(" signature: {:?}", signature);
-            println!(" [{:width$}] {} confirmed: {:?}", "Astralane", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+            crate::common::sdk_log::log_signature(signature);
+            crate::common::sdk_log::log_swqos_confirmed(
+                "Astralane",
+                trade_type,
+                start_time.elapsed(),
+            );
         }
         Ok(())
     }
@@ -247,6 +273,10 @@ impl Drop for AstralaneClient {
     fn drop(&mut self) {
         match &self.backend {
             AstralaneBackend::Http { stop_ping, ping_handle, .. } => {
+                if Arc::strong_count(ping_handle) != 1 {
+                    return;
+                }
+
                 stop_ping.store(true, Ordering::Relaxed);
                 let ping_handle = ping_handle.clone();
                 tokio::spawn(async move {
