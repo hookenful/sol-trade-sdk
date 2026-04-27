@@ -14,6 +14,7 @@
 use anyhow::{anyhow, Result};
 use crossbeam_queue::ArrayQueue;
 use once_cell::sync::OnceCell;
+use parking_lot::Mutex;
 use solana_hash::Hash;
 use solana_message::AddressLookupTableAccount;
 use solana_sdk::{
@@ -21,7 +22,6 @@ use solana_sdk::{
 };
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
-use parking_lot::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{str::FromStr, sync::Arc, time::Instant};
 use tokio::sync::Notify;
@@ -183,11 +183,7 @@ fn ensure_dedicated_pool(
         .map(|all_ids| {
             sender_thread_cores
                 .map(|indices| {
-                    indices
-                        .iter()
-                        .take(n)
-                        .filter_map(|&i| all_ids.get(i).cloned())
-                        .collect()
+                    indices.iter().take(n).filter_map(|&i| all_ids.get(i).cloned()).collect()
                 })
                 .unwrap_or_else(|| all_ids.into_iter().take(n).collect())
         })
@@ -261,6 +257,15 @@ fn is_landed_error(error: &anyhow::Error) -> bool {
     false
 }
 
+#[inline]
+fn should_route_swqos_client(with_tip: bool, swqos_type: SwqosType) -> bool {
+    if with_tip {
+        !matches!(swqos_type, SwqosType::Default)
+    } else {
+        matches!(swqos_type, SwqosType::Default)
+    }
+}
+
 struct ResultCollector {
     results: Arc<ArrayQueue<TaskResult>>,
     success_flag: Arc<AtomicBool>,
@@ -302,7 +307,7 @@ impl ResultCollector {
     ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<(SwqosType, i64)>)> {
         let start = Instant::now();
         let timeout = std::time::Duration::from_secs(5);
-        let poll_interval = std::time::Duration::from_millis(1000);
+        let poll_interval = std::time::Duration::from_millis(100);
 
         loop {
             if self.success_flag.load(Ordering::Acquire) {
@@ -451,17 +456,14 @@ pub async fn execute_parallel(
     let instructions = Arc::new(instructions);
 
     // One get_strategies call per batch (avoid N calls in loop).
-    let gas_fee_configs = gas_fee_strategy.get_strategies(if is_buy {
-        TradeType::Buy
-    } else {
-        TradeType::Sell
-    });
+    let gas_fee_configs =
+        gas_fee_strategy.get_strategies(if is_buy { TradeType::Buy } else { TradeType::Sell });
     let mut task_configs = Vec::with_capacity(swqos_clients.len() * 3);
     for (i, swqos_client) in swqos_clients.iter().enumerate() {
-        if !with_tip && !matches!(swqos_client.get_swqos_type(), SwqosType::Default) {
+        let swqos_type = swqos_client.get_swqos_type();
+        if !should_route_swqos_client(with_tip, swqos_type) {
             continue;
         }
-        let swqos_type = swqos_client.get_swqos_type();
         let check_tip = with_tip && !matches!(swqos_type, SwqosType::Default) && check_min_tip;
         let min_tip = if check_tip { swqos_client.min_tip_sol() } else { 0.0 };
         for config in &gas_fee_configs {
@@ -470,7 +472,8 @@ pub async fn execute_parallel(
             }
             if check_tip {
                 if config.2.tip < min_tip && crate::common::sdk_log::sdk_log_enabled() {
-                    println!(
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
                         "⚠️ Config filtered: {:?} tip {} is below minimum required {}",
                         config.0, config.2.tip, min_tip
                     );
@@ -562,7 +565,7 @@ pub async fn execute_parallel(
     // All jobs enqueued (no spawn on hot path)
 
     if !wait_transaction_confirmed {
-        const SUBMIT_TIMEOUT_SECS: u64 = 2;//无需确认的交易，一般2秒合适了 一般2秒内发送全都返回 没返回的也不等了，没返回的就是太慢的swqos 
+        const SUBMIT_TIMEOUT_SECS: u64 = 2; //无需确认的交易，一般2秒合适了 一般2秒内发送全都返回 没返回的也不等了，没返回的就是太慢的swqos
         let ret = collector.wait_for_all_submitted(SUBMIT_TIMEOUT_SECS).await.unwrap_or((
             false,
             vec![],
@@ -578,5 +581,24 @@ pub async fn execute_parallel(
         Ok((success, signatures, last_error, submit_timings))
     } else {
         Err(anyhow!("All transactions failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_with_tip_skips_default_rpc() {
+        assert!(!should_route_swqos_client(true, SwqosType::Default));
+        assert!(should_route_swqos_client(true, SwqosType::Jito));
+        assert!(should_route_swqos_client(true, SwqosType::Helius));
+    }
+
+    #[test]
+    fn route_without_tip_uses_only_default_rpc() {
+        assert!(should_route_swqos_client(false, SwqosType::Default));
+        assert!(!should_route_swqos_client(false, SwqosType::Jito));
+        assert!(!should_route_swqos_client(false, SwqosType::Bloxroute));
     }
 }

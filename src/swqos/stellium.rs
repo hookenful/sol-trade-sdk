@@ -99,7 +99,7 @@ impl StelliumClient {
                 let status = resp.status();
                 let _ = resp.bytes().await;
                 if !status.is_success() && crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!(" [Stellium] Ping failed with status: {}", status);
+                    crate::common::sdk_log::log_swqos_ping_status("Stellium", status);
                 }
             }
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -114,12 +114,12 @@ impl StelliumClient {
                         let status = response.status();
                         let _ = response.bytes().await;
                         if !status.is_success() && crate::common::sdk_log::sdk_log_enabled() {
-                            eprintln!(" [Stellium] Ping failed with status: {}", status);
+                            crate::common::sdk_log::log_swqos_ping_status("Stellium", status);
                         }
                     }
                     Err(e) => {
                         if crate::common::sdk_log::sdk_log_enabled() {
-                            eprintln!(" [Stellium] Ping request error: {:?}", e);
+                            crate::common::sdk_log::log_swqos_ping_failed("Stellium", e);
                         }
                     }
                 }
@@ -168,13 +168,27 @@ impl StelliumClient {
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if crate::common::sdk_log::sdk_log_enabled() {
                 if response_json.get("result").is_some() {
-                    crate::common::sdk_log::log_swqos_submitted("Stellium", trade_type, start_time.elapsed());
+                    crate::common::sdk_log::log_swqos_submitted(
+                        "Stellium",
+                        trade_type,
+                        start_time.elapsed(),
+                    );
                 } else if let Some(_error) = response_json.get("error") {
-                    crate::common::sdk_log::log_swqos_submission_failed("Stellium", trade_type, start_time.elapsed(), _error);
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "Stellium",
+                        trade_type,
+                        start_time.elapsed(),
+                        _error,
+                    );
                 }
             }
         } else if crate::common::sdk_log::sdk_log_enabled() {
-            crate::common::sdk_log::log_swqos_submission_failed("Stellium", trade_type, start_time.elapsed(), response_text);
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "Stellium",
+                trade_type,
+                start_time.elapsed(),
+                response_text,
+            );
         }
 
         let start_time: Instant = Instant::now();
@@ -182,21 +196,23 @@ impl StelliumClient {
             Ok(_) => (),
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    println!(" signature: {:?}", signature);
-                    println!(
-                        " [{:width$}] {} confirmation failed: {:?}",
+                    crate::common::sdk_log::log_signature(signature);
+                    crate::common::sdk_log::log_swqos_confirmation_failed(
                         "Stellium",
                         trade_type,
                         start_time.elapsed(),
-                        width = crate::common::sdk_log::SWQOS_LABEL_WIDTH
                     );
                 }
                 return Err(e);
             }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-            println!(" signature: {:?}", signature);
-            println!(" [{:width$}] {} confirmed: {:?}", "Stellium", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+            crate::common::sdk_log::log_signature(signature);
+            crate::common::sdk_log::log_swqos_confirmed(
+                "Stellium",
+                trade_type,
+                start_time.elapsed(),
+            );
         }
 
         Ok(())
@@ -222,6 +238,10 @@ impl StelliumClient {
 
 impl Drop for StelliumClient {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.keep_alive_running) > 2 {
+            return;
+        }
+
         // Stop ping task when client is dropped
         self.keep_alive_running.store(false, Ordering::Relaxed);
     }

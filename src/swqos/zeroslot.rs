@@ -1,12 +1,10 @@
-use crate::swqos::common::{
-    default_http_client_builder, poll_transaction_confirmation,
-};
+use crate::swqos::common::{default_http_client_builder, poll_transaction_confirmation};
+use bincode;
 use rand::seq::IndexedRandom;
 use reqwest::Client;
-use std::{sync::Arc, time::Instant, time::Duration};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::{sync::Arc, time::Duration, time::Instant};
 use tokio::task::JoinHandle;
-use bincode;
 
 use crate::swqos::SwqosClientTrait;
 use crate::swqos::{SwqosType, TradeType};
@@ -92,7 +90,7 @@ impl ZeroSlotClient {
             // Immediate first ping to warm connection and reduce first-submit cold start latency
             if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    eprintln!("0slot ping request failed: {}", e);
+                    crate::common::sdk_log::log_swqos_ping_failed("0slot", e);
                 }
             }
             let mut interval = tokio::time::interval(Duration::from_secs(30)); // 30s keepalive under 65s server timeout
@@ -101,9 +99,10 @@ impl ZeroSlotClient {
                 if stop_ping.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
+                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await
+                {
                     if crate::common::sdk_log::sdk_log_enabled() {
-                        eprintln!("0slot ping request failed: {}", e);
+                        crate::common::sdk_log::log_swqos_ping_failed("0slot", e);
                     }
                 }
             }
@@ -176,41 +175,89 @@ impl ZeroSlotClient {
             200 => {
                 if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&response_text) {
                     if json_value.get("result").is_some() {
-                        crate::common::sdk_log::log_swqos_submitted("0slot", trade_type, start_time.elapsed());
+                        crate::common::sdk_log::log_swqos_submitted(
+                            "0slot",
+                            trade_type,
+                            start_time.elapsed(),
+                        );
                     } else if let Some(error) = json_value.get("error") {
-                        let code = error.get("code")
+                        let code = error
+                            .get("code")
                             .and_then(|c| c.as_i64())
                             .map(|c| c.to_string())
                             .unwrap_or_else(|| "unknown".to_string());
-                        let message = error.get("message")
+                        let message = error
+                            .get("message")
                             .and_then(|m| m.as_str())
                             .unwrap_or("unknown error");
-                        crate::common::sdk_log::log_swqos_submission_failed("0slot", trade_type, start_time.elapsed(), format!("code {}: {}", code, message));
+                        crate::common::sdk_log::log_swqos_submission_failed(
+                            "0slot",
+                            trade_type,
+                            start_time.elapsed(),
+                            format!("code {}: {}", code, message),
+                        );
                         return Err(anyhow::anyhow!("0slot Binary-Tx error: {}", message));
                     } else {
-                        crate::common::sdk_log::log_swqos_submission_failed("0slot", trade_type, start_time.elapsed(), format!("unexpected JSON: {}", response_text));
-                        return Err(anyhow::anyhow!("0slot Binary-Tx unexpected JSON: {}", response_text));
+                        crate::common::sdk_log::log_swqos_submission_failed(
+                            "0slot",
+                            trade_type,
+                            start_time.elapsed(),
+                            format!("unexpected JSON: {}", response_text),
+                        );
+                        return Err(anyhow::anyhow!(
+                            "0slot Binary-Tx unexpected JSON: {}",
+                            response_text
+                        ));
                     }
                 } else {
-                    crate::common::sdk_log::log_swqos_submission_failed("0slot", trade_type, start_time.elapsed(), format!("invalid JSON: {}", response_text));
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "0slot",
+                        trade_type,
+                        start_time.elapsed(),
+                        format!("invalid JSON: {}", response_text),
+                    );
                     return Err(anyhow::anyhow!("0slot Binary-Tx invalid JSON: {}", response_text));
                 }
             }
             403 => {
-                crate::common::sdk_log::log_swqos_submission_failed("0slot", trade_type, start_time.elapsed(), response_text.clone());
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "0slot",
+                    trade_type,
+                    start_time.elapsed(),
+                    response_text.clone(),
+                );
                 return Err(anyhow::anyhow!("0slot API key error: {}", response_text));
             }
             419 => {
-                crate::common::sdk_log::log_swqos_submission_failed("0slot", trade_type, start_time.elapsed(), response_text.clone());
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "0slot",
+                    trade_type,
+                    start_time.elapsed(),
+                    response_text.clone(),
+                );
                 return Err(anyhow::anyhow!("0slot rate limit exceeded"));
             }
             500 => {
-                crate::common::sdk_log::log_swqos_submission_failed("0slot", trade_type, start_time.elapsed(), "submission failed".to_string());
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "0slot",
+                    trade_type,
+                    start_time.elapsed(),
+                    "submission failed".to_string(),
+                );
                 return Err(anyhow::anyhow!("0slot transaction submission failed"));
             }
             _ => {
-                crate::common::sdk_log::log_swqos_submission_failed("0slot", trade_type, start_time.elapsed(), format!("status {} body: {}", status, response_text));
-                return Err(anyhow::anyhow!("0slot Binary-Tx failed with status {}: {}", status, response_text));
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "0slot",
+                    trade_type,
+                    start_time.elapsed(),
+                    format!("status {} body: {}", status, response_text),
+                );
+                return Err(anyhow::anyhow!(
+                    "0slot Binary-Tx failed with status {}: {}",
+                    status,
+                    response_text
+                ));
             }
         }
 
@@ -221,14 +268,18 @@ impl ZeroSlotClient {
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [{:width$}] {} confirmation failed: {:?}", "0slot", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+                crate::common::sdk_log::log_signature(signature);
+                crate::common::sdk_log::log_swqos_confirmation_failed(
+                    "0slot",
+                    trade_type,
+                    start_time.elapsed(),
+                );
                 return Err(e);
             }
         }
         if wait_confirmation {
-            println!(" signature: {:?}", signature);
-            println!(" [{:width$}] {} confirmed: {:?}", "0slot", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+            crate::common::sdk_log::log_signature(signature);
+            crate::common::sdk_log::log_swqos_confirmed("0slot", trade_type, start_time.elapsed());
         }
 
         Ok(())
@@ -249,6 +300,10 @@ impl ZeroSlotClient {
 
 impl Drop for ZeroSlotClient {
     fn drop(&mut self) {
+        if Arc::strong_count(&self.ping_handle) != 1 {
+            return;
+        }
+
         // Ensure ping task stops when client is destroyed
         self.stop_ping.store(true, Ordering::Relaxed);
 

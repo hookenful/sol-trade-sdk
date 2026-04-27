@@ -105,26 +105,44 @@ impl JitoClient {
 
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if response_json.get("result").is_some() {
-                crate::common::sdk_log::log_swqos_submitted("jito", trade_type, start_time.elapsed());
+                crate::common::sdk_log::log_swqos_submitted(
+                    "jito",
+                    trade_type,
+                    start_time.elapsed(),
+                );
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" [jito] {} submission failed after {:?}: {:?}", trade_type, start_time.elapsed(), _error);
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "jito",
+                    trade_type,
+                    start_time.elapsed(),
+                    _error,
+                );
             }
         } else {
-            crate::common::sdk_log::log_swqos_submission_failed("jito", trade_type, start_time.elapsed(), response_text);
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "jito",
+                trade_type,
+                start_time.elapsed(),
+                response_text,
+            );
         }
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [{:width$}] {} confirmation failed: {:?}", "jito", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+                crate::common::sdk_log::log_signature(signature);
+                crate::common::sdk_log::log_swqos_confirmation_failed(
+                    "jito",
+                    trade_type,
+                    start_time.elapsed(),
+                );
                 return Err(e);
             }
         }
         if wait_confirmation {
-            println!(" signature: {:?}", signature);
-            println!(" [{:width$}] {} confirmed: {:?}", "jito", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+            crate::common::sdk_log::log_signature(signature);
+            crate::common::sdk_log::log_swqos_confirmed("jito", trade_type, start_time.elapsed());
         }
 
         Ok(())
@@ -169,9 +187,18 @@ impl JitoClient {
 
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if response_json.get("result").is_some() {
-                println!(" jito {} submitted: {:?}", trade_type, start_time.elapsed());
+                crate::common::sdk_log::log_swqos_submitted(
+                    "jito",
+                    trade_type,
+                    start_time.elapsed(),
+                );
             } else if let Some(_error) = response_json.get("error") {
-                eprintln!(" jito {} submission failed after {:?}: {:?}", trade_type, start_time.elapsed(), _error);
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "jito",
+                    trade_type,
+                    start_time.elapsed(),
+                    _error,
+                );
             }
         }
 

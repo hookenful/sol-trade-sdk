@@ -159,29 +159,20 @@ impl TradingInfrastructure {
             {
                 Ok(Ok(swqos_client)) => swqos_clients.push(swqos_client),
                 Ok(Err(err)) => {
-                    eprintln!(
-                        "⚠️  SWQOS {:?} 初始化失败: {}（已从列表中排除）",
-                        swqos.swqos_type(),
-                        err
-                    );
                     if sdk_log::sdk_log_enabled() {
                         warn!(
                             target: "sol_trade_sdk",
-                            "failed to create {:?} swqos client: {err}. Excluding from swqos list",
-                            swqos.swqos_type()
+                            "⚠️  SWQOS {:?} 初始化失败: {}（已从列表中排除）",
+                            swqos.swqos_type(),
+                            err
                         );
                     }
                 }
                 Err(_) => {
-                    eprintln!(
-                        "⚠️  SWQOS {:?} 初始化超时（{}s），已跳过",
-                        swqos.swqos_type(),
-                        SWQOS_CLIENT_TIMEOUT.as_secs()
-                    );
                     if sdk_log::sdk_log_enabled() {
                         warn!(
                             target: "sol_trade_sdk",
-                            "swqos {:?} init timed out ({}s), skipping",
+                            "⚠️  SWQOS {:?} 初始化超时（{}s），已跳过",
                             swqos.swqos_type(),
                             SWQOS_CLIENT_TIMEOUT.as_secs()
                         );
@@ -192,14 +183,10 @@ impl TradingInfrastructure {
 
         // 若全部失败、被黑名单跳过或仅配置了不可用通道，至少保留一条 Rpc Default，否则 execute_parallel 会因 swqos_clients 为空直接报错。
         if swqos_clients.is_empty() {
-            eprintln!(
-                "⚠️  无任何 SWQOS 客户端初始化成功，将回退为普通 RPC 发送: {}",
-                config.rpc_url
-            );
             if sdk_log::sdk_log_enabled() {
                 warn!(
                     target: "sol_trade_sdk",
-                    "no SWQOS clients initialized; falling back to Rpc Default ({})",
+                    "⚠️  无任何 SWQOS 客户端初始化成功，将回退为普通 RPC 发送: {}",
                     config.rpc_url
                 );
             }
@@ -225,33 +212,34 @@ impl TradingInfrastructure {
         }
 
         if !swqos_clients.is_empty() {
-            let labels: Vec<&str> = swqos_clients
-                .iter()
-                .map(|c| c.get_swqos_type().as_str())
-                .collect();
-            eprintln!(
-                "ℹ️  SWQOS 通道已就绪: {} 条 → [{}]",
-                swqos_clients.len(),
-                labels.join(", ")
-            );
+            let labels: Vec<&str> =
+                swqos_clients.iter().map(|c| c.get_swqos_type().as_str()).collect();
+            if sdk_log::sdk_log_enabled() {
+                info!(
+                    target: "sol_trade_sdk",
+                    "ℹ️  SWQOS 通道已就绪: {} 条 → [{}]",
+                    swqos_clients.len(),
+                    labels.join(", ")
+                );
+            }
         }
 
         let swqos_count = swqos_clients.len();
         let (max_sender_concurrency, effective_core_ids) = {
-            let num_cores = core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(0);
+            let core_ids = core_affinity::get_core_ids().unwrap_or_default();
+            let num_cores = core_ids.len();
             let max_by_cores = (num_cores * 2 / 3).max(1);
             let cap = swqos_count.min(max_by_cores).max(1);
-            let ids = core_affinity::get_core_ids()
-                .map(|all| {
-                    let v: Vec<_> = all.into_iter().collect();
-                    let len = v.len();
-                    if config.swqos_cores_from_end && len >= cap {
-                        v.into_iter().skip(len - cap).collect()
-                    } else {
-                        v.into_iter().take(cap).collect()
-                    }
-                })
-                .unwrap_or_default();
+            let ids = if config.use_core_affinity {
+                let len = core_ids.len();
+                if config.swqos_cores_from_end && len >= cap {
+                    core_ids.into_iter().skip(len - cap).collect()
+                } else {
+                    core_ids.into_iter().take(cap).collect()
+                }
+            } else {
+                Vec::new()
+            };
             (cap, Arc::new(ids))
         };
 
@@ -734,7 +722,8 @@ impl TradingClient {
             Some(v) => {
                 self.use_dedicated_sender_threads = true;
                 let cap = v.len().min(self.max_sender_concurrency);
-                self.sender_thread_cores = Some(Arc::new(if cap < v.len() { v[..cap].to_vec() } else { v }));
+                self.sender_thread_cores =
+                    Some(Arc::new(if cap < v.len() { v[..cap].to_vec() } else { v }));
             }
         }
         self
@@ -797,7 +786,10 @@ impl TradingClient {
     pub async fn buy(
         &self,
         params: TradeBuyParams,
-    ) -> Result<(bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>), anyhow::Error> {
+    ) -> Result<
+        (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
+        anyhow::Error,
+    > {
         if params.recent_blockhash.is_none() && params.durable_nonce.is_none() {
             return Err(anyhow::anyhow!(
                 "Must provide either recent_blockhash or durable_nonce for buy (required for transaction validity)"
@@ -870,8 +862,9 @@ impl TradingClient {
         };
 
         let swap_result = executor.swap(buy_params).await;
-        let result =
-            swap_result.map(|(success, sigs, err, timings)| (success, sigs, err.map(TradeError::from), timings));
+        let result = swap_result.map(|(success, sigs, err, timings)| {
+            (success, sigs, err.map(TradeError::from), timings)
+        });
         result
     }
 
@@ -904,7 +897,10 @@ impl TradingClient {
     pub async fn sell(
         &self,
         params: TradeSellParams,
-    ) -> Result<(bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>), anyhow::Error> {
+    ) -> Result<
+        (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
+        anyhow::Error,
+    > {
         #[cfg(feature = "perf-trace")]
         if sdk_log::sdk_log_enabled() && params.slippage_basis_points.is_none() {
             debug!(
@@ -977,8 +973,9 @@ impl TradingClient {
         };
 
         let swap_result = executor.swap(sell_params).await;
-        let result =
-            swap_result.map(|(success, sigs, err, timings)| (success, sigs, err.map(TradeError::from), timings));
+        let result = swap_result.map(|(success, sigs, err, timings)| {
+            (success, sigs, err.map(TradeError::from), timings)
+        });
         result
     }
 
@@ -1013,7 +1010,10 @@ impl TradingClient {
         mut params: TradeSellParams,
         amount_token: u64,
         percent: u64,
-    ) -> Result<(bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>), anyhow::Error> {
+    ) -> Result<
+        (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
+        anyhow::Error,
+    > {
         if percent == 0 || percent > 100 {
             return Err(anyhow::anyhow!("Percentage must be between 1 and 100"));
         }

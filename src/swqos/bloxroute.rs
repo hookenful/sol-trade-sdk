@@ -4,7 +4,9 @@ use crate::swqos::common::serialize_transaction_and_encode;
 use crate::swqos::serialization;
 use rand::seq::IndexedRandom;
 use reqwest::Client;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Instant};
+use tokio::task::JoinHandle;
 
 use solana_transaction_status::UiTransactionEncoding;
 use std::time::Duration;
@@ -22,6 +24,8 @@ pub struct BloxrouteClient {
     pub auth_token: String,
     pub rpc_client: Arc<SolanaRpcClient>,
     pub http_client: Client,
+    pub ping_handle: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    pub stop_ping: Arc<AtomicBool>,
 }
 
 #[async_trait::async_trait]
@@ -57,6 +61,23 @@ impl SwqosClientTrait for BloxrouteClient {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_ping_url_targets_rate_limit_endpoint() {
+        assert_eq!(
+            BloxrouteClient::build_ping_url("https://ny.solana.dex.blxrbdn.com"),
+            "https://ny.solana.dex.blxrbdn.com/api/v2/rate-limit"
+        );
+        assert_eq!(
+            BloxrouteClient::build_ping_url("https://ny.solana.dex.blxrbdn.com/"),
+            "https://ny.solana.dex.blxrbdn.com/api/v2/rate-limit"
+        );
+    }
+}
+
 impl BloxrouteClient {
     pub fn new(rpc_url: String, endpoint: String, auth_token: String) -> Self {
         let rpc_client = SolanaRpcClient::new(rpc_url);
@@ -65,7 +86,82 @@ impl BloxrouteClient {
             .pool_max_idle_per_host(256)
             .build()
             .unwrap();
-        Self { rpc_client: Arc::new(rpc_client), endpoint, auth_token, http_client }
+        let client = Self {
+            rpc_client: Arc::new(rpc_client),
+            endpoint,
+            auth_token,
+            http_client,
+            ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+        };
+
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            client_clone.start_ping_task().await;
+        });
+
+        client
+    }
+
+    #[inline]
+    fn build_ping_url(endpoint: &str) -> String {
+        format!("{}/api/v2/rate-limit", endpoint.trim_end_matches('/'))
+    }
+
+    async fn start_ping_task(&self) {
+        let endpoint = self.endpoint.clone();
+        let auth_token = self.auth_token.clone();
+        let http_client = self.http_client.clone();
+        let stop_ping = self.stop_ping.clone();
+
+        let handle = tokio::spawn(async move {
+            if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await {
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    tracing::warn!(target: "sol_trade_sdk", "bloxroute ping request failed: {}", e);
+                }
+            }
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                if stop_ping.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(e) = Self::send_ping_request(&http_client, &endpoint, &auth_token).await
+                {
+                    if crate::common::sdk_log::sdk_log_enabled() {
+                        tracing::warn!(target: "sol_trade_sdk", "bloxroute ping request failed: {}", e);
+                    }
+                }
+            }
+        });
+
+        let mut ping_guard = self.ping_handle.lock().await;
+        if let Some(old_handle) = ping_guard.as_ref() {
+            old_handle.abort();
+        }
+        *ping_guard = Some(handle);
+    }
+
+    async fn send_ping_request(
+        http_client: &Client,
+        endpoint: &str,
+        auth_token: &str,
+    ) -> Result<()> {
+        let response = http_client
+            .get(Self::build_ping_url(endpoint))
+            .header("Authorization", auth_token)
+            .timeout(Duration::from_millis(1500))
+            .send()
+            .await?;
+        if !response.status().is_success() && crate::common::sdk_log::sdk_log_enabled() {
+            tracing::warn!(
+                target: "sol_trade_sdk",
+                "bloxroute ping returned non-success status: {}",
+                response.status()
+            );
+        }
+        let _ = response.bytes().await;
+        Ok(())
     }
 
     pub async fn send_transaction(
@@ -100,13 +196,27 @@ impl BloxrouteClient {
         if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
             if crate::common::sdk_log::sdk_log_enabled() {
                 if response_json.get("result").is_some() {
-                    crate::common::sdk_log::log_swqos_submitted("bloxroute", trade_type, start_time.elapsed());
+                    crate::common::sdk_log::log_swqos_submitted(
+                        "bloxroute",
+                        trade_type,
+                        start_time.elapsed(),
+                    );
                 } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(" [bloxroute] {} submission failed after {:?}: {:?}", trade_type, start_time.elapsed(), _error);
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "bloxroute",
+                        trade_type,
+                        start_time.elapsed(),
+                        _error,
+                    );
                 }
             }
         } else if crate::common::sdk_log::sdk_log_enabled() {
-            crate::common::sdk_log::log_swqos_submission_failed("bloxroute", trade_type, start_time.elapsed(), response_text);
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "bloxroute",
+                trade_type,
+                start_time.elapsed(),
+                response_text,
+            );
         }
 
         let start_time: Instant = Instant::now();
@@ -114,8 +224,9 @@ impl BloxrouteClient {
             Ok(_) => (),
             Err(e) => {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    println!(" signature: {:?}", signature);
-                    println!(
+                    tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+                    tracing::warn!(
+                        target: "sol_trade_sdk",
                         " [{:width$}] {} confirmation failed: {:?}",
                         "bloxroute",
                         trade_type,
@@ -127,8 +238,8 @@ impl BloxrouteClient {
             }
         }
         if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
-            println!(" signature: {:?}", signature);
-            println!(" [{:width$}] {} confirmed: {:?}", "bloxroute", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
+            tracing::info!(target: "sol_trade_sdk", " signature: {:?}", signature);
+            tracing::info!(target: "sol_trade_sdk", " [{:width$}] {} confirmed: {:?}", "bloxroute", trade_type, start_time.elapsed(), width = crate::common::sdk_log::SWQOS_LABEL_WIDTH);
         }
 
         Ok(())
@@ -168,13 +279,39 @@ impl BloxrouteClient {
         if crate::common::sdk_log::sdk_log_enabled() {
             if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
                 if response_json.get("result").is_some() {
-                    println!(" bloxroute {} submitted: {:?}", trade_type, start_time.elapsed());
+                    crate::common::sdk_log::log_swqos_submitted(
+                        "bloxroute",
+                        trade_type,
+                        start_time.elapsed(),
+                    );
                 } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(" bloxroute {} submission failed after {:?}: {:?}", trade_type, start_time.elapsed(), _error);
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "bloxroute",
+                        trade_type,
+                        start_time.elapsed(),
+                        _error,
+                    );
                 }
             }
         }
 
         Ok(())
+    }
+}
+
+impl Drop for BloxrouteClient {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.ping_handle) != 1 {
+            return;
+        }
+
+        self.stop_ping.store(true, Ordering::Relaxed);
+        let ping_handle = self.ping_handle.clone();
+        tokio::spawn(async move {
+            let mut ping_guard = ping_handle.lock().await;
+            if let Some(handle) = ping_guard.take() {
+                handle.abort();
+            }
+        });
     }
 }

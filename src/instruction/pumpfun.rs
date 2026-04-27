@@ -10,9 +10,9 @@ use crate::{
     instruction::utils::pumpfun::{
         accounts, get_bonding_curve_pda, get_bonding_curve_v2_pda,
         get_protocol_extra_fee_recipient_random, get_user_volume_accumulator_pda,
-        pump_fun_fee_recipient_meta, resolve_creator_vault_for_ix,
         global_constants::{self},
-        BUY_DISCRIMINATOR, BUY_EXACT_SOL_IN_DISCRIMINATOR, SELL_DISCRIMINATOR,
+        pump_fun_fee_recipient_meta, resolve_creator_vault_for_ix, BUY_DISCRIMINATOR,
+        BUY_EXACT_SOL_IN_DISCRIMINATOR, SELL_DISCRIMINATOR,
     },
     utils::calc::{
         common::{calculate_with_slippage_buy, calculate_with_slippage_sell},
@@ -51,12 +51,7 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             protocol_params.creator_vault,
             &params.output_mint,
         )
-        .ok_or_else(|| {
-            anyhow!(
-                "creator_vault PDA derivation failed (creator={})",
-                creator
-            )
-        })?;
+        .ok_or_else(|| anyhow!("creator_vault PDA derivation failed (creator={})", creator))?;
 
         // ========================================
         // Trade calculation and account address preparation
@@ -135,10 +130,14 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         let mut buy_data = [0u8; 26];
         if params.use_exact_sol_amount.unwrap_or(true) {
             // buy_exact_sol_in(spendable_sol_in: u64, min_tokens_out: u64, track_volume)
-            let min_tokens_out = calculate_with_slippage_sell(
-                buy_token_amount,
-                params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
-            );
+            let min_tokens_out = if params.use_exact_sol_amount == Some(true) {
+                1
+            } else {
+                calculate_with_slippage_sell(
+                    buy_token_amount,
+                    params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
+                )
+            };
             buy_data[..8].copy_from_slice(&BUY_EXACT_SOL_IN_DISCRIMINATOR);
             buy_data[8..16].copy_from_slice(&params.input_amount.unwrap_or(0).to_le_bytes());
             buy_data[16..24].copy_from_slice(&min_tokens_out.to_le_bytes());
@@ -177,7 +176,7 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             accounts::FEE_PROGRAM_META,
         ];
         accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // remainingAccounts: @pump-fun/pump-sdk 要求末尾传 bondingCurveV2Pda(mint)，勿删
-        // Apr 2026: extra protocol fee recipient after bonding-curve-v2 (writable)
+                                                                           // Apr 2026: extra protocol fee recipient after bonding-curve-v2 (writable)
         accounts.push(AccountMeta::new(get_protocol_extra_fee_recipient_random(), false));
 
         instructions.push(Instruction::new_with_bytes(accounts::PUMPFUN, &buy_data, accounts));
@@ -211,12 +210,7 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             protocol_params.creator_vault,
             &params.input_mint,
         )
-        .ok_or_else(|| {
-            anyhow!(
-                "creator_vault PDA derivation failed (creator={})",
-                creator
-            )
-        })?;
+        .ok_or_else(|| anyhow!("creator_vault PDA derivation failed (creator={})", creator))?;
 
         // ========================================
         // Trade calculation and account address preparation
@@ -339,4 +333,79 @@ pub fn claim_cashback_pumpfun_instruction(payer: &Pubkey) -> Option<Instruction>
         accounts::PUMPFUN_META,
     ];
     Some(Instruction::new_with_bytes(accounts::PUMPFUN, &CLAIM_CASHBACK_DISCRIMINATOR, accounts))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::common::{bonding_curve::BondingCurveAccount, GasFeeStrategy};
+    use crate::instruction::utils::pumpfun::get_creator_vault_pda;
+    use crate::swqos::TradeType;
+    use crate::trading::core::params::DexParamEnum;
+    use solana_sdk::signature::Keypair;
+    use std::sync::Arc;
+
+    fn pumpfun_buy_params(use_exact_sol_amount: Option<bool>) -> SwapParams {
+        let payer = Arc::new(Keypair::new());
+        let mint = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        let bonding_curve =
+            BondingCurveAccount { creator, is_cashback_coin: false, ..Default::default() };
+
+        SwapParams {
+            rpc: None,
+            payer,
+            trade_type: TradeType::Buy,
+            input_mint: crate::constants::WSOL_TOKEN_ACCOUNT,
+            input_token_program: Some(crate::constants::TOKEN_PROGRAM),
+            output_mint: mint,
+            output_token_program: Some(crate::constants::TOKEN_PROGRAM),
+            input_amount: Some(2_000_000),
+            slippage_basis_points: Some(1_000),
+            address_lookup_table_account: None,
+            recent_blockhash: None,
+            wait_tx_confirmed: false,
+            protocol_params: DexParamEnum::PumpFun(PumpFunParams {
+                bonding_curve: Arc::new(bonding_curve),
+                associated_bonding_curve: Pubkey::default(),
+                creator_vault: get_creator_vault_pda(&creator).unwrap(),
+                token_program: crate::constants::TOKEN_PROGRAM,
+                close_token_account_when_sell: None,
+                fee_recipient: Pubkey::default(),
+            }),
+            open_seed_optimize: true,
+            swqos_clients: Arc::new(vec![]),
+            middleware_manager: None,
+            durable_nonce: None,
+            with_tip: true,
+            create_input_mint_ata: false,
+            close_input_mint_ata: false,
+            create_output_mint_ata: false,
+            close_output_mint_ata: false,
+            fixed_output_amount: Some(1_000_000),
+            gas_fee_strategy: GasFeeStrategy::new(),
+            simulate: false,
+            log_enabled: false,
+            use_dedicated_sender_threads: false,
+            sender_thread_cores: None,
+            max_sender_concurrency: 1,
+            effective_core_ids: Arc::new(vec![]),
+            check_min_tip: false,
+            grpc_recv_us: None,
+            use_exact_sol_amount,
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_exact_sol_uses_one_min_token_out() {
+        let builder = PumpFunInstructionBuilder;
+        let instructions =
+            builder.build_buy_instructions(&pumpfun_buy_params(Some(true))).await.unwrap();
+        let buy_ix = instructions.last().unwrap();
+
+        assert_eq!(buy_ix.data.len(), 26);
+        assert_eq!(&buy_ix.data[..8], &BUY_EXACT_SOL_IN_DISCRIMINATOR);
+        assert_eq!(u64::from_le_bytes(buy_ix.data[16..24].try_into().unwrap()), 1);
+        assert_eq!(&buy_ix.data[24..26], &[1, 0]);
+    }
 }
