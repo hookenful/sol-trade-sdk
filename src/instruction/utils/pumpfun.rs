@@ -1,5 +1,6 @@
 use crate::common::{bonding_curve::BondingCurveAccount, SolanaRpcClient};
 use anyhow::anyhow;
+use rand::seq::IndexedRandom;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
@@ -91,6 +92,19 @@ pub mod global_constants {
     pub const PUMPFUN_AMM_FEE_6: Pubkey = pubkey!("FWsW1xNtWscwNmKv6wVsU1iTzRN6wmmk3MjxRP5tT7hz"); // Pump.fun AMM: Protocol Fee 6
     pub const PUMPFUN_AMM_FEE_7: Pubkey = pubkey!("G5UZAVbAf46s7cKWoyKu8kYTip9DGTpbLZ2qa9Aq69dP");
     // Pump.fun AMM: Protocol Fee 7
+
+    /// Protocol extra fee recipients (Apr 2026 breaking upgrade). One is appended after `bonding-curve-v2`, **writable**.
+    /// See: <https://github.com/pump-fun/pump-public-docs/blob/main/docs/BREAKING_FEE_RECIPIENT.md>
+    pub const PROTOCOL_EXTRA_FEE_RECIPIENTS: [Pubkey; 8] = [
+        pubkey!("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"),
+        pubkey!("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7"),
+        pubkey!("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL"),
+        pubkey!("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR"),
+        pubkey!("5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6"),
+        pubkey!("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL"),
+        pubkey!("5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD"),
+        pubkey!("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW"),
+    ];
 }
 
 /// Constants related to program accounts and authorities
@@ -160,6 +174,14 @@ pub mod accounts {
 pub const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 pub const BUY_EXACT_SOL_IN_DISCRIMINATOR: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
 pub const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+
+/// Random entry from [`global_constants::PROTOCOL_EXTRA_FEE_RECIPIENTS`] (must be last account after bonding-curve-v2, writable).
+#[inline]
+pub fn get_protocol_extra_fee_recipient_random() -> Pubkey {
+    *global_constants::PROTOCOL_EXTRA_FEE_RECIPIENTS
+        .choose(&mut rand::rng())
+        .unwrap_or(&global_constants::PROTOCOL_EXTRA_FEE_RECIPIENTS[0])
+}
 
 pub struct Symbol;
 

@@ -6,6 +6,7 @@ use crate::{
     instruction::utils::pumpswap_types::{pool_decode, Pool},
 };
 use anyhow::anyhow;
+use rand::seq::IndexedRandom;
 use solana_account_decoder::UiAccountEncoding;
 use solana_sdk::pubkey::Pubkey;
 
@@ -71,6 +72,18 @@ pub mod accounts {
     /// Mayhem fee recipient (for mayhem mode coins)
     pub const MAYHEM_FEE_RECIPIENT: Pubkey =
         pubkey!("GesfTA3X2arioaHp8bbKdjG9vJtskViWACZoYvxp4twS");
+
+    /// Protocol extra fee recipients (Apr 2026 breaking upgrade). After `pool-v2`: recipient (readonly), then quote ATA (writable).
+    pub const PROTOCOL_EXTRA_FEE_RECIPIENTS: [Pubkey; 8] = [
+        pubkey!("5YxQFdt3Tr9zJLvkFccqXVUwhdTWJQc1fFg2YPbxvxeD"),
+        pubkey!("9M4giFFMxmFGXtc3feFzRai56WbBqehoSeRE5GK7gf7"),
+        pubkey!("GXPFM2caqTtQYC2cJ5yJRi9VDkpsYZXzYdwYpGnLmtDL"),
+        pubkey!("3BpXnfJaUTiwXnJNe7Ej1rcbzqTTQUvLShZaWazebsVR"),
+        pubkey!("5cjcW9wExnJJiqgLjq7DEG75Pm6JBgE1hNv4B2vHXUW6"),
+        pubkey!("EHAAiTxcdDwQ3U4bU6YcMsQGaekdzLS3B5SmYo46kJtL"),
+        pubkey!("5eHhjP8JaYkz83CWwvGU2uMUXefd3AazWGx4gpcuEEYD"),
+        pubkey!("A7hAgCzFw14fejgCp387JUJRMNyz4j89JKnhtKU8piqW"),
+    ];
 
     // META
 
@@ -141,6 +154,14 @@ pub mod accounts {
 pub const BUY_DISCRIMINATOR: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
 pub const BUY_EXACT_QUOTE_IN_DISCRIMINATOR: [u8; 8] = [198, 46, 21, 82, 180, 217, 232, 112];
 pub const SELL_DISCRIMINATOR: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+
+/// Random entry from [`accounts::PROTOCOL_EXTRA_FEE_RECIPIENTS`] (readonly; paired with [`fee_recipient_ata`] as last account).
+#[inline]
+pub fn get_protocol_extra_fee_recipient_random() -> Pubkey {
+    *accounts::PROTOCOL_EXTRA_FEE_RECIPIENTS
+        .choose(&mut rand::rng())
+        .unwrap_or(&accounts::PROTOCOL_EXTRA_FEE_RECIPIENTS[0])
+}
 
 /// Pool v2 PDA (seeds: ["pool-v2", base_mint]). Required at end of buy/sell/buy_exact_quote_in accounts.
 #[inline]

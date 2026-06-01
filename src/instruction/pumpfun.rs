@@ -9,7 +9,7 @@ use crate::{
 use crate::{
     instruction::utils::pumpfun::{
         accounts, get_bonding_curve_pda, get_bonding_curve_v2_pda, get_creator,
-        get_user_volume_accumulator_pda,
+        get_protocol_extra_fee_recipient_random, get_user_volume_accumulator_pda,
         global_constants::{self},
         BUY_DISCRIMINATOR, BUY_EXACT_SOL_IN_DISCRIMINATOR,
     },
@@ -177,7 +177,10 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
             accounts::FEE_CONFIG_META,
             accounts::FEE_PROGRAM_META,
         ];
-        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false)); // bonding_curve_v2 (readonly) at end
+        // bonding_curve_v2 (readonly) at end
+        accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false));
+        // Apr 2026: extra protocol fee recipient after bonding-curve-v2 (writable)
+        accounts.push(AccountMeta::new(get_protocol_extra_fee_recipient_random(), false));
 
         instructions.push(Instruction::new_with_bytes(accounts::PUMPFUN, &buy_data, accounts));
 
@@ -302,6 +305,7 @@ impl InstructionBuilder for PumpFunInstructionBuilder {
         // Program upgrade: bonding_curve_v2 (readonly) at end of account list
         let bonding_curve_v2 = get_bonding_curve_v2_pda(&params.input_mint).unwrap();
         accounts.push(AccountMeta::new_readonly(bonding_curve_v2, false));
+        accounts.push(AccountMeta::new(get_protocol_extra_fee_recipient_random(), false));
 
         instructions.push(Instruction::new_with_bytes(accounts::PUMPFUN, &sell_data, accounts));
 

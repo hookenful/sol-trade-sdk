@@ -1,9 +1,9 @@
 use crate::{
     constants::trade::trade::DEFAULT_SLIPPAGE,
     instruction::utils::pumpswap::{
-        accounts, fee_recipient_ata, get_pool_v2_pda, get_user_volume_accumulator_pda,
-        get_user_volume_accumulator_wsol_ata, BUY_DISCRIMINATOR, BUY_EXACT_QUOTE_IN_DISCRIMINATOR,
-        SELL_DISCRIMINATOR,
+        accounts, fee_recipient_ata, get_pool_v2_pda, get_protocol_extra_fee_recipient_random,
+        get_user_volume_accumulator_pda, get_user_volume_accumulator_wsol_ata, BUY_DISCRIMINATOR,
+        BUY_EXACT_QUOTE_IN_DISCRIMINATOR, SELL_DISCRIMINATOR,
     },
     trading::{
         common::wsol_manager,
@@ -153,7 +153,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         }
 
         // Create buy instruction
-        let mut accounts = Vec::with_capacity(23);
+        let mut accounts = Vec::with_capacity(28);
         accounts.extend([
             AccountMeta::new(pool, false),                          // pool_id
             AccountMeta::new(params.payer.pubkey(), true),          // user (signer)
@@ -192,6 +192,13 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         }
         // Program upgrade: pool_v2 (readonly) at end of account list
         accounts.push(AccountMeta::new_readonly(get_pool_v2_pda(&base_mint).unwrap(), false));
+        // Apr 2026: protocol fee recipient + quote ATA (after pool-v2)
+        let protocol_extra = get_protocol_extra_fee_recipient_random();
+        accounts.push(AccountMeta::new_readonly(protocol_extra, false));
+        accounts.push(AccountMeta::new(
+            crate::instruction::utils::pumpswap::fee_recipient_ata(protocol_extra, quote_mint),
+            false,
+        ));
 
         // Create instruction data
         let mut data = [0u8; 24];
@@ -353,7 +360,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         }
 
         // Create sell instruction
-        let mut accounts = Vec::with_capacity(23);
+        let mut accounts = Vec::with_capacity(28);
         accounts.extend([
             AccountMeta::new(pool, false),                          // pool_id
             AccountMeta::new(params.payer.pubkey(), true),          // user (signer)
@@ -396,6 +403,12 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         }
         // Program upgrade: pool_v2 (readonly) at end of account list
         accounts.push(AccountMeta::new_readonly(get_pool_v2_pda(&base_mint).unwrap(), false));
+        let protocol_extra = get_protocol_extra_fee_recipient_random();
+        accounts.push(AccountMeta::new_readonly(protocol_extra, false));
+        accounts.push(AccountMeta::new(
+            crate::instruction::utils::pumpswap::fee_recipient_ata(protocol_extra, quote_mint),
+            false,
+        ));
 
         // Create instruction data
         let mut data = [0u8; 24];
