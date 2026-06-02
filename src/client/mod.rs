@@ -59,6 +59,15 @@ fn normalize_swqos_configs(rpc_url: &str, configs: &[SwqosConfig]) -> Vec<SwqosC
     out
 }
 
+#[inline]
+fn compute_sender_concurrency(max_submit_lanes: usize) -> (usize, Arc<Vec<core_affinity::CoreId>>) {
+    let num_cores = core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(0);
+    let max_by_cores = (num_cores * 2 / 3).max(1);
+    let cap = max_submit_lanes.min(max_by_cores).max(1);
+    // Keep v4's sender concurrency cap, but disable automatic core pinning.
+    (cap, Arc::new(Vec::new()))
+}
+
 /// 按 mint 查找池地址（通用入口，根据 DEX 类型分发，仅 PumpSwap 等已实现的类型会走优化路径）。
 ///
 /// * `dex_type`：PumpSwap 时先走 PDA 再回退 getProgramAccounts，其他类型返回未实现错误。
@@ -294,23 +303,8 @@ impl TradingInfrastructure {
             })
             .sum::<usize>()
             .max(1);
-        let (max_sender_concurrency, effective_core_ids) = {
-            let num_cores = core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(0);
-            let max_by_cores = (num_cores * 2 / 3).max(1);
-            let cap = max_submit_lanes.min(max_by_cores).max(1);
-            let ids = core_affinity::get_core_ids()
-                .map(|all| {
-                    let v: Vec<_> = all.into_iter().collect();
-                    let len = v.len();
-                    if config.swqos_cores_from_end && len >= cap {
-                        v.into_iter().skip(len - cap).collect()
-                    } else {
-                        v.into_iter().take(cap).collect()
-                    }
-                })
-                .unwrap_or_default();
-            (cap, Arc::new(ids))
-        };
+        let (max_sender_concurrency, effective_core_ids) =
+            compute_sender_concurrency(max_submit_lanes);
 
         crate::instruction::utils::pumpswap::warm_pumpswap_global_config(Some(&rpc)).await;
 
@@ -1353,5 +1347,13 @@ mod tests {
 
         assert_eq!(normalized.len(), 1);
         assert!(matches!(normalized[0].swqos_type(), SwqosType::Default));
+    }
+
+    #[test]
+    fn sender_concurrency_disables_automatic_core_affinity() {
+        let (max_sender_concurrency, effective_core_ids) = compute_sender_concurrency(4);
+
+        assert!((1..=4).contains(&max_sender_concurrency));
+        assert!(effective_core_ids.is_empty());
     }
 }
