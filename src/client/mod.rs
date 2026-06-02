@@ -59,6 +59,15 @@ fn normalize_swqos_configs(rpc_url: &str, configs: &[SwqosConfig]) -> Vec<SwqosC
     out
 }
 
+#[inline]
+fn compute_sender_concurrency(max_submit_lanes: usize) -> (usize, Arc<Vec<core_affinity::CoreId>>) {
+    let num_cores = core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(0);
+    let max_by_cores = (num_cores * 2 / 3).max(1);
+    let cap = max_submit_lanes.min(max_by_cores).max(1);
+    // Keep v4's sender concurrency cap, but disable automatic core pinning.
+    (cap, Arc::new(Vec::new()))
+}
+
 /// 按 mint 查找池地址（通用入口，根据 DEX 类型分发，仅 PumpSwap 等已实现的类型会走优化路径）。
 ///
 /// * `dex_type`：PumpSwap 时先走 PDA 再回退 getProgramAccounts，其他类型返回未实现错误。
@@ -80,6 +89,53 @@ pub enum TradeTokenType {
     WSOL,
     USD1,
     USDC,
+}
+
+/// Optional on-chain precheck configuration executed before PumpFun buy instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrecheckConfig {
+    /// Optional override for the precheck program id.
+    /// If omitted, SDK uses `instruction::hookie_precheck::DEFAULT_PRECHECK_PROGRAM_ID`.
+    pub program_id: Option<Pubkey>,
+    /// Source event slot that the trade is based on.
+    pub context_slot: u64,
+    /// Maximum allowed slot distance from `context_slot`.
+    pub max_slot_diff: u8,
+    /// Minimum allowed bonding curve real SOL reserves.
+    pub min_liquidity_lamports: u64,
+    /// Maximum allowed bonding curve real SOL reserves.
+    pub max_liquidity_lamports: u64,
+    /// Base liquidity snapshot used for directional delta checks.
+    pub base_liquidity_lamports: u64,
+    /// Minimum allowed directional liquidity delta from `base_liquidity_lamports`.
+    /// `0` disables this lower-bound filter.
+    pub min_liquidity_difference_lamports: u64,
+    /// Maximum allowed directional liquidity delta from `base_liquidity_lamports`.
+    /// `0` disables this upper-bound filter.
+    pub max_liquidity_difference_lamports: u64,
+}
+
+impl PrecheckConfig {
+    #[inline]
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.max_slot_diff == 0 {
+            return Err(anyhow::anyhow!("precheck.max_slot_diff must be > 0"));
+        }
+        if self.min_liquidity_lamports > self.max_liquidity_lamports {
+            return Err(anyhow::anyhow!(
+                "precheck.min_liquidity_lamports must be <= precheck.max_liquidity_lamports"
+            ));
+        }
+        if self.min_liquidity_difference_lamports > 0
+            && self.max_liquidity_difference_lamports > 0
+            && self.min_liquidity_difference_lamports > self.max_liquidity_difference_lamports
+        {
+            return Err(anyhow::anyhow!(
+                "precheck.min_liquidity_difference_lamports must be <= precheck.max_liquidity_difference_lamports when both are > 0"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Shared infrastructure components that can be reused across multiple wallets
@@ -247,23 +303,8 @@ impl TradingInfrastructure {
             })
             .sum::<usize>()
             .max(1);
-        let (max_sender_concurrency, effective_core_ids) = {
-            let num_cores = core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(0);
-            let max_by_cores = (num_cores * 2 / 3).max(1);
-            let cap = max_submit_lanes.min(max_by_cores).max(1);
-            let ids = core_affinity::get_core_ids()
-                .map(|all| {
-                    let v: Vec<_> = all.into_iter().collect();
-                    let len = v.len();
-                    if config.swqos_cores_from_end && len >= cap {
-                        v.into_iter().skip(len - cap).collect()
-                    } else {
-                        v.into_iter().take(cap).collect()
-                    }
-                })
-                .unwrap_or_default();
-            (cap, Arc::new(ids))
-        };
+        let (max_sender_concurrency, effective_core_ids) =
+            compute_sender_concurrency(max_submit_lanes);
 
         crate::instruction::utils::pumpswap::warm_pumpswap_global_config(Some(&rpc)).await;
 
@@ -397,6 +438,8 @@ pub struct TradeBuyParams {
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
+    /// Optional precheck call inserted before PumpFun buy instruction.
+    pub precheck: Option<PrecheckConfig>,
     /// Optional upstream receive timestamp (e.g. gRPC recv) in microseconds for latency tracing.
     pub grpc_recv_us: Option<i64>,
 }
@@ -902,6 +945,7 @@ impl TradingClient {
             check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: params.use_exact_sol_amount,
+            precheck: params.precheck,
         };
 
         let swap_result = executor.swap(buy_params).await;
@@ -1018,6 +1062,7 @@ impl TradingClient {
             check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: None,
+            precheck: None,
         };
 
         let swap_result = executor.swap(sell_params).await;
@@ -1302,5 +1347,13 @@ mod tests {
 
         assert_eq!(normalized.len(), 1);
         assert!(matches!(normalized[0].swqos_type(), SwqosType::Default));
+    }
+
+    #[test]
+    fn sender_concurrency_disables_automatic_core_affinity() {
+        let (max_sender_concurrency, effective_core_ids) = compute_sender_concurrency(4);
+
+        assert!((1..=4).contains(&max_sender_concurrency));
+        assert!(effective_core_ids.is_empty());
     }
 }

@@ -47,6 +47,7 @@ const SWQOS_POOL_WORKERS: usize = 18;
 const SWQOS_QUEUE_CAP: usize = 128;
 const SWQOS_DEDICATED_DEFAULT_THREADS: usize = 18;
 const FAST_SUBMIT_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
+const CONFIRMED_MODE_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Shared across all jobs in one batch; built once, cloned as single Arc per job (minimal hot-path clone).
 struct SwqosSharedContext {
@@ -393,7 +394,7 @@ impl ResultCollector {
     ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
         let start = Instant::now();
         let timeout = std::time::Duration::from_secs(5);
-        let poll_interval = std::time::Duration::from_millis(1000);
+        let poll_interval = CONFIRMED_MODE_RESULT_POLL_INTERVAL;
 
         loop {
             if self.success_flag.load(Ordering::Acquire) {
@@ -847,5 +848,10 @@ mod tests {
         assert_eq!(selected[0].gas_fee_config.0, SwqosType::Default);
         assert_eq!(selected[0].gas_fee_config.2.cu_price, 700_000);
         assert_eq!(selected[0].gas_fee_config.2.tip, 0.0);
+    }
+
+    #[test]
+    fn confirmed_mode_result_poll_interval_is_100ms() {
+        assert_eq!(CONFIRMED_MODE_RESULT_POLL_INTERVAL, Duration::from_millis(100));
     }
 }

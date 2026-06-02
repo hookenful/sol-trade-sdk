@@ -167,6 +167,7 @@ async fn pumpfun_sniper_trade(e: sol_parser_sdk::core::events::PumpFunTradeEvent
         gas_fee_strategy: gas_fee_strategy.clone(),
         simulate: false,
         use_exact_sol_amount: None,
+        precheck: None,
         grpc_recv_us: None,
     };
     client.buy(buy_params).await?;

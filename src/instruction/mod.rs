@@ -1,4 +1,5 @@
 pub mod bonk;
+pub mod hookie_precheck;
 pub mod meteora_damm_v2;
 pub mod pumpfun;
 pub(crate) mod pumpfun_ix_data;

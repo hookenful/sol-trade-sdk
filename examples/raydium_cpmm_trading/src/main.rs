@@ -170,6 +170,7 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         gas_fee_strategy: gas_fee_strategy.clone(),
         simulate: false,
         use_exact_sol_amount: None,
+        precheck: None,
         grpc_recv_us: None,
     };
     client.buy(buy_params).await?;

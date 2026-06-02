@@ -308,6 +308,11 @@ impl ZeroSlotClient {
 
 impl Drop for ZeroSlotClient {
     fn drop(&mut self) {
+        // Only the last client instance should stop the shared ping task.
+        if Arc::strong_count(&self.ping_handle) != 1 {
+            return;
+        }
+
         // Ensure ping task stops when client is destroyed
         self.stop_ping.store(true, Ordering::Relaxed);
 
@@ -321,5 +326,31 @@ impl Drop for ZeroSlotClient {
             }
             *ping_guard = None;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> ZeroSlotClient {
+        ZeroSlotClient {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            auth_token: "token".to_string(),
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            http_client: default_http_client_builder().build().unwrap(),
+            ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_clone_does_not_stop_shared_ping_task() {
+        let client = test_client();
+        let clone = client.clone();
+
+        drop(clone);
+
+        assert!(!client.stop_ping.load(Ordering::Relaxed));
     }
 }
