@@ -23,7 +23,10 @@ pub struct StelliumClient {
     pub auth_token: String,
     pub rpc_client: Arc<SolanaRpcClient>,
     pub http_client: Client,
+    /// Shared stop signal for ping loop (false = run, true = stop).
     keep_alive_running: Arc<AtomicBool>,
+    /// Client-instance ref guard used to avoid stopping ping on temporary clone drop.
+    instance_refs: Arc<()>,
 }
 
 #[async_trait::async_trait]
@@ -64,7 +67,8 @@ impl StelliumClient {
         let rpc_client = SolanaRpcClient::new(rpc_url);
         let http_client = default_http_client_builder().build().unwrap();
 
-        let keep_alive_running = Arc::new(AtomicBool::new(true));
+        let keep_alive_running = Arc::new(AtomicBool::new(false));
+        let instance_refs = Arc::new(());
 
         let client = Self {
             rpc_client: Arc::new(rpc_client),
@@ -72,6 +76,7 @@ impl StelliumClient {
             auth_token: auth_token.clone(),
             http_client: http_client.clone(),
             keep_alive_running: keep_alive_running.clone(),
+            instance_refs: instance_refs.clone(),
         };
 
         // Start ping task
@@ -236,13 +241,52 @@ impl StelliumClient {
 
     /// Stop the ping task
     pub fn stop_ping_task(&self) {
-        self.keep_alive_running.store(false, Ordering::Relaxed);
+        self.keep_alive_running.store(true, Ordering::Relaxed);
     }
 }
 
 impl Drop for StelliumClient {
     fn drop(&mut self) {
-        // Stop ping task when client is dropped
-        self.keep_alive_running.store(false, Ordering::Relaxed);
+        // Only the last client instance should stop the shared ping task.
+        if Arc::strong_count(&self.instance_refs) != 1 {
+            return;
+        }
+
+        self.keep_alive_running.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> StelliumClient {
+        StelliumClient {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            auth_token: "token".to_string(),
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            http_client: default_http_client_builder().build().unwrap(),
+            keep_alive_running: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+        }
+    }
+
+    #[test]
+    fn stop_ping_task_sets_stop_flag() {
+        let client = test_client();
+
+        client.stop_ping_task();
+
+        assert!(client.keep_alive_running.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn dropping_clone_does_not_stop_shared_ping_task() {
+        let client = test_client();
+        let clone = client.clone();
+
+        drop(clone);
+
+        assert!(!client.keep_alive_running.load(Ordering::Relaxed));
     }
 }
