@@ -188,6 +188,7 @@ async fn pumpfun_copy_trade_with_grpc(
         gas_fee_strategy,
         simulate: false,
         use_exact_sol_amount: None,
+        precheck: None,
         grpc_recv_us: None,
     };
     client.buy(buy_params).await?;

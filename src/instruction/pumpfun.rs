@@ -137,11 +137,26 @@ fn should_use_v2_layout(params: &SwapParams) -> Result<bool> {
 
 #[inline]
 fn build_buy(params: &SwapParams) -> Result<Vec<Instruction>> {
-    if should_use_v2_layout(params)? {
+    let mut instructions = if should_use_v2_layout(params)? {
         build_buy_unified(params)
     } else {
         build_buy_legacy(params)
+    }?;
+
+    if let Some(precheck) = &params.precheck {
+        let bonding_curve = get_bonding_curve_pda(&params.output_mint).ok_or_else(|| {
+            anyhow!("bonding_curve PDA derivation failed for mint {}", params.output_mint)
+        })?;
+        instructions.insert(
+            0,
+            crate::instruction::hookie_precheck::build_precheck_v1_instruction(
+                bonding_curve,
+                precheck,
+            )?,
+        );
     }
+
+    Ok(instructions)
 }
 
 #[inline]
@@ -246,7 +261,11 @@ fn build_buy_legacy(params: &SwapParams) -> Result<Vec<Instruction>> {
             lamports_in,
         );
         if params.use_exact_sol_amount.unwrap_or(true) {
-            let min_tokens_out = calculate_with_slippage_sell(buy_token_amount, slippage_bp);
+            let min_tokens_out = if params.use_exact_sol_amount == Some(true) {
+                1
+            } else {
+                calculate_with_slippage_sell(buy_token_amount, slippage_bp)
+            };
             encode_pumpfun_buy_exact_quote_in_ix_data(lamports_in, min_tokens_out, ix_version)
         } else {
             let max_sol_cost = calculate_with_slippage_buy(lamports_in, slippage_bp);
@@ -568,7 +587,11 @@ fn build_buy_unified(params: &SwapParams) -> Result<Vec<Instruction>> {
             lamports_in,
         );
         if params.use_exact_sol_amount.unwrap_or(true) {
-            let min_tokens_out = calculate_with_slippage_sell(buy_token_amount, slippage_bp);
+            let min_tokens_out = if params.use_exact_sol_amount == Some(true) {
+                1
+            } else {
+                calculate_with_slippage_sell(buy_token_amount, slippage_bp)
+            };
             (
                 encode_pumpfun_buy_exact_quote_in_ix_data(
                     lamports_in,
@@ -861,7 +884,9 @@ mod tests {
     use crate::{
         common::{bonding_curve::BondingCurveAccount, GasFeeStrategy},
         constants::TOKEN_PROGRAM,
+        instruction::hookie_precheck::DEFAULT_PRECHECK_PROGRAM_ID,
         trading::core::params::{DexParamEnum, PumpFunParams, SwapParams},
+        PrecheckConfig,
     };
     use solana_sdk::signature::Keypair;
     use std::sync::Arc;
@@ -931,6 +956,20 @@ mod tests {
             check_min_tip: false,
             grpc_recv_us: None,
             use_exact_sol_amount: Some(true),
+            precheck: None,
+        }
+    }
+
+    fn precheck_config() -> PrecheckConfig {
+        PrecheckConfig {
+            program_id: None,
+            context_slot: 123,
+            max_slot_diff: 5,
+            min_liquidity_lamports: 1_000_000_000,
+            max_liquidity_lamports: 2_000_000_000,
+            base_liquidity_lamports: 0,
+            min_liquidity_difference_lamports: 0,
+            max_liquidity_difference_lamports: 0,
         }
     }
 
@@ -977,6 +1016,49 @@ mod tests {
         let instructions = build_buy(&params).unwrap();
 
         assert_eq!(instructions[2].accounts[8].pubkey, TOKEN_PROGRAM);
+    }
+
+    #[test]
+    fn pumpfun_buy_includes_precheck_instruction_first() {
+        crate::common::seed::set_default_rents();
+        let mut params = swap_params_for_buy(Pubkey::new_unique(), TOKEN_PROGRAM);
+        params.create_output_mint_ata = false;
+        params.precheck = Some(precheck_config());
+
+        let instructions = build_buy(&params).unwrap();
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].program_id, DEFAULT_PRECHECK_PROGRAM_ID);
+        assert_eq!(instructions[0].accounts.len(), 2);
+        assert_eq!(instructions[0].accounts[0].pubkey, solana_sdk::sysvar::clock::id());
+        assert_eq!(instructions[1].program_id, accounts::PUMPFUN);
+    }
+
+    #[test]
+    fn pumpfun_buy_without_precheck_keeps_current_instruction_count() {
+        crate::common::seed::set_default_rents();
+        let mut params = swap_params_for_buy(Pubkey::new_unique(), TOKEN_PROGRAM);
+        params.create_output_mint_ata = false;
+
+        let instructions = build_buy(&params).unwrap();
+
+        assert_eq!(instructions.len(), 1);
+        assert_eq!(instructions[0].program_id, accounts::PUMPFUN);
+    }
+
+    #[test]
+    fn pumpfun_buy_exact_quote_explicit_true_sets_min_tokens_out_to_one() {
+        crate::common::seed::set_default_rents();
+        let mut params = swap_params_for_buy(Pubkey::new_unique(), TOKEN_PROGRAM);
+        params.create_output_mint_ata = false;
+        params.fixed_output_amount = None;
+        params.use_exact_sol_amount = Some(true);
+
+        let instructions = build_buy(&params).unwrap();
+        let data = &instructions[0].data;
+
+        assert_eq!(&data[..8], crate::instruction::utils::pumpfun::BUY_EXACT_SOL_IN_DISCRIMINATOR);
+        assert_eq!(u64::from_le_bytes(data[16..24].try_into().unwrap()), 1);
     }
 
     #[test]

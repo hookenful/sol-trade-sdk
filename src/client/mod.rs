@@ -82,6 +82,53 @@ pub enum TradeTokenType {
     USDC,
 }
 
+/// Optional on-chain precheck configuration executed before PumpFun buy instruction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PrecheckConfig {
+    /// Optional override for the precheck program id.
+    /// If omitted, SDK uses `instruction::hookie_precheck::DEFAULT_PRECHECK_PROGRAM_ID`.
+    pub program_id: Option<Pubkey>,
+    /// Source event slot that the trade is based on.
+    pub context_slot: u64,
+    /// Maximum allowed slot distance from `context_slot`.
+    pub max_slot_diff: u8,
+    /// Minimum allowed bonding curve real SOL reserves.
+    pub min_liquidity_lamports: u64,
+    /// Maximum allowed bonding curve real SOL reserves.
+    pub max_liquidity_lamports: u64,
+    /// Base liquidity snapshot used for directional delta checks.
+    pub base_liquidity_lamports: u64,
+    /// Minimum allowed directional liquidity delta from `base_liquidity_lamports`.
+    /// `0` disables this lower-bound filter.
+    pub min_liquidity_difference_lamports: u64,
+    /// Maximum allowed directional liquidity delta from `base_liquidity_lamports`.
+    /// `0` disables this upper-bound filter.
+    pub max_liquidity_difference_lamports: u64,
+}
+
+impl PrecheckConfig {
+    #[inline]
+    pub fn validate(&self) -> Result<(), anyhow::Error> {
+        if self.max_slot_diff == 0 {
+            return Err(anyhow::anyhow!("precheck.max_slot_diff must be > 0"));
+        }
+        if self.min_liquidity_lamports > self.max_liquidity_lamports {
+            return Err(anyhow::anyhow!(
+                "precheck.min_liquidity_lamports must be <= precheck.max_liquidity_lamports"
+            ));
+        }
+        if self.min_liquidity_difference_lamports > 0
+            && self.max_liquidity_difference_lamports > 0
+            && self.min_liquidity_difference_lamports > self.max_liquidity_difference_lamports
+        {
+            return Err(anyhow::anyhow!(
+                "precheck.min_liquidity_difference_lamports must be <= precheck.max_liquidity_difference_lamports when both are > 0"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// Shared infrastructure components that can be reused across multiple wallets
 ///
 /// This struct holds the expensive-to-initialize components (RPC client, SWQOS clients)
@@ -397,6 +444,8 @@ pub struct TradeBuyParams {
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
+    /// Optional precheck call inserted before PumpFun buy instruction.
+    pub precheck: Option<PrecheckConfig>,
     /// Optional upstream receive timestamp (e.g. gRPC recv) in microseconds for latency tracing.
     pub grpc_recv_us: Option<i64>,
 }
@@ -902,6 +951,7 @@ impl TradingClient {
             check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: params.use_exact_sol_amount,
+            precheck: params.precheck,
         };
 
         let swap_result = executor.swap(buy_params).await;
@@ -1018,6 +1068,7 @@ impl TradingClient {
             check_min_tip: self.check_min_tip,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: None,
+            precheck: None,
         };
 
         let swap_result = executor.swap(sell_params).await;

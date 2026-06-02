@@ -2,6 +2,7 @@ use crate::common::nonce_cache::DurableNonceInfo;
 use crate::common::{GasFeeStrategy, SolanaRpcClient};
 use crate::swqos::{SwqosClient, TradeType};
 use crate::trading::MiddlewareManager;
+use crate::PrecheckConfig;
 use core_affinity::CoreId;
 use solana_hash::Hash;
 use solana_message::AddressLookupTableAccount;
@@ -107,6 +108,8 @@ pub struct SwapParams {
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
+    /// Optional on-chain precheck instruction inserted before PumpFun buy flow.
+    pub precheck: Option<PrecheckConfig>,
 }
 
 impl SwapParams {

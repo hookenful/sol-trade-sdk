@@ -201,6 +201,7 @@ async fn main() -> AnyResult<()> {
         open_seed_optimize: false,
         durable_nonce: None,
         fixed_output_token_amount: None,
+        precheck: None,
     };
 
     println!("⏱️  开始执行买入流程...");

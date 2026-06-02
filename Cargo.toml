@@ -16,6 +16,7 @@ readme = "README.md"
 
 [workspace]
 members = [
+    "onchain/hookie-precheck",
     "examples/trading_client",
     "examples/shared_infrastructure",
     "examples/middleware_system",

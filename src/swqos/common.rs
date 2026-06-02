@@ -31,6 +31,7 @@ const HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 5;
 const HTTP_TIMEOUT_MS: u64 = 3000;
 /// Connect timeout (milliseconds). 连接超时（毫秒）。
 const HTTP_CONNECT_TIMEOUT_MS: u64 = 2000;
+const CONFIRMATION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Shared HTTP client builder for SWQOS clients; call `.build().unwrap()` or override pool first. SWQOS 共用 HTTP 客户端构建器。
 pub fn default_http_client_builder() -> reqwest::ClientBuilder {
@@ -109,7 +110,7 @@ pub async fn poll_any_transaction_confirmation(
     }
 
     let timeout: Duration = Duration::from_secs(15);
-    let interval: Duration = Duration::from_millis(1000);
+    let interval: Duration = CONFIRMATION_POLL_INTERVAL;
     let start: Instant = Instant::now();
     let mut poll_count = 0u32;
     // Track which signature landed (confirmed or failed on-chain)
@@ -326,4 +327,14 @@ pub async fn serialize_smart_transaction_and_encode(
         _ => return Err(anyhow::anyhow!("Unsupported encoding")),
     };
     Ok((serialized, *signature))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_poll_interval_is_100ms() {
+        assert_eq!(CONFIRMATION_POLL_INTERVAL, Duration::from_millis(100));
+    }
 }
