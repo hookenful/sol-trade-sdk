@@ -1,6 +1,6 @@
 [package]
 name = "sol-trade-sdk"
-version = "4.0.15"
+version = "4.0.20"
 edition = "2021"
 authors = [
     "William <byteblock6@gmail.com>",
@@ -35,6 +35,7 @@ members = [
     "examples/cli_trading",
     "examples/gas_fee_strategy",
     "examples/meteora_damm_v2_direct_trading",
+    "examples/simple_trading",
 ]
 
 [lib]

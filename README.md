@@ -81,13 +81,13 @@ This SDK is available in multiple languages:
 
 ## 🔖 Current Release
 
-**Rust crate:** `sol-trade-sdk = "4.0.15"`
+**Rust crate:** `sol-trade-sdk = "4.0.17"`
 
-This release refreshes PumpFun V2 and USDC quote-pool handling, keeps the default RPC submit lane active alongside SWQoS lanes, restores the fast-submit result window to 5 seconds, and aligns Raydium CPMM fixed-output swaps with the on-chain `swap_base_out` instruction. Trade execution requires a caller-supplied `recent_blockhash` or durable nonce; hot-path execution does not query RPC for blockhash, account, or balance data.
+This release refreshes PumpFun native-SOL quote handling so SOL/WSOL sentinels prefer the smaller V1 hot path, keeps the default RPC submit lane active alongside SWQoS lanes, restores the fast-submit result window to 5 seconds, and aligns Raydium CPMM fixed-output swaps with the on-chain `swap_base_out` instruction. Trade execution requires a caller-supplied `recent_blockhash` or durable nonce; hot-path execution does not query RPC for blockhash, account, or balance data.
 
 ## ✨ Features
 
-1. **PumpFun Trading**: Unified SDK-side `buy`, `sell`, and `buy_exact_quote_in` flow, selecting legacy or V2 on-chain instructions as needed (SOL + USDC)
+1. **PumpFun Trading**: Unified SDK-side `buy`, `sell`, and `buy_exact_quote_in` flow, preferring V1 for native SOL and selecting V2 for USDC/non-native quote mints or explicit WSOL settlement
 2. **PumpSwap Trading**: Support for PumpSwap pool trading operations
 3. **Bonk Trading**: Support for Bonk trading operations
 4. **Raydium CPMM Trading**: Support for Raydium CPMM (Concentrated Pool Market Maker) trading operations
@@ -115,14 +115,14 @@ Add the dependency to your `Cargo.toml`:
 
 ```toml
 # Add to your Cargo.toml
-sol-trade-sdk = { path = "./sol-trade-sdk", version = "4.0.15" }
+sol-trade-sdk = { path = "./sol-trade-sdk", version = "4.0.17" }
 ```
 
 ### Use crates.io
 
 ```toml
 # Add to your Cargo.toml
-sol-trade-sdk = "4.0.15"
+sol-trade-sdk = "4.0.17"
 ```
 
 ## 🛠️ Usage Examples
@@ -196,40 +196,74 @@ gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 
 For detailed information about all trading parameters, see the [Trading Parameters Reference](docs/TRADING_PARAMETERS.md).
 
 ```rust
-// Import DexParamEnum for protocol-specific parameters
-use sol_trade_sdk::trading::core::params::DexParamEnum;
-
-let buy_params = sol_trade_sdk::TradeBuyParams {
-  dex_type: DexType::PumpSwap,
-  input_token_type: TradeTokenType::WSOL,
-  mint: mint_pubkey,
-  input_token_amount: buy_sol_amount,
-  slippage_basis_points: slippage_basis_points,
-  recent_blockhash: Some(recent_blockhash),
-  // Use DexParamEnum for type-safe protocol parameters (zero-overhead abstraction)
-  extension_params: DexParamEnum::PumpSwap(params.clone()),
-  address_lookup_table_account: None,
-  wait_transaction_confirmed: true,
-  create_input_token_ata: true,
-  close_input_token_ata: true,
-  create_mint_ata: true,
-  durable_nonce: None,
-  fixed_output_token_amount: None,  // Optional: specify exact output amount
-  gas_fee_strategy: gas_fee_strategy.clone(),  // Gas fee strategy configuration
-  simulate: false,  // Set to true for simulation only
-  use_exact_sol_amount: None,  // Use exact SOL input for PumpFun/PumpSwap (defaults to true)
+use sol_trade_sdk::{
+    AccountPolicy, BuyAmount, DexType, SimpleBuyParams, TradeTokenType,
+    trading::core::params::DexParamEnum,
 };
+
+let buy_params = SimpleBuyParams::new(
+    DexType::PumpFun,
+    // Token used to pay. For PumpFun V2 SOL/WSOL quote pools, keep this as SOL
+    // when you want to spend native SOL; the SDK will still use V2 accounts.
+    TradeTokenType::SOL,
+    // Mint of the meme/token you want to buy.
+    mint_pubkey,
+    // Regular PumpFun/PumpSwap buy. The SDK estimates token output and applies
+    // slippage to the maximum quote cost.
+    BuyAmount::WithMaxInput { quote_amount: buy_sol_amount },
+    // Protocol state from parser/RPC cache, for example PumpFunParams::from_trade(...).
+    DexParamEnum::PumpFun(pumpfun_params),
+    // Pass a cached recent blockhash; the SDK does not fetch it on the hot path.
+    recent_blockhash,
+    gas_fee_strategy.clone(),
+)
+// 300 = 3%.
+.slippage_basis_points(300)
+// For bots/sniping: assume ATAs are already prepared and keep the tx small.
+.account_policy(AccountPolicy::HotPathMinimal);
 ```
 
 #### 4. Execute Trading
 
 ```rust
-client.buy(buy_params).await?;
+client.buy_simple(buy_params).await?;
 ```
 
 ### ⚡ Trading Parameters
 
-For comprehensive information about all trading parameters including `TradeBuyParams` and `TradeSellParams`, see the dedicated [Trading Parameters Reference](docs/TRADING_PARAMETERS.md).
+Use `SimpleBuyParams` / `SimpleSellParams` for new integrations. They describe trading intent and hide low-level ATA flags. Most users only choose:
+
+- `pay_with` / `receive_as`: quote token direction. Use `SOL` when the wallet spends or receives native SOL. For PumpFun V2 SOL-paired pools whose quote mint is WSOL, still use `SOL` if you want native SOL settlement.
+- `amount`: trade sizing intent. Pick one enum variant instead of combining `input_token_amount`, `fixed_output_token_amount`, and `use_exact_sol_amount`.
+- `account_policy`: account creation behavior. Bots usually use `HotPathMinimal`; normal apps can keep the default `Auto`.
+
+| Parameter | Meaning | Recommendation |
+|---|---|---|
+| `BuyAmount::ExactInput(amount)` | Spend exactly this quote amount; slippage protects minimum output. | Normal swaps |
+| `BuyAmount::WithMaxInput { quote_amount }` | Regular PumpFun/PumpSwap buy with slippage applied to max quote cost. | Sniping/arbitrage |
+| `BuyAmount::ExactOutput { output_amount, max_input_amount }` | Buy an exact token amount with a max quote budget. | Exact-output workflows |
+| `SellAmount::ExactInput(amount)` | Sell exactly this token amount. | Normal sells |
+| `SellAmount::ExactOutput { output_amount, max_input_amount }` | Receive an exact quote amount while limiting token input, where the DEX supports it. | Exact-output sells |
+| `AccountPolicy::Auto` | SDK creates practical ATAs when needed. | General usage |
+| `AccountPolicy::HotPathMinimal` | Avoid ATA create/close instructions in the trade tx. | Bots, sniping, latency-sensitive flows |
+| `AccountPolicy::CreateMissing` | Include ATA creation instructions where possible. | Convenience over transaction size |
+| `AccountPolicy::AssumePrepared` | Caller prepared every required ATA. | Deterministic advanced flows |
+
+Optional builder methods:
+
+| Method | Meaning |
+|---|---|
+| `.slippage_basis_points(300)` | Set slippage. `300` means 3%. |
+| `.address_lookup_table_account(alt)` | Attach an ALT to reduce transaction size. Useful for large PumpFun V2 transactions. |
+| `.wait_tx_confirmed(true)` | Return only after confirmation. Usually disabled for fastest submit paths. |
+| `.wait_for_all_submits(true)` | In fast-submit mode, wait for all SWQoS lane responses and return all signatures. |
+| `.simulate(true)` | Build and simulate the transaction instead of sending it. |
+| `.grpc_recv_us(ts)` | Attach upstream receive timestamp for latency tracing. |
+| `.durable_nonce(nonce_info)` | Use durable nonce and clear `recent_blockhash`. Recommended when you start from `SimpleBuyParams::new(...)` / `SimpleSellParams::new(...)`. |
+| `SimpleBuyParams::with_durable_nonce(...)` / `SimpleSellParams::with_durable_nonce(...)` | Construct params directly with durable nonce instead of `recent_blockhash`. |
+| `SimpleSellParams::with_tip(false)` | Disable relay tips for sells. Buys use the gas fee strategy/tip settings. |
+
+`TradeBuyParams` and `TradeSellParams` remain available as advanced low-level APIs. See the dedicated [Trading Parameters Reference](docs/TRADING_PARAMETERS.md).
 
 #### About ShredStream
 
@@ -240,6 +274,7 @@ Please ensure that the parameters your trading logic depends on are available in
 
 | Description | Run Command | Source Code |
 |-------------|-------------|-------------|
+| Simple buy/sell parameter API | `cargo run --package simple_trading` | [examples/simple_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/simple_trading/src/main.rs) |
 | Create and configure TradingClient instance | `cargo run --package trading_client` | [examples/trading_client](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/trading_client/src/main.rs) |
 | Share infrastructure across multiple wallets | `cargo run --package shared_infrastructure` | [examples/shared_infrastructure](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/shared_infrastructure/src/main.rs) |
 | PumpFun token sniping trading | `cargo run --package pumpfun_sniper_trading` | [examples/pumpfun_sniper_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpfun_sniper_trading/src/main.rs) |
@@ -289,7 +324,29 @@ let temporal_config = SwqosConfig::Temporal(
 - If no custom URL is provided (`None`), the system will use the default endpoint for the specified `SwqosRegion`
 - This allows for maximum flexibility while maintaining backward compatibility 
 
-When using multiple MEV services, you need to use `Durable Nonce`. You need to use the `fetch_nonce_info` function to get the latest `nonce` value, and use it as the `durable_nonce` when trading.
+When using multiple MEV services, you need to use `Durable Nonce`. Fetch the latest nonce value and attach it to the high-level buy/sell params:
+
+```rust
+use sol_trade_sdk::{fetch_nonce_info, AccountPolicy, BuyAmount, SimpleBuyParams};
+
+let nonce_info = fetch_nonce_info(&client.infrastructure.rpc, nonce_account)
+    .await
+    .expect("nonce account must be initialized");
+
+let buy_params = SimpleBuyParams::new(
+    DexType::PumpFun,
+    TradeTokenType::SOL,
+    mint_pubkey,
+    BuyAmount::WithMaxInput { quote_amount: buy_sol_amount },
+    DexParamEnum::PumpFun(pumpfun_params),
+    recent_blockhash, // will be cleared by `.durable_nonce(...)`
+    gas_fee_strategy.clone(),
+)
+.durable_nonce(nonce_info)
+.account_policy(AccountPolicy::HotPathMinimal);
+
+client.buy_simple(buy_params).await?;
+```
 
 #### Astralane (Binary / Plain HTTP / QUIC)
 
@@ -369,15 +426,15 @@ PumpFun has two instruction sets for bonding-curve trading:
 |---|---|---|
 | Instructions | `buy` / `buy_exact_sol_in` / `sell` | `buy_v2` / `buy_exact_quote_in_v2` / `sell_v2` |
 | Account metas | 18 | 27 |
-| Quote mint | SOL only (legacy) | SOL or USDC (via `quote_mint` field) |
-| Transaction size | Smaller (fits `PACKET_DATA_SIZE` without LUT) | Larger (requires LUT for most transactions) |
+| Quote mint | Native SOL (`default`, Solscan SOL sentinel, or WSOL sentinel) | Non-native quote mint, or explicit WSOL settlement |
+| Transaction size | Smaller (preferred hot path) | Larger (may require LUT for nonce/tip/ATA-heavy transactions) |
 
-The SDK-side builder is version-neutral: callers use the normal buy/sell flow, and `quote_mint` selects the correct on-chain discriminator and account layout internally. There is no user-facing V2 switch required.
+The SDK-side builder is version-neutral: callers use the normal buy/sell flow, and `quote_mint` plus the requested settlement token (`pay_with` / `receive_as`) select the correct on-chain discriminator and account layout internally. There is no user-facing V2 switch required.
 
-**Default: V1**. When `quote_mint` is `Pubkey::default()` or the Solscan SOL sentinel (`So11111111111111111111111111111111111111111`), the SDK uses V1 instructions which produce smaller transactions that fit within the 1232-byte `PACKET_DATA_SIZE` limit without requiring an Address Lookup Table. Passing `WSOL_TOKEN_ACCOUNT` selects SOL V2; passing USDC selects USDC V2.
+**Default: V1**. When `quote_mint` is `Pubkey::default()`, the Solscan SOL sentinel (`So11111111111111111111111111111111111111111`), or `WSOL_TOKEN_ACCOUNT` (`So11111111111111111111111111111111111111112`), the SDK treats the curve as native SOL-paired and uses V1 instructions when `pay_with` / `receive_as` is `SOL`. This is the preferred hot path because it avoids the 27-account V2 layout. Passing USDC or another real quote mint selects V2. Passing `WSOL` as the buy input or sell output selects V2 only when you intentionally want to settle through an existing WSOL ATA.
 
 **Key changes in v2 instructions:**
-- `quote_mint` parameter — pass wrapped SOL for SOL-paired, or USDC mint for USDC-paired
+- `quote_mint` parameter — native SOL-paired curves may appear as default, Solscan SOL, or WSOL; USDC/non-native quote mints select V2
 - 27 fixed accounts (buy) / 26 fixed accounts (sell) — **no optional accounts**
 - `buyback_fee_recipient`, `sharing_config`, and 6 `associated_quote_*` ATAs are now mandatory
 - Same pricing and cost as legacy instructions for SOL-paired coins
@@ -385,13 +442,12 @@ The SDK-side builder is version-neutral: callers use the normal buy/sell flow, a
 
 **Pass `quote_mint` into `PumpFunParams::from_trade`**:
 
-When using event/parser data, pass the event's `quote_mint` right after `mint`. `Pubkey::default()` and Solscan SOL (`So11111111111111111111111111111111111111111`) mean the legacy SOL layout; `WSOL_TOKEN_ACCOUNT` means SOL V2; USDC means USDC V2.
+When using event/parser data, pass the event's `quote_mint` right after `mint`. `Pubkey::default()`, Solscan SOL (`So11111111111111111111111111111111111111111`), and `WSOL_TOKEN_ACCOUNT` all mean a native SOL-paired curve and default to V1 for normal SOL settlement. USDC means USDC V2.
 
 ```rust
 // quote_mint is not a PDA. It is the quote SPL mint carried by parser/gRPC events:
-// - Legacy SOL pool: Pubkey::default() or Solscan SOL from parser data
-// - SOL V2 pool: WSOL_TOKEN_ACCOUNT
-// - USDC V2 pool: USDC mint
+// - Native SOL pool: Pubkey::default(), Solscan SOL, or WSOL sentinel from parser data
+// - USDC/non-native pool: actual quote SPL mint
 let quote_mint = e.quote_mint;
 let params = PumpFunParams::from_trade(
     e.bonding_curve,
@@ -412,11 +468,11 @@ let params = PumpFunParams::from_trade(
 );
 ```
 
-For USDC-paired coins, pass `USDC_TOKEN_ACCOUNT` as the buy `input_mint` and sell `output_mint`; SOL/WSOL is only valid for SOL-paired PumpFun curves.
+For USDC-paired coins, pass `USDC_TOKEN_ACCOUNT` as the buy `input_mint` and sell `output_mint`; SOL/WSOL is only valid for SOL-paired PumpFun curves. For SOL-paired curves, use `SOL` for the normal fast path; use `WSOL` only if you intentionally want V2 settlement through an existing WSOL ATA.
 When consuming parser events, map `quoteMint`, `virtualQuoteReserves`, and `realQuoteReserves` into `PumpFunParams::from_trade(...)`; USDC pools use `4_292_000_000` as the initial virtual quote reserve.
 For legacy SOL events where `quote_mint` is `Pubkey::default()` or Solscan SOL, use `virtual_sol_reserves` / `real_sol_reserves` when the quote-reserve fields are absent or zero.
 
-> **Note**: V2 transactions with ATA creation + durable nonce may exceed `PACKET_DATA_SIZE`. Enable an Address Lookup Table (`address_lookup_table_account`) when using V2.
+> **Note**: V2 transactions with ATA creation + durable nonce/tip may exceed `PACKET_DATA_SIZE`. The SDK reports this locally and does not remove compute-budget or tip instructions because that changes priority semantics. Use V1 when the curve is native SOL-paired, pre-create ATAs, or enable an Address Lookup Table (`address_lookup_table_account`) when using V2.
 
 #### PumpSwap: coin_creator_vault from events (no RPC)
 

@@ -81,13 +81,13 @@
 
 ## 🔖 当前版本
 
-**Rust crate:** `sol-trade-sdk = "4.0.15"`
+**Rust crate:** `sol-trade-sdk = "4.0.17"`
 
-本版本刷新 PumpFun V2 与 USDC quote 池处理逻辑，确保默认 RPC 提交通道会和 SWQoS 通道一起发出，快速提交结果等待窗口恢复为 5 秒，并将 Raydium CPMM fixed-output 交易对齐到链上 `swap_base_out` 指令。交易执行必须由调用方传入 `recent_blockhash` 或 durable nonce；热路径不会查询 RPC 获取 blockhash、账户或余额数据。
+本版本刷新 PumpFun native SOL quote 处理逻辑，SOL/WSOL sentinel 默认优先走更小的 V1 热路径，确保默认 RPC 提交通道会和 SWQoS 通道一起发出，快速提交结果等待窗口恢复为 5 秒，并将 Raydium CPMM fixed-output 交易对齐到链上 `swap_base_out` 指令。交易执行必须由调用方传入 `recent_blockhash` 或 durable nonce；热路径不会查询 RPC 获取 blockhash、账户或余额数据。
 
 ## ✨ 项目特性
 
-1. **PumpFun 交易**: SDK 侧统一为 `buy`、`sell`、`buy_exact_quote_in` 流程，内部按需选择旧版或 V2 链上指令（SOL + USDC）
+1. **PumpFun 交易**: SDK 侧统一为 `buy`、`sell`、`buy_exact_quote_in` 流程，native SOL 优先走 V1，USDC/非 SOL quote 或显式 WSOL 结算才走 V2
 2. **PumpSwap 交易**: 支持 PumpSwap 池的交易操作
 3. **Bonk 交易**: 支持 Bonk 的交易操作
 4. **Raydium CPMM 交易**: 支持 Raydium CPMM (Concentrated Pool Market Maker) 的交易操作
@@ -115,14 +115,14 @@ git clone https://github.com/0xfnzero/sol-trade-sdk
 
 ```toml
 # 添加到您的 Cargo.toml
-sol-trade-sdk = { path = "./sol-trade-sdk", version = "4.0.15" }
+sol-trade-sdk = { path = "./sol-trade-sdk", version = "4.0.17" }
 ```
 
 ### 使用 crates.io
 
 ```toml
 # 添加到您的 Cargo.toml
-sol-trade-sdk = "4.0.15"
+sol-trade-sdk = "4.0.17"
 ```
 
 ## 🛠️ 使用示例
@@ -195,40 +195,74 @@ gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 
 有关所有交易参数的详细信息，请参阅 [交易参数参考手册](docs/TRADING_PARAMETERS_CN.md)。
 
 ```rust
-// 导入 DexParamEnum 用于协议特定参数
-use sol_trade_sdk::trading::core::params::DexParamEnum;
-
-let buy_params = sol_trade_sdk::TradeBuyParams {
-  dex_type: DexType::PumpSwap,
-  input_token_type: TradeTokenType::WSOL,
-  mint: mint_pubkey,
-  input_token_amount: buy_sol_amount,
-  slippage_basis_points: slippage_basis_points,
-  recent_blockhash: Some(recent_blockhash),
-  // 使用 DexParamEnum 实现类型安全的协议参数（零开销抽象）
-  extension_params: DexParamEnum::PumpSwap(params.clone()),
-  address_lookup_table_account: None,
-  wait_transaction_confirmed: true,
-  create_input_token_ata: true,
-  close_input_token_ata: true,
-  create_mint_ata: true,
-  durable_nonce: None,
-  fixed_output_token_amount: None,  // 可选：指定精确输出数量
-  gas_fee_strategy: gas_fee_strategy.clone(),  // Gas 费用策略配置
-  simulate: false,  // 设为 true 仅进行模拟
-  use_exact_sol_amount: None,  // 对 PumpFun/PumpSwap 使用精确 SOL 输入（默认为 true）
+use sol_trade_sdk::{
+    AccountPolicy, BuyAmount, DexType, SimpleBuyParams, TradeTokenType,
+    trading::core::params::DexParamEnum,
 };
+
+let buy_params = SimpleBuyParams::new(
+    DexType::PumpFun,
+    // 支付币种。PumpFun V2 的 SOL/WSOL quote 池，如果你想花原生 SOL，
+    // 这里仍然传 SOL；SDK 内部会按 V2 账户布局处理。
+    TradeTokenType::SOL,
+    // 要买入的 meme/token mint。
+    mint_pubkey,
+    // 常规 PumpFun/PumpSwap buy。SDK 先估算能买到多少 token，
+    // 再把滑点应用到最大 quote 成本上。
+    BuyAmount::WithMaxInput { quote_amount: buy_sol_amount },
+    // 协议状态参数，通常来自 parser/RPC 缓存，例如 PumpFunParams::from_trade(...)。
+    DexParamEnum::PumpFun(pumpfun_params),
+    // 传入外部缓存的 recent_blockhash；SDK 不在热路径里临时获取。
+    recent_blockhash,
+    gas_fee_strategy.clone(),
+)
+// 300 = 3%。
+.slippage_basis_points(300)
+// Bot/狙击推荐：假设 ATA 已提前准备好，交易内不创建/关闭 ATA，体积更小。
+.account_policy(AccountPolicy::HotPathMinimal);
 ```
 
 #### 4. 执行交易
 
 ```rust
-client.buy(buy_params).await?;
+client.buy_simple(buy_params).await?;
 ```
 
 ### ⚡ 交易参数
 
-有关所有交易参数（包括 `TradeBuyParams` 和 `TradeSellParams`）的详细信息，请参阅专门的 [交易参数参考手册](docs/TRADING_PARAMETERS_CN.md)。
+新接入建议优先使用 `SimpleBuyParams` / `SimpleSellParams`。它们描述交易意图，SDK 内部处理底层 ATA 参数。多数用户只需要选择：
+
+- `pay_with` / `receive_as`：买入时用什么 quote 支付，卖出时收什么 quote。钱包实际花/收原生 SOL 就传 `SOL`。PumpFun V2 的 SOL 配对池虽然 `quote_mint` 是 WSOL，但你想用原生 SOL 结算时这里仍传 `SOL`。
+- `amount`：交易数量语义。用一个枚举表达意图，不再同时理解 `input_token_amount`、`fixed_output_token_amount`、`use_exact_sol_amount`。
+- `account_policy`：账户创建策略。Bot 通常用 `HotPathMinimal`；普通应用可以保留默认 `Auto`。
+
+| 参数 | 含义 | 推荐场景 |
+|---|---|---|
+| `BuyAmount::ExactInput(amount)` | 精确花费指定 quote 数量；滑点保护最小买到数量。 | 普通买入 |
+| `BuyAmount::WithMaxInput { quote_amount }` | PumpFun/PumpSwap 常规 buy，滑点作用在最大 quote 成本上。 | 狙击、套利 |
+| `BuyAmount::ExactOutput { output_amount, max_input_amount }` | 精确买到指定 token 数量，并限制最大 quote 成本。 | 精确输出 |
+| `SellAmount::ExactInput(amount)` | 精确卖出指定 token 数量。 | 普通卖出 |
+| `SellAmount::ExactOutput { output_amount, max_input_amount }` | 精确收到指定 quote 数量，并限制最多卖出多少 token；取决于 DEX 是否支持。 | 精确输出卖出 |
+| `AccountPolicy::Auto` | SDK 按交易路径创建必要 ATA。 | 普通用户 |
+| `AccountPolicy::HotPathMinimal` | 交易内避免创建/关闭 ATA。 | Bot、狙击、低延迟 |
+| `AccountPolicy::CreateMissing` | 尽量在交易内创建缺失 ATA。 | 优先方便，不追求最小交易体积 |
+| `AccountPolicy::AssumePrepared` | 调用方保证所有 ATA 已准备好。 | 高级确定性流程 |
+
+可选 builder 方法：
+
+| 方法 | 含义 |
+|---|---|
+| `.slippage_basis_points(300)` | 设置滑点。`300` 表示 3%。 |
+| `.address_lookup_table_account(alt)` | 传入 ALT 以减少交易体积。PumpFun V2 交易较大时很有用。 |
+| `.wait_tx_confirmed(true)` | 等链上确认后再返回。追求最快提交时通常关闭。 |
+| `.wait_for_all_submits(true)` | fast-submit 模式下等待所有 SWQoS 通道返回，并拿到全部签名。 |
+| `.simulate(true)` | 只构建并模拟交易，不真正发送。 |
+| `.grpc_recv_us(ts)` | 传入上游收到事件的微秒时间戳，用于延迟追踪。 |
+| `.durable_nonce(nonce_info)` | 使用 durable nonce，并清空 `recent_blockhash`。如果你从 `SimpleBuyParams::new(...)` / `SimpleSellParams::new(...)` 开始构造，推荐用这个。 |
+| `SimpleBuyParams::with_durable_nonce(...)` / `SimpleSellParams::with_durable_nonce(...)` | 直接用 durable nonce 构造参数，不使用 `recent_blockhash`。 |
+| `SimpleSellParams::with_tip(false)` | 关闭卖出交易 relay tip。买入的 tip 使用 gas fee strategy 控制。 |
+
+`TradeBuyParams` 和 `TradeSellParams` 仍保留为高级低层接口。详细说明见 [交易参数参考手册](docs/TRADING_PARAMETERS_CN.md)。
 
 #### 关于shredstream
 
@@ -239,6 +273,7 @@ client.buy(buy_params).await?;
 
 | 描述 | 运行命令 | 源码路径 |
 |------|---------|----------|
+| 简化买卖参数 API | `cargo run --package simple_trading` | [examples/simple_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/simple_trading/src/main.rs) |
 | 创建和配置 TradingClient 实例 | `cargo run --package trading_client` | [examples/trading_client](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/trading_client/src/main.rs) |
 | 多钱包共享基础设施 | `cargo run --package shared_infrastructure` | [examples/shared_infrastructure](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/shared_infrastructure/src/main.rs) |
 | PumpFun 代币狙击交易 | `cargo run --package pumpfun_sniper_trading` | [examples/pumpfun_sniper_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpfun_sniper_trading/src/main.rs) |
@@ -288,7 +323,29 @@ let temporal_config = SwqosConfig::Temporal(
 - 如果没有提供自定义 URL（`None`），系统将使用指定 `SwqosRegion` 的默认端点
 - 这提供了最大的灵活性，同时保持向后兼容性
 
-当使用多个MEV服务时，需要使用`Durable Nonce`。你需要使用`fetch_nonce_info`函数获取最新的`nonce`值，并在交易的时候将`durable_nonce`填入交易参数。
+当使用多个 MEV 服务时，需要使用 `Durable Nonce`。先获取最新 nonce，再挂到新的 buy/sell 参数上：
+
+```rust
+use sol_trade_sdk::{fetch_nonce_info, AccountPolicy, BuyAmount, SimpleBuyParams};
+
+let nonce_info = fetch_nonce_info(&client.infrastructure.rpc, nonce_account)
+    .await
+    .expect("nonce account must be initialized");
+
+let buy_params = SimpleBuyParams::new(
+    DexType::PumpFun,
+    TradeTokenType::SOL,
+    mint_pubkey,
+    BuyAmount::WithMaxInput { quote_amount: buy_sol_amount },
+    DexParamEnum::PumpFun(pumpfun_params),
+    recent_blockhash, // 会被 `.durable_nonce(...)` 清空
+    gas_fee_strategy.clone(),
+)
+.durable_nonce(nonce_info)
+.account_policy(AccountPolicy::HotPathMinimal);
+
+client.buy_simple(buy_params).await?;
+```
 
 #### Astralane（Binary / Plain / QUIC）
 
@@ -371,22 +428,21 @@ SDK 不会在每次卖出时通过 RPC 拉取 creator_vault（以避免延迟）
 
 Pump.fun 已升级 Bonding Curve 合约，推出**统一化 v2 指令**，通过固定账户布局同时支持 SOL 和 USDC 配对币。旧版 `buy`/`sell`/`buy_exact_sol_in` 仍可用于 SOL 配对币，且保持为默认选项。
 
-SDK 侧调用入口保持统一：正常使用 `buy` / `sell` 流程即可，SDK 会根据 `quote_mint` 自动选择正确的链上 discriminator 和账户布局。
+SDK 侧调用入口保持统一：正常使用 `buy` / `sell` 流程即可，SDK 会根据 `quote_mint` 和买/卖的结算 mint 自动选择正确的链上 discriminator 和账户布局。能用 V1 的 native SOL 池会优先用 V1。
 
 **v2 指令关键变化：**
-- 新增 `quote_mint` 参数 — SOL 配对传包装 SOL（`So11111111111111111111111111111111111111112`），USDC 配对传 USDC mint
+- 新增 `quote_mint` 参数 — native SOL 配对可能表现为默认值、Solscan SOL sentinel（`So11111111111111111111111111111111111111111`）或 WSOL sentinel（`So11111111111111111111111111111111111111112`）；USDC/其他真实 quote mint 才选择 V2
 - 27 个固定账户（buy）/ 26 个固定账户（sell）— **无可选账户**
 - `buyback_fee_recipient`、`sharing_config` 和 6 个 `associated_quote_*` ATA 变为强制账户
 - SOL 配对币的报价和成本与旧版一致，无额外开销
 
 **使用方式：**
 
-把事件里的 `quote_mint` 传给 `PumpFunParams::from_trade`。`quote_mint` 不是 PDA，它就是 quote SPL mint；`Pubkey::default()` 和 Solscan SOL（`So11111111111111111111111111111111111111111`）表示旧版 SOL 布局，`WSOL_TOKEN_ACCOUNT` 表示 SOL V2，USDC 表示 USDC V2：
+把事件里的 `quote_mint` 传给 `PumpFunParams::from_trade`。`quote_mint` 不是 PDA，它就是 quote SPL mint 或 native SOL sentinel；`Pubkey::default()`、Solscan SOL（`So11111111111111111111111111111111111111111`）和 `WSOL_TOKEN_ACCOUNT` 都表示 native SOL 配对，正常用 SOL 结算时默认走旧版 V1；USDC 表示 USDC V2：
 
 ```rust
-// legacy SOL 池：log 事件里可能是 Pubkey::default()，parser 数据里是 Solscan SOL sentinel
-// SOL V2 池：WSOL_TOKEN_ACCOUNT
-// USDC 池：就是 USDC mint
+// native SOL 池：可能是 Pubkey::default()、Solscan SOL sentinel 或 WSOL sentinel
+// USDC / 非 SOL 池：就是实际 quote SPL mint
 let quote_mint = e.quote_mint;
 
 let params = PumpFunParams::from_trade(
@@ -412,14 +468,14 @@ client.buy(buy_params).await?;
 client.sell(sell_params).await?;
 ```
 
-USDC 配对币必须用 USDC 买入、卖出也结算为 USDC；SOL/WSOL 只适用于 SOL 配对的 PumpFun 曲线。SDK 会在提交前拒绝 USDC quote 池的 SOL 输入，避免链上 6063 失败。
+USDC 配对币必须用 USDC 买入、卖出也结算为 USDC；SOL/WSOL 只适用于 SOL 配对的 PumpFun 曲线。SOL 配对的普通热路径请传 `SOL`，SDK 会用 V1；只有你明确传 `WSOL` 作为买入输入或卖出输出、希望通过已有 WSOL ATA 结算时，才会选择 V2。
+SDK 会在提交前拒绝 USDC quote 池的 SOL 输入，避免链上 6063 失败。
 消费 parser 事件时，需要把 `quoteMint`、`virtualQuoteReserves`、`realQuoteReserves` 传进 `PumpFunParams::from_trade(...)`；USDC 池初始虚拟 quote reserve 是 `4_292_000_000`。
 legacy SOL 事件里如果 `quote_mint` 是默认值或 Solscan SOL，并且 quote reserve 字段缺失/为 0，应回退使用 `virtual_sol_reserves` / `real_sol_reserves`。
 
 | quote_mint | 实际使用的指令 | 说明 |
 |-----------|---------|------|
-| 未设置（默认）/ `SOL_TOKEN_ACCOUNT` (`So111...11111`) | 旧版 `buy`/`sell`/`buy_exact_sol_in` | 向后兼容，仅 SOL |
-| `WSOL_TOKEN_ACCOUNT` (`So111...11112`) | `buy_v2`/`sell_v2`/`buy_exact_quote_in_v2` | SOL 配对，统一布局 |
+| 未设置（默认）/ `SOL_TOKEN_ACCOUNT` (`So111...11111`) / `WSOL_TOKEN_ACCOUNT` (`So111...11112`) | 优先旧版 `buy`/`sell`/`buy_exact_sol_in` | native SOL 配对；普通 SOL 结算走 V1，显式 WSOL 结算才走 V2 |
 | `USDC_TOKEN_ACCOUNT` | `buy_v2`/`sell_v2`/`buy_exact_quote_in_v2` | USDC 配对（必须使用 v2） |
 
 ## 🛡️ MEV 保护服务
