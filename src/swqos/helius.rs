@@ -16,8 +16,9 @@ use reqwest::Client;
 use serde_json::json;
 use solana_sdk::transaction::VersionedTransaction;
 use solana_transaction_status::UiTransactionEncoding;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::common::SolanaRpcClient;
 use crate::constants::swqos::{
@@ -33,6 +34,10 @@ pub struct HeliusClient {
     pub http_client: Client,
     /// When true, min_tip_sol() returns 0.000005; else 0.0002.
     swqos_only: bool,
+    /// Shared stop signal for the connection warmup loop.
+    stop_ping: Arc<AtomicBool>,
+    /// Client-instance ref guard used to avoid stopping ping on temporary clone drop.
+    instance_refs: Arc<()>,
 }
 
 impl HeliusClient {
@@ -45,7 +50,19 @@ impl HeliusClient {
         let rpc_client = SolanaRpcClient::new(rpc_url);
         let http_client = default_http_client_builder().build().unwrap();
         let submit_url = Self::build_submit_url(&endpoint, api_key.as_deref(), swqos_only);
-        Self { submit_url, rpc_client: Arc::new(rpc_client), http_client, swqos_only }
+        let client = Self {
+            submit_url,
+            rpc_client: Arc::new(rpc_client),
+            http_client,
+            swqos_only,
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+        };
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            client_clone.start_ping_task().await;
+        });
+        client
     }
 
     /// Build URL once at construction; no per-request allocation.
@@ -66,6 +83,33 @@ impl HeliusClient {
             url.push_str("swqos_only=true");
         }
         url
+    }
+
+    async fn start_ping_task(&self) {
+        let submit_url = self.submit_url.clone();
+        let http_client = self.http_client.clone();
+        let stop_ping = self.stop_ping.clone();
+
+        tokio::spawn(async move {
+            // Warm the TLS/TCP connection immediately, then keep the pool hot. A non-success
+            // status is fine here; the request is intentionally side-effect free.
+            let _ = Self::send_ping_request(&http_client, &submit_url).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if stop_ping.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = Self::send_ping_request(&http_client, &submit_url).await;
+            }
+        });
+    }
+
+    async fn send_ping_request(http_client: &Client, submit_url: &str) -> Result<()> {
+        let response =
+            http_client.get(submit_url).timeout(Duration::from_millis(1500)).send().await?;
+        let _ = response.bytes().await;
+        Ok(())
     }
 
     pub async fn send_transaction(
@@ -223,5 +267,16 @@ impl SwqosClientTrait for HeliusClient {
         } else {
             SWQOS_MIN_TIP_HELIUS
         }
+    }
+}
+
+impl Drop for HeliusClient {
+    fn drop(&mut self) {
+        // Only the last real client instance should stop the shared ping task; temporary
+        // Arc/worker clones must not tear down the warm connection loop.
+        if Arc::strong_count(&self.instance_refs) != 1 {
+            return;
+        }
+        self.stop_ping.store(true, Ordering::Relaxed);
     }
 }

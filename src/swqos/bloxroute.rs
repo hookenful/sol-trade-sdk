@@ -4,6 +4,7 @@ use crate::swqos::common::serialize_transaction_and_encode;
 use crate::swqos::serialization;
 use rand::seq::IndexedRandom;
 use reqwest::Client;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{sync::Arc, time::Instant};
 
 use solana_transaction_status::UiTransactionEncoding;
@@ -22,6 +23,10 @@ pub struct BloxrouteClient {
     pub auth_token: String,
     pub rpc_client: Arc<SolanaRpcClient>,
     pub http_client: Client,
+    /// Shared stop signal for the connection warmup loop.
+    stop_ping: Arc<AtomicBool>,
+    /// Client-instance ref guard used to avoid stopping ping on temporary clone drop.
+    instance_refs: Arc<()>,
 }
 
 #[async_trait::async_trait]
@@ -65,7 +70,46 @@ impl BloxrouteClient {
             .pool_max_idle_per_host(256)
             .build()
             .unwrap();
-        Self { rpc_client: Arc::new(rpc_client), endpoint, auth_token, http_client }
+        let client = Self {
+            rpc_client: Arc::new(rpc_client),
+            endpoint,
+            auth_token,
+            http_client,
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+        };
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            client_clone.start_ping_task().await;
+        });
+        client
+    }
+
+    async fn start_ping_task(&self) {
+        let endpoint = self.endpoint.clone();
+        let http_client = self.http_client.clone();
+        let stop_ping = self.stop_ping.clone();
+
+        tokio::spawn(async move {
+            // Warm the TLS/TCP connection immediately, then keep the pool hot. A non-success
+            // status is fine here; the request is intentionally side-effect free.
+            let _ = Self::send_ping_request(&http_client, &endpoint).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            loop {
+                interval.tick().await;
+                if stop_ping.load(Ordering::Relaxed) {
+                    break;
+                }
+                let _ = Self::send_ping_request(&http_client, &endpoint).await;
+            }
+        });
+    }
+
+    async fn send_ping_request(http_client: &Client, endpoint: &str) -> Result<()> {
+        let response =
+            http_client.get(endpoint).timeout(Duration::from_millis(1500)).send().await?;
+        let _ = response.bytes().await;
+        Ok(())
     }
 
     pub async fn send_transaction(
@@ -201,5 +245,16 @@ impl BloxrouteClient {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for BloxrouteClient {
+    fn drop(&mut self) {
+        // Only the last real client instance should stop the shared ping task; temporary
+        // Arc/worker clones must not tear down the warm connection loop.
+        if Arc::strong_count(&self.instance_refs) != 1 {
+            return;
+        }
+        self.stop_ping.store(true, Ordering::Relaxed);
     }
 }

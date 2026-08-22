@@ -1,4 +1,5 @@
-use std::{sync::Arc, time::Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{sync::Arc, time::Duration, time::Instant};
 
 use solana_client::rpc_config::RpcSendTransactionConfig;
 use solana_commitment_config::CommitmentLevel;
@@ -15,7 +16,11 @@ use anyhow::Result;
 #[derive(Clone)]
 pub struct SolRpcClient {
     pub rpc_client: Arc<SolanaRpcClient>,
+    stop_ping: Arc<AtomicBool>,
+    instance_refs: Arc<()>,
 }
+
+const DEFAULT_RPC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 #[async_trait::async_trait]
 impl SwqosClientTrait for SolRpcClient {
@@ -82,6 +87,82 @@ impl SwqosClientTrait for SolRpcClient {
 
 impl SolRpcClient {
     pub fn new(rpc_client: Arc<SolanaRpcClient>) -> Self {
-        Self { rpc_client }
+        let client = Self {
+            rpc_client,
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+        };
+        let client_clone = client.clone();
+        tokio::spawn(async move {
+            client_clone.start_ping_task().await;
+        });
+        client
+    }
+
+    /// Warm the Default RPC client's connection immediately, then keep it hot.
+    async fn start_ping_task(&self) {
+        let rpc_client = self.rpc_client.clone();
+        let stop_ping = self.stop_ping.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = Self::send_ping_request(&rpc_client).await {
+                if sdk_log::sdk_log_enabled() {
+                    eprintln!("Default RPC ping request failed: {}", e);
+                }
+            }
+
+            let mut interval = tokio::time::interval(DEFAULT_RPC_KEEPALIVE_INTERVAL);
+            loop {
+                interval.tick().await;
+                if stop_ping.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Err(e) = Self::send_ping_request(&rpc_client).await {
+                    if sdk_log::sdk_log_enabled() {
+                        eprintln!("Default RPC ping request failed: {}", e);
+                    }
+                }
+            }
+        });
+    }
+
+    async fn send_ping_request(rpc_client: &SolanaRpcClient) -> Result<()> {
+        rpc_client.get_health().await?;
+        Ok(())
+    }
+}
+
+impl Drop for SolRpcClient {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.instance_refs) != 1 {
+            return;
+        }
+        self.stop_ping.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> SolRpcClient {
+        SolRpcClient {
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+        }
+    }
+
+    #[test]
+    fn dropping_clone_does_not_stop_default_rpc_ping_task() {
+        let client = test_client();
+        let stop_ping = client.stop_ping.clone();
+        let clone = client.clone();
+
+        drop(clone);
+        assert!(!stop_ping.load(Ordering::Relaxed));
+
+        drop(client);
+        assert!(stop_ping.load(Ordering::Relaxed));
     }
 }
