@@ -1,5 +1,5 @@
 use crate::common::nonce_cache::DurableNonceInfo;
-use crate::common::{GasFeeStrategy, SolanaRpcClient};
+use crate::common::{GasFeeStrategy, SolanaRpcClient, TradeTransactionVersion};
 use crate::swqos::{SwqosClient, TradeType};
 use crate::trading::MiddlewareManager;
 use crate::PrecheckConfig;
@@ -29,7 +29,11 @@ pub struct SenderConcurrencyConfig {
 pub enum DexParamEnum {
     PumpFun(PumpFunParams),
     PumpSwap(PumpSwapParams),
+    LaunchLab(BonkParams),
     Bonk(BonkParams),
+    StonkFun(BonkParams),
+    /// Graduated StonkFun pool parameters backed by the external CPMM venue.
+    StonkFunSwap(RaydiumCpmmParams),
     RaydiumCpmm(RaydiumCpmmParams),
     RaydiumAmmV4(RaydiumAmmV4Params),
     MeteoraDammV2(MeteoraDammV2Params),
@@ -42,7 +46,10 @@ impl DexParamEnum {
         match self {
             DexParamEnum::PumpFun(p) => p,
             DexParamEnum::PumpSwap(p) => p,
+            DexParamEnum::LaunchLab(p) => p,
             DexParamEnum::Bonk(p) => p,
+            DexParamEnum::StonkFun(p) => p,
+            DexParamEnum::StonkFunSwap(p) => p,
             DexParamEnum::RaydiumCpmm(p) => p,
             DexParamEnum::RaydiumAmmV4(p) => p,
             DexParamEnum::MeteoraDammV2(p) => p,
@@ -62,7 +69,7 @@ pub struct SwapParams {
     pub output_token_program: Option<Pubkey>,
     pub input_amount: Option<u64>,
     pub slippage_basis_points: Option<u64>,
-    pub address_lookup_table_account: Option<AddressLookupTableAccount>,
+    pub address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
     pub recent_blockhash: Option<Hash>,
     pub wait_tx_confirmed: bool,
     pub protocol_params: DexParamEnum,
@@ -83,13 +90,15 @@ pub struct SwapParams {
     pub simulate: bool,
     /// Whether to output SDK logs (from TradeConfig.log_enabled).
     pub log_enabled: bool,
-    /// Fast-submit only (`wait_tx_confirmed = false`): when true, wait for every
-    /// SWQOS route's HTTP submit response so all submitted signatures are
-    /// returned. Defaults to false (post-4.0.11 behaviour: return after the
-    /// first route accepts). Set to true when the caller does its own on-chain
-    /// confirmation against a pinned durable nonce — only one route's tx can
-    /// land, but the caller cannot know which in advance, so it needs every
-    /// signature to poll via `getSignatureStatuses`.
+    /// When true, wait for every SWQOS route's HTTP submit response before
+    /// returning so the result includes all submitted signatures.
+    ///
+    /// This is useful when confirmation or external monitoring polls all
+    /// signatures: each route can submit a distinct transaction because relay
+    /// tips may use different accounts. With a durable nonce, at most one route
+    /// can consume the nonce; with a recent blockhash, multiple route variants
+    /// may be valid, so callers must choose strategy and account state
+    /// accordingly. Defaults to false for lower submit latency.
     pub wait_for_all_submits: bool,
     /// Use dedicated sender threads (internal; set via client.with_dedicated_sender_threads()).
     pub use_dedicated_sender_threads: bool,
@@ -101,6 +110,8 @@ pub struct SwapParams {
     pub effective_core_ids: Arc<Vec<CoreId>>,
     /// Whether to check minimum tip per SWQOS (from TradeConfig.check_min_tip). When false, skip filter for lower latency.
     pub check_min_tip: bool,
+    /// Solana transaction construction mode selected by `TradeConfig`.
+    pub transaction_version: TradeTransactionVersion,
     /// Optional event receive time in microseconds (same scale as sol-parser-sdk clock::now_micros). Used as timing start when log_enabled.
     pub grpc_recv_us: Option<i64>,
     /// Use exact quote-input buy instructions (legacy PumpFun uses SOL quote; V2/PumpSwap use generic quote).

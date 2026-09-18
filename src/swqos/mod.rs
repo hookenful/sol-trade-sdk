@@ -4,18 +4,23 @@ pub mod blockrazor;
 pub mod bloxroute;
 pub mod common;
 pub mod flashblock;
+pub mod glaive;
+pub mod glaive_quic;
 pub mod helius;
 pub mod jito;
 pub mod lightspeed;
+pub mod lunarlander;
 pub mod nextblock;
 pub mod node1;
 pub mod node1_quic;
 pub mod serialization;
+pub mod solami;
 pub mod solana_rpc;
 pub mod soyas;
 pub mod speedlanding;
 pub mod stellium;
 pub mod temporal;
+mod temporal_quic;
 pub mod zeroslot;
 
 use std::sync::Arc;
@@ -31,23 +36,25 @@ use crate::{
         SWQOS_ENDPOINTS_ASTRALANE_BINARY, SWQOS_ENDPOINTS_ASTRALANE_PLAIN,
         SWQOS_ENDPOINTS_ASTRALANE_QUIC, SWQOS_ENDPOINTS_ASTRALANE_QUIC_MEV,
         SWQOS_ENDPOINTS_BLOCKRAZOR, SWQOS_ENDPOINTS_BLOCKRAZOR_GRPC, SWQOS_ENDPOINTS_BLOX,
-        SWQOS_ENDPOINTS_FLASHBLOCK, SWQOS_ENDPOINTS_HELIUS, SWQOS_ENDPOINTS_JITO,
-        SWQOS_ENDPOINTS_NEXTBLOCK, SWQOS_ENDPOINTS_NODE1, SWQOS_ENDPOINTS_NODE1_QUIC,
-        SWQOS_ENDPOINTS_SOYAS, SWQOS_ENDPOINTS_SPEEDLANDING, SWQOS_ENDPOINTS_STELLIUM,
-        SWQOS_ENDPOINTS_TEMPORAL, SWQOS_ENDPOINTS_ZERO_SLOT, SWQOS_MIN_TIP_ASTRALANE,
-        SWQOS_MIN_TIP_BLOCKRAZOR, SWQOS_MIN_TIP_BLOXROUTE, SWQOS_MIN_TIP_DEFAULT,
-        SWQOS_MIN_TIP_FLASHBLOCK, SWQOS_MIN_TIP_HELIUS, SWQOS_MIN_TIP_JITO,
-        SWQOS_MIN_TIP_LIGHTSPEED, SWQOS_MIN_TIP_NEXTBLOCK, SWQOS_MIN_TIP_NODE1,
-        SWQOS_MIN_TIP_SOYAS, SWQOS_MIN_TIP_SPEEDLANDING, SWQOS_MIN_TIP_STELLIUM,
-        SWQOS_MIN_TIP_TEMPORAL, SWQOS_MIN_TIP_ZERO_SLOT,
+        SWQOS_ENDPOINTS_FLASHBLOCK, SWQOS_ENDPOINTS_GLAIVE, SWQOS_ENDPOINTS_GLAIVE_QUIC,
+        SWQOS_ENDPOINTS_HELIUS, SWQOS_ENDPOINTS_JITO, SWQOS_ENDPOINTS_LUNARLANDER,
+        SWQOS_ENDPOINTS_LUNARLANDER_QUIC, SWQOS_ENDPOINTS_NEXTBLOCK, SWQOS_ENDPOINTS_NODE1,
+        SWQOS_ENDPOINTS_NODE1_QUIC, SWQOS_ENDPOINTS_SOLAMI, SWQOS_ENDPOINTS_SOYAS,
+        SWQOS_ENDPOINTS_SPEEDLANDING, SWQOS_ENDPOINTS_STELLIUM, SWQOS_ENDPOINTS_TEMPORAL,
+        SWQOS_ENDPOINTS_ZERO_SLOT, SWQOS_MIN_TIP_ASTRALANE, SWQOS_MIN_TIP_BLOCKRAZOR,
+        SWQOS_MIN_TIP_BLOXROUTE, SWQOS_MIN_TIP_DEFAULT, SWQOS_MIN_TIP_FLASHBLOCK,
+        SWQOS_MIN_TIP_GLAIVE, SWQOS_MIN_TIP_HELIUS, SWQOS_MIN_TIP_JITO, SWQOS_MIN_TIP_LIGHTSPEED,
+        SWQOS_MIN_TIP_LUNARLANDER, SWQOS_MIN_TIP_NEXTBLOCK, SWQOS_MIN_TIP_NODE1,
+        SWQOS_MIN_TIP_SOLAMI, SWQOS_MIN_TIP_SOYAS, SWQOS_MIN_TIP_SPEEDLANDING,
+        SWQOS_MIN_TIP_STELLIUM, SWQOS_MIN_TIP_TEMPORAL, SWQOS_MIN_TIP_ZERO_SLOT,
     },
     swqos::{
         astralane::AstralaneClient, blockrazor::BlockRazorClient, bloxroute::BloxrouteClient,
-        flashblock::FlashBlockClient, helius::HeliusClient, jito::JitoClient,
-        lightspeed::LightspeedClient, nextblock::NextBlockClient, node1::Node1Client,
-        node1_quic::Node1QuicClient, solana_rpc::SolRpcClient, soyas::SoyasClient,
-        speedlanding::SpeedlandingClient, stellium::StelliumClient, temporal::TemporalClient,
-        zeroslot::ZeroSlotClient,
+        flashblock::FlashBlockClient, glaive::GlaiveClient, helius::HeliusClient, jito::JitoClient,
+        lightspeed::LightspeedClient, lunarlander::LunarLanderClient, nextblock::NextBlockClient,
+        node1::Node1Client, node1_quic::Node1QuicClient, solami::SolamiClient,
+        solana_rpc::SolRpcClient, soyas::SoyasClient, speedlanding::SpeedlandingClient,
+        stellium::StelliumClient, temporal::TemporalClient, zeroslot::ZeroSlotClient,
     },
 };
 
@@ -63,7 +70,7 @@ pub const SWQOS_BLACKLIST: &[SwqosType] = &[
 
 /// SWQOS 提交通道：HTTP、gRPC 或 QUIC（低延迟）。
 /// BlockRazor 支持 gRPC 和 HTTP。
-/// Node1 支持 QUIC。
+/// Node1、Glaive 与 Lunar Lander 支持 QUIC。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum SwqosTransport {
     #[default]
@@ -77,11 +84,11 @@ pub enum SwqosTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum AstralaneTransport {
     /// Binary over HTTP：`…/irisb?api-key=…&method=sendTransaction`（与 `AstralaneClient` 当前序列化一致）。
-    #[default]
     Binary,
     /// Plain HTTP：`…/iris?…`（非 irisb 路径）。
     Plain,
     /// QUIC（`host:7000`；MEV 时 `host:9000`）。
+    #[default]
     Quic,
 }
 
@@ -121,6 +128,9 @@ pub enum SwqosType {
     Soyas,
     Speedlanding,
     Helius,
+    Solami,
+    LunarLander,
+    Glaive,
     Default,
 }
 
@@ -143,6 +153,9 @@ impl SwqosType {
             Self::Soyas => "Soyas",
             Self::Speedlanding => "Speedlanding",
             Self::Helius => "Helius",
+            Self::Solami => "Solami",
+            Self::LunarLander => "LunarLander",
+            Self::Glaive => "Glaive",
             Self::Default => "Default",
         }
     }
@@ -163,6 +176,9 @@ impl SwqosType {
             Self::Soyas,
             Self::Speedlanding,
             Self::Helius,
+            Self::Solami,
+            Self::LunarLander,
+            Self::Glaive,
             Self::Default,
         ]
     }
@@ -204,6 +220,9 @@ pub trait SwqosClientTrait {
             SwqosType::Soyas => SWQOS_MIN_TIP_SOYAS,
             SwqosType::Speedlanding => SWQOS_MIN_TIP_SPEEDLANDING,
             SwqosType::Helius => SWQOS_MIN_TIP_HELIUS,
+            SwqosType::Solami => SWQOS_MIN_TIP_SOLAMI,
+            SwqosType::LunarLander => SWQOS_MIN_TIP_LUNARLANDER,
+            SwqosType::Glaive => SWQOS_MIN_TIP_GLAIVE,
             SwqosType::Default => SWQOS_MIN_TIP_DEFAULT,
         }
     }
@@ -238,7 +257,8 @@ pub enum SwqosConfig {
     NextBlock(String, SwqosRegion, Option<String>),
     /// Bloxroute(api_token, region, custom_url)
     Bloxroute(String, SwqosRegion, Option<String>),
-    /// Temporal(api_token, region, custom_url)
+    /// Temporal(api_token, region, custom_url). Without a custom URL, uses QUIC/H3 then HTTP Batch fallback.
+    /// A custom URL remains an explicit HTTP Binary Batch endpoint.
     Temporal(String, SwqosRegion, Option<String>),
     /// ZeroSlot(api_token, region, custom_url)
     ZeroSlot(String, SwqosRegion, Option<String>),
@@ -248,7 +268,8 @@ pub enum SwqosConfig {
     FlashBlock(String, SwqosRegion, Option<String>),
     /// BlockRazor(api_token, region, custom_url, transport). transport=None 或 Grpc => gRPC; Some(Http) => HTTP.
     BlockRazor(String, SwqosRegion, Option<String>, Option<SwqosTransport>),
-    /// Astralane(api_token, region, custom_url, mode). `None` => [`AstralaneTransport::Binary`]（`/irisb`）。
+    /// Astralane(api_token, region, custom_url, mode). `None` => QUIC then Binary HTTP fallback.
+    /// A custom URL with no mode remains an explicit Binary HTTP endpoint.
     Astralane(String, SwqosRegion, Option<String>, Option<AstralaneTransport>),
     /// Stellium(api_token, region, custom_url)
     Stellium(String, SwqosRegion, Option<String>),
@@ -264,6 +285,16 @@ pub enum SwqosConfig {
     /// Helius Sender: dual routing to validators and Jito. API key optional (custom TPS only).
     /// (api_key, region, custom_url, swqos_only). swqos_only: None => false (min tip 0.0002 SOL); Some(true) => SWQOS-only (min tip 0.000005 SOL, much lower).
     Helius(String, SwqosRegion, Option<String>, Option<bool>),
+    /// Solami(api_key, region, custom_url)
+    Solami(String, SwqosRegion, Option<String>),
+    /// Lunar Lander (HelloMoon): binary tx via QUIC (port 16888) or HTTP POST /send-bin.
+    /// (api_key, region, custom_url, transport). transport=None => QUIC; Some(Http) => HTTP.
+    /// Minimum tip: 0.001 SOL. Apply for API key: https://docs.hellomoon.io/reference/lunar-lander
+    LunarLander(String, SwqosRegion, Option<String>, Option<SwqosTransport>),
+    /// Glaive(api_key_uuid, region, custom_url, transport).
+    /// transport=None => QUIC (official lowest-latency path, UDP/4000); Some(Http) => binary HTTP.
+    /// Minimum tip: 0.0001 SOL. API and protocol docs: <https://glaive.trade/docs>
+    Glaive(String, SwqosRegion, Option<String>, Option<SwqosTransport>),
 }
 
 impl SwqosConfig {
@@ -284,6 +315,9 @@ impl SwqosConfig {
             SwqosConfig::Soyas(_, _, _) => SwqosType::Soyas,
             SwqosConfig::Speedlanding(_, _, _) => SwqosType::Speedlanding,
             SwqosConfig::Helius(_, _, _, _) => SwqosType::Helius,
+            SwqosConfig::Solami(_, _, _) => SwqosType::Solami,
+            SwqosConfig::LunarLander(_, _, _, _) => SwqosType::LunarLander,
+            SwqosConfig::Glaive(_, _, _, _) => SwqosType::Glaive,
         }
     }
 
@@ -312,6 +346,9 @@ impl SwqosConfig {
             SwqosType::Soyas => SWQOS_ENDPOINTS_SOYAS[region as usize].to_string(),
             SwqosType::Speedlanding => SWQOS_ENDPOINTS_SPEEDLANDING[region as usize].to_string(),
             SwqosType::Helius => SWQOS_ENDPOINTS_HELIUS[region as usize].to_string(),
+            SwqosType::Solami => SWQOS_ENDPOINTS_SOLAMI[region as usize].to_string(),
+            SwqosType::LunarLander => SWQOS_ENDPOINTS_LUNARLANDER[region as usize].to_string(),
+            SwqosType::Glaive => SWQOS_ENDPOINTS_GLAIVE[region as usize].to_string(),
             SwqosType::Default => "".to_string(),
         }
     }
@@ -345,6 +382,22 @@ impl SwqosConfig {
                     SWQOS_ENDPOINTS_NODE1[region as usize].to_string()
                 }
             }
+            SwqosType::LunarLander => {
+                let use_quic = transport.unwrap_or(SwqosTransport::Quic) == SwqosTransport::Quic;
+                if use_quic {
+                    SWQOS_ENDPOINTS_LUNARLANDER_QUIC[region as usize].to_string()
+                } else {
+                    SWQOS_ENDPOINTS_LUNARLANDER[region as usize].to_string()
+                }
+            }
+            SwqosType::Glaive => {
+                let use_quic = transport.unwrap_or(SwqosTransport::Quic) == SwqosTransport::Quic;
+                if use_quic {
+                    SWQOS_ENDPOINTS_GLAIVE_QUIC[region as usize].to_string()
+                } else {
+                    SWQOS_ENDPOINTS_GLAIVE[region as usize].to_string()
+                }
+            }
             _ => Self::get_endpoint(swqos_type, region, None),
         }
     }
@@ -374,9 +427,24 @@ impl SwqosConfig {
                 Ok(Arc::new(zeroslot_client))
             }
             SwqosConfig::Temporal(auth_token, region, url) => {
-                let endpoint = SwqosConfig::get_endpoint(SwqosType::Temporal, region, url);
-                let temporal_client =
-                    TemporalClient::new(rpc_url.clone(), endpoint.to_string(), auth_token);
+                if let Some(endpoint) = url {
+                    return Ok(Arc::new(TemporalClient::new(
+                        rpc_url.clone(),
+                        endpoint,
+                        auth_token,
+                    )));
+                }
+                let endpoint = SWQOS_ENDPOINTS_TEMPORAL[region as usize].to_string();
+                let temporal_client = TemporalClient::new_quic_with_fallback(
+                    rpc_url.clone(),
+                    endpoint.clone(),
+                    auth_token.clone(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    tracing::warn!(target: "sol_trade_sdk", "Temporal QUIC setup failed; using HTTP Batch only: {error}");
+                    TemporalClient::new(rpc_url.clone(), endpoint, auth_token)
+                });
                 Ok(Arc::new(temporal_client))
             }
             SwqosConfig::Bloxroute(auth_token, region, url) => {
@@ -408,44 +476,115 @@ impl SwqosConfig {
                 Ok(Arc::new(flashblock_client))
             }
             SwqosConfig::BlockRazor(auth_token, region, url, transport) => {
-                // BlockRazor: transport=None 或 transport=Grpc 时使用 gRPC，transport=Http 时使用 HTTP
-                let use_http = transport.map_or(false, |t| t == SwqosTransport::Http);
-                let endpoint = SwqosConfig::get_endpoint_with_transport(
-                    SwqosType::BlockRazor,
-                    region,
-                    url,
-                    transport,
-                    mev_protection,
-                );
-                if use_http {
-                    let blockrazor_client = BlockRazorClient::new_http(
+                let region_index = region as usize;
+                if url.is_some() && transport.is_none() {
+                    return Ok(Arc::new(BlockRazorClient::new_http(
                         rpc_url.clone(),
-                        endpoint.to_string(),
+                        url.unwrap(),
                         auth_token,
                         mev_protection,
-                    );
-                    Ok(Arc::new(blockrazor_client))
-                } else {
-                    // 使用 gRPC 模式（默认或用户明确指定了 gRPC）
-                    let blockrazor_client = BlockRazorClient::new_grpc(
-                        rpc_url.clone(),
-                        endpoint.to_string(),
-                        auth_token,
-                        mev_protection,
-                    )
-                    .await?;
-                    Ok(Arc::new(blockrazor_client))
+                    )));
+                }
+                match transport {
+                    Some(SwqosTransport::Http) => {
+                        let endpoint = url.unwrap_or_else(|| {
+                            SWQOS_ENDPOINTS_BLOCKRAZOR[region_index].to_string()
+                        });
+                        Ok(Arc::new(BlockRazorClient::new_http(
+                            rpc_url.clone(),
+                            endpoint,
+                            auth_token,
+                            mev_protection,
+                        )))
+                    }
+                    Some(SwqosTransport::Grpc) => {
+                        let endpoint = url.unwrap_or_else(|| {
+                            SWQOS_ENDPOINTS_BLOCKRAZOR_GRPC[region_index].to_string()
+                        });
+                        Ok(Arc::new(
+                            BlockRazorClient::new_grpc(
+                                rpc_url.clone(),
+                                endpoint,
+                                auth_token,
+                                mev_protection,
+                            )
+                            .await?,
+                        ))
+                    }
+                    Some(SwqosTransport::Quic) => {
+                        anyhow::bail!(
+                            "BlockRazor does not support the QUIC transaction-submission transport"
+                        )
+                    }
+                    None => {
+                        let grpc_endpoint =
+                            SWQOS_ENDPOINTS_BLOCKRAZOR_GRPC[region_index].to_string();
+                        let http_endpoint = SWQOS_ENDPOINTS_BLOCKRAZOR[region_index].to_string();
+                        let client = BlockRazorClient::new_grpc_with_http_fallback(
+                            rpc_url.clone(),
+                            grpc_endpoint,
+                            http_endpoint.clone(),
+                            auth_token.clone(),
+                            mev_protection,
+                        )
+                        .await
+                        .unwrap_or_else(|error| {
+                            tracing::warn!(target: "sol_trade_sdk", "BlockRazor gRPC setup failed; using HTTP only: {error}");
+                            BlockRazorClient::new_http(
+                                rpc_url.clone(),
+                                http_endpoint,
+                                auth_token,
+                                mev_protection,
+                            )
+                        });
+                        Ok(Arc::new(client))
+                    }
                 }
             }
             SwqosConfig::Astralane(auth_token, region, url, mode) => {
-                let mode = mode.unwrap_or_default();
-                match mode {
+                let region_index = region as usize;
+                if mode.is_none() {
+                    if let Some(endpoint) = url {
+                        return Ok(Arc::new(AstralaneClient::new(
+                            rpc_url.clone(),
+                            endpoint,
+                            auth_token,
+                            mev_protection,
+                        )));
+                    }
+                    let quic_endpoint = if mev_protection {
+                        SWQOS_ENDPOINTS_ASTRALANE_QUIC_MEV[region_index].to_string()
+                    } else {
+                        SWQOS_ENDPOINTS_ASTRALANE_QUIC[region_index].to_string()
+                    };
+                    let http_endpoint = SWQOS_ENDPOINTS_ASTRALANE_BINARY[region_index].to_string();
+                    let client = AstralaneClient::new_quic_with_http_fallback(
+                        rpc_url.clone(),
+                        &quic_endpoint,
+                        http_endpoint.clone(),
+                        auth_token.clone(),
+                        mev_protection,
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        tracing::warn!(target: "sol_trade_sdk", "Astralane QUIC setup failed; using Binary HTTP only: {error}");
+                        AstralaneClient::new(
+                            rpc_url.clone(),
+                            http_endpoint,
+                            auth_token,
+                            mev_protection,
+                        )
+                    });
+                    return Ok(Arc::new(client));
+                }
+
+                match mode.unwrap() {
                     AstralaneTransport::Quic => {
                         let quic_endpoint = url.unwrap_or_else(|| {
                             if mev_protection {
-                                SWQOS_ENDPOINTS_ASTRALANE_QUIC_MEV[region as usize].to_string()
+                                SWQOS_ENDPOINTS_ASTRALANE_QUIC_MEV[region_index].to_string()
                             } else {
-                                SWQOS_ENDPOINTS_ASTRALANE_QUIC[region as usize].to_string()
+                                SWQOS_ENDPOINTS_ASTRALANE_QUIC[region_index].to_string()
                             }
                         });
                         let astralane_client =
@@ -455,7 +594,7 @@ impl SwqosConfig {
                     }
                     AstralaneTransport::Plain => {
                         let endpoint = url.unwrap_or_else(|| {
-                            SWQOS_ENDPOINTS_ASTRALANE_PLAIN[region as usize].to_string()
+                            SWQOS_ENDPOINTS_ASTRALANE_PLAIN[region_index].to_string()
                         });
                         let astralane_client = AstralaneClient::new(
                             rpc_url.clone(),
@@ -467,7 +606,7 @@ impl SwqosConfig {
                     }
                     AstralaneTransport::Binary => {
                         let endpoint = url.unwrap_or_else(|| {
-                            SWQOS_ENDPOINTS_ASTRALANE_BINARY[region as usize].to_string()
+                            SWQOS_ENDPOINTS_ASTRALANE_BINARY[region_index].to_string()
                         });
                         let astralane_client = AstralaneClient::new(
                             rpc_url.clone(),
@@ -512,11 +651,143 @@ impl SwqosConfig {
                     HeliusClient::new(rpc_url.clone(), endpoint, api_key_opt, swqos_only);
                 Ok(Arc::new(helius_client))
             }
+            SwqosConfig::Solami(auth_token, region, url) => {
+                let endpoint = SwqosConfig::get_endpoint(SwqosType::Solami, region, url);
+                let solami_client =
+                    SolamiClient::new(rpc_url.clone(), endpoint.to_string(), auth_token).await?;
+                Ok(Arc::new(solami_client))
+            }
+            SwqosConfig::LunarLander(api_key, region, url, transport) => {
+                let use_quic = transport.unwrap_or(SwqosTransport::Quic) == SwqosTransport::Quic;
+                if use_quic {
+                    let quic_endpoint = url.unwrap_or_else(|| {
+                        SWQOS_ENDPOINTS_LUNARLANDER_QUIC[region as usize].to_string()
+                    });
+                    let lunarlander_client = LunarLanderClient::new_quic(
+                        rpc_url.clone(),
+                        &quic_endpoint,
+                        api_key,
+                        mev_protection,
+                    )
+                    .await?;
+                    Ok(Arc::new(lunarlander_client))
+                } else {
+                    let endpoint = SwqosConfig::get_endpoint(SwqosType::LunarLander, region, url);
+                    let lunarlander_client =
+                        LunarLanderClient::new(rpc_url.clone(), endpoint, api_key);
+                    Ok(Arc::new(lunarlander_client))
+                }
+            }
+            SwqosConfig::Glaive(api_key, region, url, transport) => {
+                match transport.unwrap_or(SwqosTransport::Quic) {
+                    SwqosTransport::Quic => {
+                        let endpoint = url.unwrap_or_else(|| {
+                            SWQOS_ENDPOINTS_GLAIVE_QUIC[region as usize].to_string()
+                        });
+                        let client = GlaiveClient::new_quic(
+                            rpc_url.clone(),
+                            &endpoint,
+                            api_key,
+                            mev_protection,
+                        )
+                        .await?;
+                        Ok(Arc::new(client))
+                    }
+                    SwqosTransport::Http => {
+                        let endpoint = url
+                            .unwrap_or_else(|| SWQOS_ENDPOINTS_GLAIVE[region as usize].to_string());
+                        let client = GlaiveClient::new_http(
+                            rpc_url.clone(),
+                            endpoint,
+                            api_key,
+                            mev_protection,
+                        )?;
+                        Ok(Arc::new(client))
+                    }
+                    SwqosTransport::Grpc => {
+                        anyhow::bail!("Glaive does not support the gRPC transport")
+                    }
+                }
+            }
             SwqosConfig::Default(endpoint) => {
                 let rpc = SolanaRpcClient::new_with_commitment(endpoint, commitment);
                 let rpc_client = SolRpcClient::new(Arc::new(rpc));
                 Ok(Arc::new(rpc_client))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lunarlander_defaults_to_quic_endpoint() {
+        let endpoint = SwqosConfig::get_endpoint_with_transport(
+            SwqosType::LunarLander,
+            SwqosRegion::Frankfurt,
+            None,
+            None,
+            false,
+        );
+
+        assert_eq!(endpoint, SWQOS_ENDPOINTS_LUNARLANDER_QUIC[SwqosRegion::Frankfurt as usize]);
+    }
+
+    #[test]
+    fn lunarlander_http_transport_uses_binary_http_endpoint() {
+        let endpoint = SwqosConfig::get_endpoint_with_transport(
+            SwqosType::LunarLander,
+            SwqosRegion::Frankfurt,
+            None,
+            Some(SwqosTransport::Http),
+            false,
+        );
+
+        assert_eq!(endpoint, SWQOS_ENDPOINTS_LUNARLANDER[SwqosRegion::Frankfurt as usize]);
+    }
+
+    #[test]
+    fn glaive_defaults_to_quic_endpoint() {
+        assert!(SwqosType::values().contains(&SwqosType::Glaive));
+        let endpoint = SwqosConfig::get_endpoint_with_transport(
+            SwqosType::Glaive,
+            SwqosRegion::Frankfurt,
+            None,
+            None,
+            false,
+        );
+        assert_eq!(endpoint, SWQOS_ENDPOINTS_GLAIVE_QUIC[SwqosRegion::Frankfurt as usize]);
+    }
+
+    #[test]
+    fn glaive_http_transport_uses_binary_http_origin() {
+        let endpoint = SwqosConfig::get_endpoint_with_transport(
+            SwqosType::Glaive,
+            SwqosRegion::Frankfurt,
+            None,
+            Some(SwqosTransport::Http),
+            false,
+        );
+        assert_eq!(endpoint, SWQOS_ENDPOINTS_GLAIVE[SwqosRegion::Frankfurt as usize]);
+    }
+
+    #[tokio::test]
+    async fn glaive_rejects_unsupported_grpc_transport_without_connecting() {
+        let result = SwqosConfig::get_swqos_client(
+            "http://127.0.0.1:8899".to_string(),
+            CommitmentConfig::processed(),
+            SwqosConfig::Glaive(
+                "00112233-4455-4677-8899-aabbccddeeff".to_string(),
+                SwqosRegion::Frankfurt,
+                None,
+                Some(SwqosTransport::Grpc),
+            ),
+            false,
+        )
+        .await;
+        let error = result.err().expect("Glaive gRPC config must fail");
+        assert!(error.to_string().contains("does not support the gRPC transport"));
     }
 }

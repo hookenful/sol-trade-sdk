@@ -4,7 +4,7 @@
 </div>
 
 <p align="center">
-    <strong>一个面向低延迟 Solana DEX 交易机器人的高性能 Rust SDK。该 SDK 以速度和效率为核心设计，支持与 PumpFun、Pump AMM（PumpSwap）、Bonk、Meteora DAMM v2、Raydium AMM v4 以及 Raydium CPMM 进行无缝、高吞吐量的交互，适用于对延迟高度敏感的交易策略。</strong>
+    <strong>一个面向低延迟 Solana DEX 交易机器人的高性能 Rust SDK。该 SDK 以速度和效率为核心设计，支持与 PumpFun、Pump AMM（PumpSwap）、Bonk、StonkFun、Meteora DAMM v2、Raydium AMM v4 以及 Raydium CPMM 进行无缝、高吞吐量的交互，适用于对延迟高度敏感的交易策略。</strong>
 </p>
 
 <p align="center">
@@ -39,15 +39,10 @@
     <a href="https://discord.gg/vuazbGkqQE">Discord</a>
 </p>
 
-> ☕ **支持本项目**
->
-> 本 SDK 完全免费且开源。但维护和持续更新需要消耗大量 AI 算力与 Token。如果这个 SDK 对您的开发有帮助，欢迎每月捐赠任意数量的 SOL，您的支持将帮助这个项目持续运行！
->
-> **捐赠钱包：** `6oW7AXz1yRb57pYSxysuXnMs2aR1ha5rzGzReZ1MjPV8`
-
 ## 📋 目录
 
 - [✨ 项目特性](#-项目特性)
+- [📚 使用文档](#-使用文档)
 - [📦 安装](#-安装)
 - [🛠️ 使用示例](#️-使用示例)
   - [📋 使用示例](#-使用示例)
@@ -55,6 +50,7 @@
   - [📊 使用示例汇总表格](#-使用示例汇总表格)
   - [⚙️ SWQoS 服务配置说明](#️-swqos-服务配置说明)
   - [Astralane（Binary / Plain / QUIC）](#astralanebinary--plain--quic)
+  - [Glaive（Binary HTTP / QUIC）](#glaivebinary-http--quic)
   - [🔧 中间件系统说明](#-中间件系统说明)
   - [🔍 地址查找表](#-地址查找表)
   - [🔍 Nonce 缓存](#-nonce-缓存)
@@ -79,26 +75,57 @@
 | **Python** | [sol-trade-sdk-python](https://github.com/0xfnzero/sol-trade-sdk-python) | 原生 async/await 支持 |
 | **Go** | [sol-trade-sdk-golang](https://github.com/0xfnzero/sol-trade-sdk-golang) | 并发安全，goroutine 支持 |
 
+## 这个 SDK 适合什么场景
+
+`sol-trade-sdk` 是 FnZero Solana 交易 SDK 系列的 Rust 版本，重点服务于低延迟交易构建和提交，适合 Solana DEX 交易机器人、跟单系统、狙击机器人、套利策略和私有交易基础设施。
+
+| 方向 | 覆盖范围 |
+|------|----------|
+| DEX 协议 | PumpFun、PumpSwap、LaunchLab、Bonk、StonkFun、Meteora DAMM v2、Raydium AMM v4、Raydium CPMM |
+| 提交通道 | 默认 Solana RPC，以及 Jito、Nextblock、ZeroSlot、Temporal、Bloxroute、FlashBlock、BlockRazor、Node1、Astralane、Glaive、SpeedLanding 等 SWQoS 服务 |
+| 交易流程 | 买入/卖出、精确输入/输出、跟单交易、狙击交易、地址查找表、durable nonce、中间件、共享基础设施 |
+| 热路径设计 | 调用方传入 recent blockhash 或 durable nonce；交易执行阶段不再查询 RPC 获取 blockhash、账户或余额 |
+
 ## 🔖 当前版本
 
-**Rust crate:** `sol-trade-sdk = "4.0.17"`
+**Rust crate:** `sol-trade-sdk = "5.0.4"`
 
-本版本刷新 PumpFun native SOL quote 处理逻辑，SOL/WSOL sentinel 默认优先走更小的 V1 热路径，确保默认 RPC 提交通道会和 SWQoS 通道一起发出，快速提交结果等待窗口恢复为 5 秒，并将 Raydium CPMM fixed-output 交易对齐到链上 `swap_base_out` 指令。交易执行必须由调用方传入 `recent_blockhash` 或 durable nonce；热路径不会查询 RPC 获取 blockhash、账户或余额数据。
+本版本新增共享程序的一等交易入口：`DexType::LaunchLab`、`DexParamEnum::LaunchLab` 与 `LaunchLabParams`，并通过 `DexType::StonkFun`、`DexParamEnum::StonkFun` 与 `StonkFunParams` 提供平台专用命名。同一个 `DexType::StonkFun` 搭配 `DexParamEnum::StonkFunSwap` / `StonkFunSwapParams` 时会路由毕业后的外盘：从主网状态解析任意交易对、SPL Token/Token-2022 混合 token program、当前 AmmConfig、creator fee、transfer fee、vault 余额与两个 swap 方向。曲线买入在毕业边界还会按官方 LaunchLab SDK 反算并缩小实际输入。旧 Bonk 与 `RaydiumCpmm` 名称继续兼容，可用于直接访问底层协议。
+
+以下真实主网回归测试分别使用当前 StonkFun reward 内盘和毕业后的 KNOTS/STONK CPMM 池，仅解析和构造交易，不会提交交易：
+
+```bash
+RUN_MAINNET_TESTS=1 cargo test --lib current_stonkfun_reward_pool_decodes_and_builds_both_trade_directions -- --nocapture
+RUN_MAINNET_TESTS=1 cargo test --lib current_stonkfun_graduated_pool_decodes_and_builds_both_swap_directions -- --nocapture
+```
 
 ## ✨ 项目特性
 
 1. **PumpFun 交易**: SDK 侧统一为 `buy`、`sell`、`buy_exact_quote_in` 流程，native SOL 优先走 V1，USDC/非 SOL quote 或显式 WSOL 结算才走 V2
 2. **PumpSwap 交易**: 支持 PumpSwap 池的交易操作
-3. **Bonk 交易**: 支持 Bonk 的交易操作
-4. **Raydium CPMM 交易**: 支持 Raydium CPMM (Concentrated Pool Market Maker) 的交易操作
-5. **Raydium AMM V4 交易**: 支持 Raydium AMM V4 (Automated Market Maker) 的交易操作
-6. **Meteora DAMM V2 交易**: 支持 Meteora DAMM V2 (Dynamic AMM) 的交易操作
-7. **多种 MEV 保护**: 支持 Jito、Temporal、FlashBlock、BlockRazor、Astralane、SpeedLanding 等服务
-8. **并发交易**: 所有已配置的 SWQoS 通道和默认 RPC 通道都会发出提交；首个成功只影响返回，较慢通道会继续提交
-9. **统一交易接口**: 使用统一的交易协议枚举进行交易操作
-10. **中间件系统**: 支持自定义指令中间件，可在交易执行前对指令进行修改、添加或移除
-11. **共享基础设施**: 多钱包可共享同一套 RPC 与 SWQoS 客户端，降低资源占用
-12. **热路径 RPC 边界**: 交易执行使用调用方传入的 blockhash 或 durable nonce，不在热路径查询 blockhash、账户或余额
+3. **LaunchLab 交易**: 提供一等通用 LaunchLab 路由，并保留 Bonk 兼容名称
+4. **StonkFun 交易**: 基于 LaunchLab 提供独立 StonkFun 路由，并通过 CPMM 支持毕业后的外盘 swap，支持任意 quote mint 与 Token-2022
+5. **Raydium CPMM 交易**: 支持 Raydium CPMM (Concentrated Pool Market Maker) 的交易操作
+6. **Raydium AMM V4 交易**: 支持 Raydium AMM V4 (Automated Market Maker) 的交易操作
+7. **Meteora DAMM V2 交易**: 支持 Meteora DAMM V2 (Dynamic AMM) 的交易操作
+8. **多种 MEV 保护**: 支持 Jito、Nextblock、ZeroSlot、Temporal、Bloxroute、FlashBlock、BlockRazor、Node1、Astralane、Glaive、SpeedLanding、LunarLander 等服务
+9. **并发交易**: 所有已配置的 SWQoS 通道和默认 RPC 通道都会发出提交；首个成功只影响返回，较慢通道会继续提交
+10. **统一交易接口**: 使用统一的交易协议枚举进行交易操作
+11. **中间件系统**: 支持自定义指令中间件，可在交易执行前对指令进行修改、添加或移除
+12. **[买入前风险门](docs/PRE_BUY_RISK_GATE_CN.md)**: 在交易构建和提交前，通过本地缓存执行 mint authority、freeze authority、持仓聚类、白名单或黑名单判断
+13. **共享基础设施**: 多钱包可共享同一套 RPC 与 SWQoS 客户端，降低资源占用
+14. **热路径 RPC 边界**: 交易执行使用调用方传入的 blockhash 或 durable nonce，不在热路径查询 blockhash、账户或余额
+
+## 📚 使用文档
+
+| 文档 | 用途 |
+|---|---|
+| [买入前风险门](docs/PRE_BUY_RISK_GATE_CN.md) | 在构建和提交交易之前，通过本地风险缓存拒绝危险买入 |
+| [低延迟 Bot 集成](docs/LOW_LATENCY_BOTS_CN.md) | 组织事件处理、状态刷新、blockhash、账户和提交流程 |
+| [交易参数](docs/TRADING_PARAMETERS_CN.md) | 选择买卖金额模式、账户策略、ALT 和 nonce 设置 |
+| [Gas 费策略](docs/GAS_FEE_STRATEGY_CN.md) | 配置 compute unit 价格、limit、relay tip 和通道费率 |
+| [地址查找表](docs/ADDRESS_LOOKUP_TABLE_CN.md) | 使用一个或多个 ALT 缩小 versioned transaction |
+| [Durable Nonce](docs/NONCE_CACHE_CN.md) | 构建和刷新 durable nonce 交易流程 |
 
 ## 📦 安装
 
@@ -115,14 +142,14 @@ git clone https://github.com/0xfnzero/sol-trade-sdk
 
 ```toml
 # 添加到您的 Cargo.toml
-sol-trade-sdk = { path = "./sol-trade-sdk", version = "4.0.17" }
+sol-trade-sdk = { path = "./sol-trade-sdk", version = "5.0.4" }
 ```
 
 ### 使用 crates.io
 
 ```toml
 # 添加到您的 Cargo.toml
-sol-trade-sdk = "4.0.17"
+sol-trade-sdk = "5.0.4"
 ```
 
 ## 🛠️ 使用示例
@@ -150,20 +177,44 @@ let swqos_configs: Vec<SwqosConfig> = vec![
     // Astralane：第4个参数为 AstralaneTransport — Binary（默认）、Plain（/iris）或 Quic
     SwqosConfig::Astralane("your_astralane_api_key".to_string(), SwqosRegion::Frankfurt, None, None), // Binary /irisb
     SwqosConfig::SpeedLanding("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    // Lunar Lander：第4个参数 None 为 QUIC（默认）；Some(SwqosTransport::Http) 为 binary HTTP
+    SwqosConfig::LunarLander("your_hellomoon_api_key".to_string(), SwqosRegion::Frankfurt, None, None),
+    SwqosConfig::LunarLander(
+        "your_hellomoon_api_key".to_string(),
+        SwqosRegion::Frankfurt,
+        None,
+        Some(SwqosTransport::Http),
+    ),
+    // Glaive：None 为 QUIC（默认，UDP/4000）；Some(Http) 为 binary HTTP
+    SwqosConfig::Glaive(
+        "your_glaive_uuid_v4_api_key".to_string(),
+        SwqosRegion::Frankfurt,
+        None,
+        None,
+    ),
 ];
 // 创建 TradeConfig 实例
 let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
+    // .transaction_version(TradeTransactionVersion::V1) // 默认：V0 兼容模式
     // .create_wsol_ata_on_startup(true)  // 默认: true  - 初始化时检查并创建 WSOL ATA
     // .use_seed_optimize(true)            // 默认: true  - ATA 操作启用 seed 优化
     // .log_enabled(true)                  // 默认: true  - SDK 计时 / SWQOS 日志
     // .check_min_tip(false)               // 默认: false - 过滤低于最低小费的 SWQOS
     // .swqos_cores_from_end(false)        // 默认: false - 将 SWQOS 绑定到末尾 N 个 CPU 核心
-    // .mev_protection(false)              // 默认: false - MEV（Astralane QUIC :9000 或 HTTP mev-protect / BlockRazor）
+    // .mev_protection(false)              // 默认: false - Astralane / BlockRazor / Glaive 的 MEV 保护
     .build();
 
 // 创建 TradingClient
 let client = TradingClient::new(Arc::new(payer), trade_config).await;
 ```
+
+`TradeTransactionVersion::V0` 是默认值，并保持原有行为：没有地址查找表时使用 Legacy
+消息，传入地址查找表时使用 V0。只有显式选择 `TradeTransactionVersion::V1` 才会构造
+V1 消息。V1 将计算单元上限和总优先费写入交易配置，不再添加 ComputeBudget 指令，
+不支持地址查找表，交易大小上限为 4096 字节。现有 `cu_price` 的单位仍是
+micro-lamports/CU，SDK 会向上取整换算成总 lamports。请仅在目标集群和提交服务均支持
+V1 时启用；部分提交服务可能采用更小的传输上限，Mainnet 的 V1 激活时间也可能晚于
+Devnet/Testnet。
 
 **方式二：共享基础设施（多钱包）**
 
@@ -175,7 +226,8 @@ let infra_config = InfrastructureConfig::new(rpc_url, swqos_configs, commitment)
 let infrastructure = Arc::new(TradingInfrastructure::new(infra_config).await);
 
 // 基于同一基础设施创建多个客户端（开销小）
-let client1 = TradingClient::from_infrastructure(Arc::new(payer1), infrastructure.clone(), true);
+let client1 = TradingClient::from_infrastructure(Arc::new(payer1), infrastructure.clone(), true)
+    .with_transaction_version(TradeTransactionVersion::V1);
 let client2 = TradingClient::from_infrastructure(Arc::new(payer2), infrastructure.clone(), true);
 ```
 
@@ -255,7 +307,7 @@ client.buy_simple(buy_params).await?;
 | `.slippage_basis_points(300)` | 设置滑点。`300` 表示 3%。 |
 | `.address_lookup_table_account(alt)` | 传入 ALT 以减少交易体积。PumpFun V2 交易较大时很有用。 |
 | `.wait_tx_confirmed(true)` | 等链上确认后再返回。追求最快提交时通常关闭。 |
-| `.wait_for_all_submits(true)` | fast-submit 模式下等待所有 SWQoS 通道返回，并拿到全部签名。 |
+| `.wait_for_all_submits(true)` | 等待所有 SWQoS 通道返回，并拿到已提交签名。recent blockhash 多路交易不互斥；durable nonce 多路交易互斥。 |
 | `.simulate(true)` | 只构建并模拟交易，不真正发送。 |
 | `.grpc_recv_us(ts)` | 传入上游收到事件的微秒时间戳，用于延迟追踪。 |
 | `.durable_nonce(nonce_info)` | 使用 durable nonce，并清空 `recent_blockhash`。如果你从 `SimpleBuyParams::new(...)` / `SimpleSellParams::new(...)` 开始构造，推荐用这个。 |
@@ -269,27 +321,33 @@ client.buy_simple(buy_params).await?;
 当你使用 shred 订阅事件时，由于 shred 的特性，你无法获取到交易事件的完整信息。
 请你在使用时，确保你的交易逻辑依赖的参数，在shred中都能获取到。
 
+客户端预热、blockhash/nonce、交易模式、事件状态新鲜度和 6040 重报价规则见 [低延迟 Bot 集成清单](docs/LOW_LATENCY_BOTS_CN.md)。
+
 ### 📊 使用示例汇总表格
 
-| 描述 | 运行命令 | 源码路径 |
+完整双语索引和安全分类见 [`examples/README_CN.md`](examples/README_CN.md)。
+
+| 描述 | 运行命令 | 使用说明 |
 |------|---------|----------|
-| 简化买卖参数 API | `cargo run --package simple_trading` | [examples/simple_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/simple_trading/src/main.rs) |
-| 创建和配置 TradingClient 实例 | `cargo run --package trading_client` | [examples/trading_client](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/trading_client/src/main.rs) |
-| 多钱包共享基础设施 | `cargo run --package shared_infrastructure` | [examples/shared_infrastructure](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/shared_infrastructure/src/main.rs) |
-| PumpFun 代币狙击交易 | `cargo run --package pumpfun_sniper_trading` | [examples/pumpfun_sniper_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpfun_sniper_trading/src/main.rs) |
-| PumpFun 代币跟单交易 | `cargo run --package pumpfun_copy_trading` | [examples/pumpfun_copy_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpfun_copy_trading/src/main.rs) |
-| PumpSwap 交易操作 | `cargo run --package pumpswap_trading` | [examples/pumpswap_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/pumpswap_trading/src/main.rs) |
-| Raydium CPMM 交易操作 | `cargo run --package raydium_cpmm_trading` | [examples/raydium_cpmm_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/raydium_cpmm_trading/src/main.rs) |
-| Raydium AMM V4 交易操作 | `cargo run --package raydium_amm_v4_trading` | [examples/raydium_amm_v4_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/raydium_amm_v4_trading/src/main.rs) |
-| Meteora DAMM V2 交易操作 | `cargo run --package meteora_damm_v2_direct_trading` | [examples/meteora_damm_v2_direct_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/meteora_damm_v2_direct_trading/src/main.rs) |
-| Bonk 代币狙击交易 | `cargo run --package bonk_sniper_trading` | [examples/bonk_sniper_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/bonk_sniper_trading/src/main.rs) |
-| Bonk 代币跟单交易 | `cargo run --package bonk_copy_trading` | [examples/bonk_copy_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/bonk_copy_trading/src/main.rs) |
-| 自定义指令中间件示例 | `cargo run --package middleware_system` | [examples/middleware_system](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/middleware_system/src/main.rs) |
-| 地址查找表示例 | `cargo run --package address_lookup` | [examples/address_lookup](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/address_lookup/src/main.rs) |
-| Nonce示例 | `cargo run --package nonce_cache` | [examples/nonce_cache](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/nonce_cache/src/main.rs) |
-| SOL与WSOL相互转换示例 | `cargo run --package wsol_wrapper` | [examples/wsol_wrapper](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/wsol_wrapper/src/main.rs) |
-| Seed 优化交易示例 | `cargo run --package seed_trading` | [examples/seed_trading](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/seed_trading/src/main.rs) |
-| Gas费用策略示例 | `cargo run --package gas_fee_strategy` | [examples/gas_fee_strategy](https://github.com/0xfnzero/sol-trade-sdk/tree/main/examples/gas_fee_strategy/src/main.rs) |
+| 简化买卖参数 API | `cargo run --package simple_trading` | [README](examples/simple_trading/README_CN.md) |
+| 创建和配置 TradingClient | `cargo run --package trading_client` | [README](examples/trading_client/README_CN.md) |
+| 多钱包共享基础设施 | `cargo run --package shared_infrastructure` | [README](examples/shared_infrastructure/README_CN.md) |
+| PumpFun 狙击 | `cargo run --package pumpfun_sniper_trading` | [README](examples/pumpfun_sniper_trading/README_CN.md) |
+| PumpFun 跟单 | `cargo run --package pumpfun_copy_trading` | [README](examples/pumpfun_copy_trading/README_CN.md) |
+| PumpSwap 低延迟事件流 | `cargo run --package pumpswap_trading` | [README](examples/pumpswap_trading/README_CN.md) |
+| PumpSwap 直接 RPC 流程 | `cargo run --package pumpswap_direct_trading` | [README](examples/pumpswap_direct_trading/README_CN.md) |
+| Raydium CPMM | `cargo run --package raydium_cpmm_trading` | [README](examples/raydium_cpmm_trading/README_CN.md) |
+| Raydium AMM V4 | `cargo run --package raydium_amm_v4_trading` | [README](examples/raydium_amm_v4_trading/README_CN.md) |
+| Meteora DAMM V2 | `cargo run --package meteora_damm_v2_direct_trading` | [README](examples/meteora_damm_v2_direct_trading/README_CN.md) |
+| Bonk 狙击 | `cargo run --package bonk_sniper_trading` | [README](examples/bonk_sniper_trading/README_CN.md) |
+| Bonk 跟单 | `cargo run --package bonk_copy_trading` | [README](examples/bonk_copy_trading/README_CN.md) |
+| 指令中间件 | `cargo run --package middleware_system` | [README](examples/middleware_system/README_CN.md) |
+| 地址查找表 | `cargo run --package address_lookup` | [README](examples/address_lookup/README_CN.md) |
+| Durable nonce | `cargo run --package nonce_cache` | [README](examples/nonce_cache/README_CN.md) |
+| SOL/WSOL 包装与解包 | `cargo run --package wsol_wrapper` | [README](examples/wsol_wrapper/README_CN.md) |
+| Seed 优化 | `cargo run --package seed_trading` | [README](examples/seed_trading/README_CN.md) |
+| Gas fee 策略 | `cargo run --package gas_fee_strategy` | [README](examples/gas_fee_strategy/README_CN.md) |
+| 多 DEX CLI 模板 | `cargo run --package cli_trading` | [README](examples/cli_trading/README_CN.md) |
 
 ### ⚙️ SWQoS 服务配置说明
 
@@ -322,6 +380,7 @@ let temporal_config = SwqosConfig::Temporal(
 - 如果提供了自定义 URL（`Some(url)`），将使用自定义 URL 而不是区域端点
 - 如果没有提供自定义 URL（`None`），系统将使用指定 `SwqosRegion` 的默认端点
 - 这提供了最大的灵活性，同时保持向后兼容性
+- Glaive 自定义 QUIC 地址格式为 `host:4000`；自定义 HTTP 地址必须是完整的 `http://` 或 `https://` 基础 URL，SDK 会自动追加 `/binary` 和鉴权参数。
 
 当使用多个 MEV 服务时，需要使用 `Durable Nonce`。先获取最新 nonce，再挂到新的 buy/sell 参数上：
 
@@ -369,6 +428,42 @@ let swqos_configs: Vec<SwqosConfig> = vec![
 - **Binary**（默认）：`None` 或 `Some(AstralaneTransport::Binary)` — `/irisb`，bincode 正文。
 - **Plain**：`Some(AstralaneTransport::Plain)` — `/iris`。
 - **QUIC**：`Some(AstralaneTransport::Quic)` — 按区域的 `host:7000` / `:9000`（MEV）；同一 API key。
+
+#### Glaive（Binary HTTP / QUIC）
+
+Glaive 支持 binary HTTP 和持久 QUIC。Glaive 官方将 QUIC 定义为最低延迟路径，因此 SDK 默认使用 QUIC。API key 必须是 UUID v4；每笔交易至少需要 `0.0001 SOL` tip，SDK 会从 Glaive 官方公布的 6 个 tip 账户中选择一个。
+
+```rust
+use sol_trade_sdk::{
+    swqos::{SwqosConfig, SwqosRegion},
+    SwqosTransport,
+};
+
+let glaive_quic = SwqosConfig::Glaive(
+    "your_glaive_uuid_v4_api_key".to_string(),
+    SwqosRegion::Frankfurt,
+    None, // fra.glaive.trade:4000
+    None, // 默认 QUIC
+);
+
+let glaive_http = SwqosConfig::Glaive(
+    "your_glaive_uuid_v4_api_key".to_string(),
+    SwqosRegion::Frankfurt,
+    None, // http://fra.glaive.trade/binary?api-key=...
+    Some(SwqosTransport::Http),
+);
+```
+
+- **QUIC（默认）**：`None` 或 `Some(SwqosTransport::Quic)`。使用 UDP `4000`、ALPN `solana-tpu`、SNI `glaive-intake`；维持一条已鉴权连接，每笔交易使用一个单向流。
+- **Binary HTTP**：`Some(SwqosTransport::Http)`。把原始交易字节提交到 `/binary?api-key=...`，并通过 `/health` 保持连接池热连接。
+- `Some(SwqosTransport::Grpc)` 会直接返回错误，因为 Glaive 没有提供 gRPC 提交协议。
+- **MEV 保护**：`.mev_protection(true)` 会设置 QUIC 鉴权帧的 flag bit 0，或为 binary HTTP 追加 `mev-protect=true`。
+- **Tip 配置**：Glaive 通道的 gas-fee strategy tip 至少应为 `0.0001 SOL`。`.check_min_tip(true)` 会在本地过滤低于该值的配置，但不会自动提高用户设置的 tip。
+- **区域**：Glaive 原生 PoP 包括 Amsterdam、Frankfurt、London 和 New York；其他 `SwqosRegion` 会映射到最近的已公布端点。
+- **仅主网**：Glaive 当前没有 testnet 端点。
+- 内置 HTTP 地址遵循 Glaive 官方文档中的 `http://` 端点。优先使用默认 QUIC；如果 Glaive 为你分配了 HTTPS 地址，也可以通过自定义 URL 使用。
+
+凭证、限流和协议详情请参考 [Glaive 官方文档](https://glaive.trade/docs)。
 
 ---
 
@@ -478,6 +573,14 @@ legacy SOL 事件里如果 `quote_mint` 是默认值或 Solscan SOL，并且 quo
 | 未设置（默认）/ `SOL_TOKEN_ACCOUNT` (`So111...11111`) / `WSOL_TOKEN_ACCOUNT` (`So111...11112`) | 优先旧版 `buy`/`sell`/`buy_exact_sol_in` | native SOL 配对；普通 SOL 结算走 V1，显式 WSOL 结算才走 V2 |
 | `USDC_TOKEN_ACCOUNT` | `buy_v2`/`sell_v2`/`buy_exact_quote_in_v2` | USDC 配对（必须使用 v2） |
 
+#### PumpSwap：虚拟 quote 储备
+
+PumpSwap 报价必须使用 `effective_quote_reserves = pool_quote_token_account.amount + virtual_quote_reserves`。Pool 账户以及 BuyEvent/SellEvent 中的 `virtual_quote_reserves` 类型均为 `i128`。
+
+- `PumpSwapParams::from_pool_address_by_rpc` 等 RPC 构造器会自动读取并应用 Pool 字段。
+- 事件热路径必须把事件中的原始 `pool_quote_token_reserves` 和 `virtual_quote_reserves` 分别传给 `PumpSwapParams::from_trade(...)` 或 `from_trade_with_fee_basis_points(...)`，不要在调用前自行相加。
+- SDK 在买入、卖出、报价和动态费率分层中统一使用有效储备；无效的有符号结果会返回错误，不会发生整数回绕。
+
 ## 🛡️ MEV 保护服务
 
 可以通过官网申请密钥：[社区官网](https://fnzero.dev/swqos)
@@ -487,7 +590,10 @@ legacy SOL 事件里如果 `quote_mint` 是默认值或 Solscan SOL，并且 quo
 - **FlashBlock**: 高速交易执行，支持 API 密钥认证
 - **BlockRazor**: 高速交易执行，支持 API 密钥认证
 - **Astralane**: 区块链网络加速（Binary/Plain HTTP 与 QUIC）
+- **Glaive**: 持久 QUIC 与 binary HTTP 交易投递（最低 tip：0.0001 SOL）
 - **SpeedLanding**: 高速交易执行，支持 API 密钥认证
+- **Node1**: 高速交易执行，支持 API 密钥认证
+- **LunarLander**: HelloMoon 交易着陆服务（最低小费：0.001 SOL）
 
 ## 📁 项目结构
 

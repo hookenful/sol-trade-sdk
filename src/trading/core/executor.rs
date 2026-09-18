@@ -18,7 +18,7 @@ use crate::{
     perf::syscall_bypass::SystemCallBypassManager,
     swqos::common::poll_any_transaction_confirmation,
     trading::core::{
-        async_executor::execute_parallel,
+        async_executor::execute_parallel_with_version,
         execution::{InstructionProcessor, Prefetch},
         traits::TradeExecutor,
     },
@@ -96,6 +96,7 @@ impl TradeExecutor for GenericTradeExecutor {
             total_start.as_ref().map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
         let before_submit_us = (params.log_enabled && crate::common::sdk_log::sdk_log_enabled())
             .then(crate::common::clock::now_micros);
+        let address_lookup_table_accounts = params.address_lookup_table_accounts.clone();
 
         if params.simulate {
             let send_start = crate::common::sdk_log::sdk_log_enabled().then(Instant::now);
@@ -103,7 +104,7 @@ impl TradeExecutor for GenericTradeExecutor {
                 params.rpc,
                 params.payer,
                 final_instructions,
-                params.address_lookup_table_account,
+                address_lookup_table_accounts,
                 params.recent_blockhash,
                 params.durable_nonce,
                 params.middleware_manager,
@@ -111,6 +112,7 @@ impl TradeExecutor for GenericTradeExecutor {
                 is_buy,
                 if is_buy { true } else { params.with_tip },
                 params.gas_fee_strategy,
+                params.transaction_version,
             )
             .await;
             let send_elapsed = send_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
@@ -157,16 +159,16 @@ impl TradeExecutor for GenericTradeExecutor {
         }
 
         let need_confirm = params.wait_tx_confirmed;
-        // When the caller confirms externally (need_confirm = false) and opts in
-        // via SwapParams.wait_for_all_submits, return every route's signature so
-        // pinned-nonce confirmation can poll all of them.
-        let wait_for_all_submits = !need_confirm && params.wait_for_all_submits;
+        // Each SWQOS lane may submit a distinct transaction because relay tips
+        // can use different accounts, so confirmation must be able to poll every
+        // returned signature when the caller opts in.
+        let wait_for_all_submits = params.wait_for_all_submits;
         let sender_config = params.sender_concurrency_config();
-        let result = execute_parallel(
+        let result = execute_parallel_with_version(
             params.swqos_clients.as_slice(),
             params.payer,
             final_instructions,
-            params.address_lookup_table_account,
+            address_lookup_table_accounts,
             params.recent_blockhash,
             params.durable_nonce,
             params.middleware_manager,
@@ -179,6 +181,7 @@ impl TradeExecutor for GenericTradeExecutor {
             params.use_dedicated_sender_threads,
             sender_config,
             params.check_min_tip,
+            params.transaction_version,
         )
         .await;
 
@@ -253,7 +256,7 @@ async fn simulate_transaction(
     rpc: Option<Arc<SolanaRpcClient>>,
     payer: Arc<Keypair>,
     instructions: Vec<Instruction>,
-    address_lookup_table_account: Option<AddressLookupTableAccount>,
+    address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
     recent_blockhash: Option<Hash>,
     durable_nonce: Option<DurableNonceInfo>,
     middleware_manager: Option<Arc<MiddlewareManager>>,
@@ -261,11 +264,12 @@ async fn simulate_transaction(
     is_buy: bool,
     with_tip: bool,
     gas_fee_strategy: GasFeeStrategy,
+    transaction_version: crate::common::TradeTransactionVersion,
 ) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
-    use crate::trading::common::build_transaction;
+    use crate::trading::common::build_transaction_with_version;
     use solana_client::rpc_config::RpcSimulateTransactionConfig;
     use solana_commitment_config::CommitmentLevel;
-    use solana_transaction_status::UiTransactionEncoding;
+    use solana_transaction_status_client_types::UiTransactionEncoding;
 
     let rpc = rpc.ok_or_else(|| anyhow::anyhow!("RPC client is required for simulation"))?;
 
@@ -283,12 +287,13 @@ async fn simulate_transaction(
     let unit_limit = default_config.2.cu_limit;
     let unit_price = default_config.2.cu_price;
 
-    let transaction = build_transaction(
+    let transaction = build_transaction_with_version(
         &payer,
         unit_limit,
         unit_price,
+        transaction_version,
         &instructions,
-        address_lookup_table_account.as_ref(),
+        address_lookup_table_accounts.as_slice(),
         recent_blockhash,
         middleware_manager.as_ref(),
         protocol_name,

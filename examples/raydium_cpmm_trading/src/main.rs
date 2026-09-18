@@ -1,4 +1,3 @@
-use sol_trade_sdk::common::spl_associated_token_account::get_associated_token_address;
 use sol_trade_sdk::common::TradeConfig;
 use sol_trade_sdk::constants::{USDC_TOKEN_ACCOUNT, WSOL_TOKEN_ACCOUNT};
 use sol_trade_sdk::trading::core::params::{DexParamEnum, RaydiumCpmmParams};
@@ -6,17 +5,13 @@ use sol_trade_sdk::trading::factory::DexType;
 use sol_trade_sdk::TradeTokenType;
 use sol_trade_sdk::{common::AnyResult, swqos::SwqosConfig, SolanaTrade};
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::signature::Keypair;
-use solana_sdk::signer::Signer;
 use solana_streamer_sdk::streaming::event_parser::common::filter::EventTypeFilter;
 use solana_streamer_sdk::streaming::event_parser::common::EventType;
 use solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::parser::RAYDIUM_CPMM_PROGRAM_ID;
-use solana_streamer_sdk::streaming::event_parser::{Protocol, UnifiedEvent};
-use solana_streamer_sdk::streaming::yellowstone_grpc::{AccountFilter, TransactionFilter};
+use solana_streamer_sdk::streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmSwapEvent;
+use solana_streamer_sdk::streaming::event_parser::{DexEvent, Protocol};
+use solana_streamer_sdk::streaming::yellowstone_grpc::TransactionFilter;
 use solana_streamer_sdk::streaming::YellowstoneGrpc;
-use solana_streamer_sdk::{
-    match_event, streaming::event_parser::protocols::raydium_cpmm::RaydiumCpmmSwapEvent,
-};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -50,19 +45,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         account_required,
     };
 
-    // Listen to account data belonging to owner programs -> account event monitoring
-    let account_filter = AccountFilter { account: vec![], owner: vec![], filters: vec![] };
-
     // listen to specific event type
-    let event_type_filter = EventTypeFilter {
-        include: vec![EventType::RaydiumCpmmSwapBaseInput, EventType::RaydiumCpmmSwapBaseOutput],
-    };
+    let event_type_filter = EventTypeFilter::include_only(vec![
+        EventType::RaydiumCpmmSwapBaseInput,
+        EventType::RaydiumCpmmSwapBaseOutput,
+    ]);
 
     grpc.subscribe_events_immediate(
         protocols,
         None,
         vec![transaction_filter],
-        vec![account_filter],
+        vec![],
         Some(event_type_filter),
         None,
         callback,
@@ -70,32 +63,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
 
     tokio::signal::ctrl_c().await?;
+    grpc.stop().await;
 
     Ok(())
 }
 
 /// Create an event callback function that handles different types of events
-fn create_event_callback() -> impl Fn(Box<dyn UnifiedEvent>) {
-    |event: Box<dyn UnifiedEvent>| {
-        match_event!(event, {
-            RaydiumCpmmSwapEvent => |e: RaydiumCpmmSwapEvent| {
-                let is_wsol = e.input_token_mint == WSOL_TOKEN_ACCOUNT || e.output_token_mint == WSOL_TOKEN_ACCOUNT;
-                let is_usdc = e.input_token_mint == USDC_TOKEN_ACCOUNT || e.output_token_mint == USDC_TOKEN_ACCOUNT;
-                if !is_wsol && !is_usdc {
-                    return;
+fn create_event_callback() -> impl Fn(DexEvent) {
+    |event: DexEvent| {
+        let DexEvent::RaydiumCpmmSwapEvent(event) = event else {
+            return;
+        };
+        let is_wsol = event.input_token_mint == WSOL_TOKEN_ACCOUNT
+            || event.output_token_mint == WSOL_TOKEN_ACCOUNT;
+        let is_usdc = event.input_token_mint == USDC_TOKEN_ACCOUNT
+            || event.output_token_mint == USDC_TOKEN_ACCOUNT;
+        if !is_wsol && !is_usdc {
+            return;
+        }
+        if !ALREADY_EXECUTED.swap(true, Ordering::SeqCst) {
+            tokio::spawn(async move {
+                if let Err(err) = raydium_cpmm_copy_trade_with_grpc(event).await {
+                    eprintln!("Error in copy trade: {:?}", err);
+                    std::process::exit(1);
                 }
-                // Test code, only test one transaction
-                if !ALREADY_EXECUTED.swap(true, Ordering::SeqCst) {
-                    let event_clone = e.clone();
-                    tokio::spawn(async move {
-                        if let Err(err) = raydium_cpmm_copy_trade_with_grpc(event_clone).await {
-                            eprintln!("Error in copy trade: {:?}", err);
-                            std::process::exit(0);
-                        }
-                    });
-                }
-            },
-        });
+            });
+        }
     }
 }
 
@@ -103,7 +96,7 @@ fn create_event_callback() -> impl Fn(Box<dyn UnifiedEvent>) {
 /// Initializes a new SolanaTrade client with configuration
 async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     println!("🚀 Initializing SolanaTrade client...");
-    let payer = Keypair::from_base58_string("your_payer_keypair_here");
+    let payer = sol_trade_sdk::common::keypair::load_keypair_from_env("PRIVATE_KEY")?;
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
@@ -147,6 +140,15 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
 
     let is_wsol = trade_info.input_token_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT
         || trade_info.output_token_mint == sol_trade_sdk::constants::WSOL_TOKEN_ACCOUNT;
+    let mint_token_program = if buy_params.base_mint == mint_pubkey {
+        buy_params.base_token_program
+    } else if buy_params.quote_mint == mint_pubkey {
+        buy_params.quote_token_program
+    } else {
+        return Err(std::io::Error::other("target mint does not belong to pool").into());
+    };
+    let balance_before =
+        client.get_payer_token_balance_with_program(&mint_pubkey, &mint_token_program).await?;
 
     // Buy tokens
     println!("Buying tokens from Raydium_cpmm...");
@@ -159,7 +161,7 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         slippage_basis_points: slippage_basis_points,
         recent_blockhash: Some(recent_blockhash),
         extension_params: DexParamEnum::RaydiumCpmm(buy_params),
-        address_lookup_table_account: None,
+        address_lookup_table_accounts: Vec::new(),
         wait_tx_confirmed: true,
         wait_for_all_submits: false,
         create_input_token_ata: is_wsol,
@@ -173,17 +175,24 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         precheck: None,
         grpc_recv_us: None,
     };
-    client.buy(buy_params).await?;
+    let (ok, sigs, err, _) = client.buy(buy_params).await?;
+    if !ok {
+        return Err(
+            std::io::Error::other(format!("buy failed: {:?}; sigs: {:?}", err, sigs)).into()
+        );
+    }
 
     // Sell tokens
     println!("Selling tokens from Raydium_cpmm...");
 
-    let rpc = client.infrastructure.rpc.clone();
-    let payer = client.payer.pubkey();
-    let account = get_associated_token_address(&payer, &mint_pubkey);
-    let balance = rpc.get_token_account_balance(&account).await?;
-    println!("Balance: {:?}", balance);
-    let amount_token = balance.amount.parse::<u64>().unwrap();
+    let balance_after =
+        client.get_payer_token_balance_with_program(&mint_pubkey, &mint_token_program).await?;
+    let amount_token = balance_after
+        .checked_sub(balance_before)
+        .ok_or_else(|| std::io::Error::other("token balance decreased after buy"))?;
+    if amount_token == 0 {
+        return Err(std::io::Error::other("confirmed buy did not increase token balance").into());
+    }
 
     let sell_params = RaydiumCpmmParams::from_pool_address_by_rpc(
         &client.infrastructure.rpc,
@@ -198,10 +207,10 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         mint: mint_pubkey,
         input_token_amount: amount_token,
         slippage_basis_points: slippage_basis_points,
-        recent_blockhash: Some(recent_blockhash),
+        recent_blockhash: Some(client.infrastructure.rpc.get_latest_blockhash().await?),
         with_tip: false,
         extension_params: DexParamEnum::RaydiumCpmm(sell_params),
-        address_lookup_table_account: None,
+        address_lookup_table_accounts: Vec::new(),
         wait_tx_confirmed: true,
         wait_for_all_submits: false,
         create_output_token_ata: is_wsol,
@@ -213,7 +222,12 @@ async fn raydium_cpmm_copy_trade_with_grpc(trade_info: RaydiumCpmmSwapEvent) -> 
         simulate: false,
         grpc_recv_us: None,
     };
-    client.sell(sell_params).await?;
+    let (ok, sigs, err, _) = client.sell(sell_params).await?;
+    if !ok {
+        return Err(
+            std::io::Error::other(format!("sell failed: {:?}; sigs: {:?}", err, sigs)).into()
+        );
+    }
 
     // Exit program
     std::process::exit(0);

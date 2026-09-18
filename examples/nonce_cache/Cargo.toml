@@ -5,9 +5,9 @@ edition = "2021"
 
 [dependencies]
 sol-trade-sdk = { path = "../.." }
-sol-parser-sdk = "0.4.14"
-solana-sdk = "3.0.0"
-solana-commitment-config = { version = "3.0.0", features = ["serde"] }
-spl-associated-token-account = "7.0.0"
+sol-parser-sdk = { workspace = true }
+solana-sdk = { workspace = true }
+solana-commitment-config = { workspace = true }
+spl-associated-token-account = "8.0.0"
 tokio = { version = "1", features = ["full"] }
 anyhow = "1.0.94"

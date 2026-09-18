@@ -41,7 +41,11 @@ use solana_sdk::{
 
 #[inline]
 fn effective_pump_mint_token_program(protocol_params: &PumpFunParams, mint: &Pubkey) -> Pubkey {
-    if mint.to_string().ends_with("pump") {
+    let mut encoded = [0_u8; 44];
+    let has_pump_suffix = bs58::encode(mint.as_ref())
+        .onto(&mut encoded[..])
+        .is_ok_and(|len| encoded[..len].ends_with(b"pump"));
+    if has_pump_suffix {
         return TOKEN_PROGRAM_2022;
     }
     let tp = protocol_params.token_program;
@@ -910,6 +914,8 @@ pub fn claim_cashback_pumpfun_instruction(payer: &Pubkey) -> Option<Instruction>
         AccountMeta::new(*payer, true),
         AccountMeta::new(user_volume_accumulator, false),
         crate::constants::SYSTEM_PROGRAM_META,
+        accounts::EVENT_AUTHORITY_META,
+        accounts::PUMPFUN_META,
     ];
     let ix =
         Instruction::new_with_bytes(accounts::PUMPFUN, &CLAIM_CASHBACK_DISCRIMINATOR, ix_accounts);
@@ -969,7 +975,7 @@ mod tests {
             output_token_program: None,
             input_amount: Some(10_000_000),
             slippage_basis_points: Some(300),
-            address_lookup_table_account: None,
+            address_lookup_table_accounts: Vec::new(),
             recent_blockhash: None,
             wait_tx_confirmed: false,
             protocol_params: DexParamEnum::PumpFun(params),
@@ -992,6 +998,7 @@ mod tests {
             max_sender_concurrency: 0,
             effective_core_ids: Arc::new(Vec::new()),
             check_min_tip: false,
+            transaction_version: crate::common::TradeTransactionVersion::V0,
             grpc_recv_us: None,
             use_exact_sol_amount: Some(true),
             precheck: None,
@@ -1015,8 +1022,20 @@ mod tests {
     fn test_claim_cashback_instruction() {
         let payer = Pubkey::new_unique();
         let ix = claim_cashback_pumpfun_instruction(&payer).unwrap();
-        assert_eq!(ix.accounts.len(), 3);
-        assert_eq!(ix.accounts[0].pubkey, payer);
+        let accumulator = get_user_volume_accumulator_pda(&payer).unwrap();
+
+        assert_eq!(ix.program_id, accounts::PUMPFUN);
+        assert_eq!(ix.data, [37, 58, 35, 126, 190, 53, 228, 197]);
+        assert_eq!(
+            ix.accounts,
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(accumulator, false),
+                crate::constants::SYSTEM_PROGRAM_META,
+                accounts::EVENT_AUTHORITY_META,
+                accounts::PUMPFUN_META,
+            ]
+        );
     }
 
     #[test]
@@ -1207,7 +1226,7 @@ mod tests {
             150_000,
             500_000,
             &business_instructions,
-            None,
+            &[],
             Some(solana_hash::Hash::new_unique()),
             None,
             "PumpFun",
@@ -1242,7 +1261,7 @@ mod tests {
             150_000,
             500_000,
             &business_instructions,
-            None,
+            &[],
             Some(solana_hash::Hash::new_unique()),
             None,
             "PumpFun",
@@ -1253,7 +1272,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let serialized = bincode::serialize(&transaction).unwrap();
+        let serialized = wincode::serialize(&transaction).unwrap();
 
         assert!(
             serialized.len() <= 1232,

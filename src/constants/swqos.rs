@@ -171,6 +171,43 @@ pub const SPEEDLANDING_TIP_ACCOUNTS: &[Pubkey] = &[
     pubkey!("speede8xCcUq2Tiv1efXeTuE3k9TDNq8TnGKaKSc6J4"),
 ];
 
+pub const SOLAMI_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("15qWd4huAkoxvhDsHMfpUn27TW1YBYMMJJ2jkAkbeam"),
+    pubkey!("9XuGciSwr5wb7dLTQm91JhuBTvj3GG8WjuRDc3obeam"),
+    pubkey!("kiQioJNyFG7pU36ELLsRKXkeT48kFbk3b6rSgrWbeam"),
+    pubkey!("kjmVhW1UzJrW2sU5bY5NtZ79jpvjSStsj37Pzmabeam"),
+    pubkey!("kREnjPWFpt4AHeY5pijPmyXaCrMnbatUQJo7d3Xbeam"),
+    pubkey!("praRZG6N6MdbsT4EFpKgZJWReZGXQhAMFcH68oCbeam"),
+    pubkey!("SqoKQKU5uwBxovq3R7yEBxFwptc4z7vwoghU3M9beam"),
+    pubkey!("sV72TY66T1RfmDSeHPPbwX6wwJ3bBv5hd4ehJ8tbeam"),
+    pubkey!("swf8MyEeLo7gtRUo27UuJj6naCASUrypU7dbteSbeam"),
+    pubkey!("uiuaQsxA47JybQAVN4FTfYuoEDkMiXV1r591Aewbeam"),
+];
+
+// LunarLander (HelloMoon) tip accounts
+pub const LUNARLANDER_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("moon17L6BgxXRX5uHKudAmqVF96xia9h8ygcmG2sL3F"),
+    pubkey!("moon26Sek222Md7ZydcAGxoKG832DK36CkLrS3PQY4c"),
+    pubkey!("moon7fwyajcVstMoBnVy7UBcTx87SBtNoGGAaH2Cb8V"),
+    pubkey!("moonBtH9HvLHjLqi9ivyrMVKgFUsSfrz9BwQ9khhn1u"),
+    pubkey!("moonCJg8476LNFLptX1qrK8PdRsA1HD1R6XWyu9MB93"),
+    pubkey!("moonF2sz7qwAtdETnrgxNbjonnhGGjd6r4W4UC9284s"),
+    pubkey!("moonKfftMiGSak3cezvhEqvkPSzwrmQxQHXuspC96yj"),
+    pubkey!("moonQBUKBpkifLcTd78bfxxt4PYLwmJ5admLW6cBBs8"),
+    pubkey!("moonXwpKwoVkMegt5Bc776cSW793X1irL5hHV1vJ3JA"),
+    pubkey!("moonZ6u9E2fgk6eWd82621eLPHt9zuJuYECXAYjMY1C"),
+];
+
+/// Glaive tip accounts from <https://glaive.trade/docs#tip-accounts>.
+pub const GLAIVE_TIP_ACCOUNTS: &[Pubkey] = &[
+    pubkey!("GLaiv4GMRYQmthatDS98uQT4HoucgxWT8NeJz6oSwxeU"),
+    pubkey!("GLaivL5uPrDpvd1wTtvat38KGqb5WLhEdqQfnmNd3oNr"),
+    pubkey!("GLaivinAWh21NaJMhtExtD5G2gZs1xnvaYVZmwqobWZL"),
+    pubkey!("GLaivJSUL71FcocYa8tks5vpVyYzvaDMHtyrzfQF2ABr"),
+    pubkey!("GLaivRU6eDKrta3p3psFAWPEFLzCjeMHGpPUuQqTjtyv"),
+    pubkey!("GLaivq5dU8qHayz9Qf13LjPfVy3SmUhbmickfGiZdmfh"),
+];
+
 // `SwqosRegion` 与下列各 `SWQOS_ENDPOINTS_*` 下标严格对应（共 10 项）：
 // 0 NewYork, 1 Frankfurt, 2 Amsterdam, 3 Dublin, 4 SLC, 5 Tokyo, 6 Singapore, 7 London, 8 LosAngeles, 9 Default。
 //
@@ -289,19 +326,18 @@ pub const SWQOS_ENDPOINTS_FLASHBLOCK: [&str; 10] = [
     "http://fra.flashblock.trade", // Default: 非地理区域；EU 枢纽
 ];
 
-/// BlockRazor Send Transaction v2: plain-text Base64 body, auth in URI, Content-Type: text/plain. Keep-alive: POST /v2/health.
-/// 若 HTTP 返回 500，可尝试 HTTPS：https://<region>.solana.blockrazor.io/v2/sendTransaction（Frankfurt/NewYork/Tokyo），通过 custom_url 覆盖。
+/// BlockRazor Send Transaction: JSON body, `apikey` header. Keep-alive: POST `/health`.
 pub const SWQOS_ENDPOINTS_BLOCKRAZOR: [&str; 10] = [
-    "http://newyork.solana.blockrazor.xyz:443/v2/sendTransaction",
-    "http://frankfurt.solana.blockrazor.xyz:443/v2/sendTransaction",
-    "http://amsterdam.solana.blockrazor.xyz:443/v2/sendTransaction",
-    "http://london.solana.blockrazor.xyz:443/v2/sendTransaction", // Dublin: UK nearest published
-    "http://newyork.solana.blockrazor.xyz:443/v2/sendTransaction", // SLC: 文档无美西；美国仅 NY，受可用区限制
-    "http://tokyo.solana.blockrazor.xyz:443/v2/sendTransaction",
-    "http://tokyo.solana.blockrazor.xyz:443/v2/sendTransaction", // SG: 已公布 APAC 仅 Tokyo，为距 SG 最近
-    "http://london.solana.blockrazor.xyz:443/v2/sendTransaction",
-    "http://newyork.solana.blockrazor.xyz:443/v2/sendTransaction", // LosAngeles: 无美西入口；美国仅 NY
-    "http://frankfurt.solana.blockrazor.xyz:443/v2/sendTransaction", // Default: 非地理区域；EU 枢纽
+    "http://newyork.solana.blockrazor.xyz:443/sendTransaction",
+    "http://frankfurt.solana.blockrazor.xyz:443/sendTransaction",
+    "http://amsterdam.solana.blockrazor.xyz:443/sendTransaction",
+    "http://london.solana.blockrazor.xyz:443/sendTransaction",
+    "http://newyork.solana.blockrazor.xyz:443/sendTransaction",
+    "http://tokyo.solana.blockrazor.xyz:443/sendTransaction",
+    "http://singapore.solana.blockrazor.xyz:443/sendTransaction",
+    "http://london.solana.blockrazor.xyz:443/sendTransaction",
+    "http://losangeles.solana.blockrazor.xyz:443/sendTransaction",
+    "http://frankfurt.solana.blockrazor.xyz:443/sendTransaction",
 ];
 
 /// BlockRazor gRPC endpoints. Region order matches [`SwqosRegion`].
@@ -313,9 +349,9 @@ pub const SWQOS_ENDPOINTS_BLOCKRAZOR_GRPC: [&str; 10] = [
     "http://london.solana-grpc.blockrazor.xyz:80",
     "http://newyork.solana-grpc.blockrazor.xyz:80", // SLC: 与 HTTP 一致；美国仅 NY
     "http://tokyo.solana-grpc.blockrazor.xyz:80",
-    "http://tokyo.solana-grpc.blockrazor.xyz:80",
+    "http://singapore.solana-grpc.blockrazor.xyz:80",
     "http://london.solana-grpc.blockrazor.xyz:80",
-    "http://newyork.solana-grpc.blockrazor.xyz:80", // LosAngeles: 与 HTTP 一致
+    "http://losangeles.solana-grpc.blockrazor.xyz:80",
     "http://frankfurt.solana-grpc.blockrazor.xyz:80", // Default: 非地理区域
 ];
 
@@ -420,6 +456,65 @@ pub const SWQOS_ENDPOINTS_SPEEDLANDING: [&str; 10] = [
     "fra.speedlanding.trade:17778", // Default: 非地理区域；EU 枢纽
 ];
 
+/// Lunar Lander HTTP endpoints. Binary tx via POST /send-bin with x-api-key header.
+/// `SwqosRegion` order; regions without a dedicated published PoP use the nearest available host.
+pub const SWQOS_ENDPOINTS_LUNARLANDER: [&str; 10] = [
+    "http://nyc-1.prod.lunar-lander.hellomoon.io",
+    "http://fra-1.prod.lunar-lander.hellomoon.io",
+    "http://ams-1.prod.lunar-lander.hellomoon.io",
+    "http://ams-1.prod.lunar-lander.hellomoon.io", // Dublin -> Amsterdam
+    "http://ash-2.prod.lunar-lander.hellomoon.io", // SLC -> Ashburn
+    "http://tyo-1.prod.lunar-lander.hellomoon.io",
+    "http://tyo-1.prod.lunar-lander.hellomoon.io", // Singapore -> Tokyo
+    "http://fra-1.prod.lunar-lander.hellomoon.io", // London -> Frankfurt
+    "http://nyc-1.prod.lunar-lander.hellomoon.io", // LosAngeles -> NYC
+    "http://nyc-1.prod.lunar-lander.hellomoon.io", // Default -> NYC
+];
+
+/// Lunar Lander QUIC endpoints (direct, port 16888). Auth via client cert CN = API key.
+/// ALPN: b"lunar-lander-tpu". Fire-and-forget unidirectional streams.
+pub const SWQOS_ENDPOINTS_LUNARLANDER_QUIC: [&str; 10] = [
+    "nyc-1.prod.lunar-lander.hellomoon.io:16888",
+    "fra-1.prod.lunar-lander.hellomoon.io:16888",
+    "ams-1.prod.lunar-lander.hellomoon.io:16888",
+    "ams-1.prod.lunar-lander.hellomoon.io:16888", // Dublin -> Amsterdam
+    "ash-2.prod.lunar-lander.hellomoon.io:16888", // SLC -> Ashburn
+    "tyo-1.prod.lunar-lander.hellomoon.io:16888",
+    "tyo-1.prod.lunar-lander.hellomoon.io:16888", // Singapore -> Tokyo
+    "fra-1.prod.lunar-lander.hellomoon.io:16888", // London -> Frankfurt
+    "nyc-1.prod.lunar-lander.hellomoon.io:16888", // LosAngeles -> NYC
+    "nyc-1.prod.lunar-lander.hellomoon.io:16888", // Default -> NYC
+];
+
+/// Glaive binary HTTP origins. The client appends `/binary?api-key=...`.
+/// Glaive currently publishes Amsterdam, Frankfurt, London, and New York PoPs.
+pub const SWQOS_ENDPOINTS_GLAIVE: [&str; 10] = [
+    "http://ny.glaive.trade",
+    "http://fra.glaive.trade",
+    "http://ams1.glaive.trade",
+    "http://lon.glaive.trade",  // Dublin -> London
+    "http://ny.glaive.trade",   // SLC -> only published US PoP
+    "http://ams1.glaive.trade", // Tokyo -> nearest published PoP
+    "http://fra.glaive.trade",  // Singapore -> nearest published PoP
+    "http://lon.glaive.trade",
+    "http://ny.glaive.trade",   // Los Angeles -> only published US PoP
+    "http://ams1.glaive.trade", // Default -> official documentation example
+];
+
+/// Glaive QUIC endpoints. ALPN `solana-tpu`, SNI `glaive-intake`, UDP port 4000.
+pub const SWQOS_ENDPOINTS_GLAIVE_QUIC: [&str; 10] = [
+    "ny.glaive.trade:4000",
+    "fra.glaive.trade:4000",
+    "ams1.glaive.trade:4000",
+    "lon.glaive.trade:4000",  // Dublin -> London
+    "ny.glaive.trade:4000",   // SLC -> only published US PoP
+    "ams1.glaive.trade:4000", // Tokyo -> nearest published PoP
+    "fra.glaive.trade:4000",  // Singapore -> nearest published PoP
+    "lon.glaive.trade:4000",
+    "ny.glaive.trade:4000",   // Los Angeles -> only published US PoP
+    "ams1.glaive.trade:4000", // Default -> official documentation example
+];
+
 /// Helius Sender: POST /fast, dual routing to validators and Jito. API key optional (custom TPS only).
 pub const SWQOS_ENDPOINTS_HELIUS: [&str; 10] = [
     "http://ewr-sender.helius-rpc.com/fast",
@@ -432,6 +527,19 @@ pub const SWQOS_ENDPOINTS_HELIUS: [&str; 10] = [
     "http://lon-sender.helius-rpc.com/fast",
     "http://slc-sender.helius-rpc.com/fast",
     "https://sender.helius-rpc.com/fast", // Default: 非地理区域；全局 Sender
+];
+
+pub const SWQOS_ENDPOINTS_SOLAMI: [&str; 10] = [
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
+    "beam.solami.dev:11000",
 ];
 
 pub const SWQOS_MIN_TIP_DEFAULT: f64 = 0.00001; // 其它SWQOS默认最低小费
@@ -450,9 +558,12 @@ pub const SWQOS_MIN_TIP_SOYAS: f64 = 0.001; // Soyas requires minimum 0.001 SOL 
 pub const SWQOS_MIN_TIP_SPEEDLANDING: f64 = 0.001; // Speedlanding requires minimum 0.001 SOL tip
 /// Helius Sender: 0.0002 SOL when not swqos_only; use SWQOS_MIN_TIP_HELIUS_SWQOS_ONLY when swqos_only=true.
 pub const SWQOS_MIN_TIP_HELIUS: f64 = 0.0002;
+pub const SWQOS_MIN_TIP_SOLAMI: f64 = 0.0001;
+pub const SWQOS_MIN_TIP_LUNARLANDER: f64 = 0.001; // LunarLander 最低小费 0.001 SOL
+/// Glaive requires at least 100,000 lamports (0.0001 SOL).
+pub const SWQOS_MIN_TIP_GLAIVE: f64 = 0.0001;
 /// Helius Sender with swqos_only: minimum 0.000005 SOL (much lower tip allowed).
 pub const SWQOS_MIN_TIP_HELIUS_SWQOS_ONLY: f64 = 0.000005;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,6 +587,11 @@ mod tests {
         &SWQOS_ENDPOINTS_SOYAS,
         &SWQOS_ENDPOINTS_SPEEDLANDING,
         &SWQOS_ENDPOINTS_HELIUS,
+        &SWQOS_ENDPOINTS_LUNARLANDER,
+        &SWQOS_ENDPOINTS_LUNARLANDER_QUIC,
+        &SWQOS_ENDPOINTS_GLAIVE,
+        &SWQOS_ENDPOINTS_GLAIVE_QUIC,
+        &SWQOS_ENDPOINTS_SOLAMI,
     ];
 
     #[test]
@@ -518,5 +634,22 @@ mod tests {
             let binary = SWQOS_ENDPOINTS_ASTRALANE_BINARY[i].trim_end_matches("/irisb");
             assert_eq!(plain, binary, "Astralane Plain vs Binary base URL mismatch at index {}", i);
         }
+    }
+
+    #[test]
+    fn glaive_http_and_quic_hosts_match_per_region() {
+        for i in 0..10 {
+            let http_host =
+                SWQOS_ENDPOINTS_GLAIVE[i].strip_prefix("http://").expect("Glaive HTTP URL");
+            let quic_host =
+                SWQOS_ENDPOINTS_GLAIVE_QUIC[i].strip_suffix(":4000").expect("Glaive QUIC endpoint");
+            assert_eq!(http_host, quic_host, "Glaive HTTP vs QUIC host mismatch at index {i}");
+        }
+    }
+
+    #[test]
+    fn glaive_tip_policy_matches_official_docs() {
+        assert_eq!(GLAIVE_TIP_ACCOUNTS.len(), 6);
+        assert_eq!(SWQOS_MIN_TIP_GLAIVE, 0.0001);
     }
 }

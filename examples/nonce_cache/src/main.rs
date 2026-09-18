@@ -23,7 +23,7 @@ use sol_trade_sdk::{
     SolanaTrade,
 };
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::{pubkey::Pubkey, signature::Keypair};
+use solana_sdk::pubkey::Pubkey;
 
 static ALREADY_EXECUTED: AtomicBool = AtomicBool::new(false);
 
@@ -104,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     println!("🚀 Initializing SolanaTrade client...");
-    let payer = Keypair::from_base58_string("use_your_payer_keypair_here");
+    let payer = sol_trade_sdk::common::keypair::load_keypair_from_env("PRIVATE_KEY")?;
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
@@ -173,7 +173,7 @@ async fn pumpfun_copy_trade_with_grpc(
             trade_info.is_cashback_coin,
             Some(trade_info.mayhem_mode),
         )),
-        address_lookup_table_account: None,
+        address_lookup_table_accounts: Vec::new(),
         wait_tx_confirmed: true,
         wait_for_all_submits: false,
         create_input_token_ata: false,

@@ -1,4 +1,3 @@
-use sol_trade_sdk::common::fast_fn::get_associated_token_address_with_program_id_fast_use_seed;
 use sol_trade_sdk::common::TradeConfig;
 use sol_trade_sdk::{
     common::AnyResult,
@@ -10,13 +9,11 @@ use sol_trade_sdk::{
     SolanaTrade,
 };
 use solana_commitment_config::CommitmentConfig;
-use solana_sdk::signature::Keypair;
-use solana_sdk::signer::Signer;
 use solana_streamer_sdk::streaming::event_parser::common::filter::EventTypeFilter;
 use solana_streamer_sdk::streaming::event_parser::common::EventType;
 use solana_streamer_sdk::streaming::event_parser::protocols::bonk::BonkTradeEvent;
-use solana_streamer_sdk::streaming::event_parser::{Protocol, UnifiedEvent};
-use solana_streamer_sdk::{match_event, streaming::ShredStreamGrpc};
+use solana_streamer_sdk::streaming::event_parser::{DexEvent, Protocol};
+use solana_streamer_sdk::streaming::ShredStreamGrpc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -32,16 +29,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shred_stream = ShredStreamGrpc::new("use_your_shred_stream_url_here".to_string()).await?;
     let callback = create_event_callback();
     let protocols = vec![Protocol::Bonk];
-    let event_type_filter = EventTypeFilter {
-        include: vec![
-            EventType::BonkBuyExactIn,
-            EventType::BonkBuyExactOut,
-            EventType::BonkSellExactIn,
-            EventType::BonkSellExactOut,
-            EventType::BonkInitialize,
-            EventType::BonkInitializeV2,
-        ],
-    };
+    let event_type_filter = EventTypeFilter::include_only(vec![
+        EventType::BonkBuyExactIn,
+        EventType::BonkBuyExactOut,
+        EventType::BonkSellExactIn,
+        EventType::BonkSellExactOut,
+        EventType::BonkInitialize,
+        EventType::BonkInitializeV2,
+    ]);
     println!("Starting to listen for events, press Ctrl+C to stop...");
     shred_stream.shredstream_subscribe(protocols, None, Some(event_type_filter), callback).await?;
     tokio::signal::ctrl_c().await?;
@@ -49,27 +44,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Create an event callback function that handles different types of events
-fn create_event_callback() -> impl Fn(Box<dyn UnifiedEvent>) {
-    |event: Box<dyn UnifiedEvent>| {
-        match_event!(event, {
-            BonkTradeEvent => |e: BonkTradeEvent| {
-                // Only process developer token creation events
-                if !e.is_dev_create_token_trade {
-                    return;
+fn create_event_callback() -> impl Fn(DexEvent) {
+    |event: DexEvent| {
+        let DexEvent::BonkTradeEvent(event) = event else {
+            return;
+        };
+        if !event.is_dev_create_token_trade {
+            return;
+        }
+        if !ALREADY_EXECUTED.swap(true, Ordering::SeqCst) {
+            tokio::spawn(async move {
+                if let Err(err) = bonk_sniper_trade_with_shreds(event).await {
+                    eprintln!("Error in sniper trade: {:?}", err);
+                    std::process::exit(1);
                 }
-                // Ensure we only execute the trade once using atomic compare-and-swap
-                if !ALREADY_EXECUTED.swap(true, Ordering::SeqCst) {
-                    let event_clone = e.clone();
-                    // Spawn a new task to handle the trading operation
-                    tokio::spawn(async move {
-                        if let Err(err) = bonk_sniper_trade_with_shreds(event_clone).await {
-                            eprintln!("Error in sniper trade: {:?}", err);
-                            std::process::exit(0);
-                        }
-                    });
-                }
-            },
-        });
+            });
+        }
     }
 }
 
@@ -77,7 +67,7 @@ fn create_event_callback() -> impl Fn(Box<dyn UnifiedEvent>) {
 /// Initializes a new SolanaTrade client with configuration
 async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     println!("🚀 Initializing SolanaTrade client...");
-    let payer = Keypair::from_base58_string("use_your_payer_keypair_here");
+    let payer = sol_trade_sdk::common::keypair::load_keypair_from_env("PRIVATE_KEY")?;
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
@@ -113,6 +103,9 @@ async fn bonk_sniper_trade_with_shreds(trade_info: BonkTradeEvent) -> AnyResult<
     } else {
         sol_trade_sdk::TradeTokenType::SOL
     };
+    let balance_before = client
+        .get_payer_token_balance_with_program(&mint_pubkey, &trade_info.base_token_program)
+        .await?;
 
     // Buy tokens
     println!("Buying tokens from Bonk...");
@@ -137,7 +130,7 @@ async fn bonk_sniper_trade_with_shreds(trade_info: BonkTradeEvent) -> AnyResult<
             trade_info.creator_associated_account,
             trade_info.global_config,
         )),
-        address_lookup_table_account: None,
+        address_lookup_table_accounts: Vec::new(),
         wait_tx_confirmed: true,
         wait_for_all_submits: false,
         create_input_token_ata: true,
@@ -151,22 +144,25 @@ async fn bonk_sniper_trade_with_shreds(trade_info: BonkTradeEvent) -> AnyResult<
         precheck: None,
         grpc_recv_us: None,
     };
-    client.buy(buy_params).await?;
+    let (ok, sigs, err, _) = client.buy(buy_params).await?;
+    if !ok {
+        return Err(
+            std::io::Error::other(format!("buy failed: {:?}; sigs: {:?}", err, sigs)).into()
+        );
+    }
 
     // Sell tokens
     println!("Selling tokens from Bonk...");
 
-    let rpc = client.infrastructure.rpc.clone();
-    let payer = client.payer.pubkey();
-    let account = get_associated_token_address_with_program_id_fast_use_seed(
-        &payer,
-        &mint_pubkey,
-        &trade_info.base_token_program,
-        client.use_seed_optimize,
-    );
-    let balance = rpc.get_token_account_balance(&account).await?;
-    println!("Balance: {:?}", balance);
-    let amount_token = balance.amount.parse::<u64>().unwrap();
+    let balance_after = client
+        .get_payer_token_balance_with_program(&mint_pubkey, &trade_info.base_token_program)
+        .await?;
+    let amount_token = balance_after
+        .checked_sub(balance_before)
+        .ok_or_else(|| std::io::Error::other("token balance decreased after buy"))?;
+    if amount_token == 0 {
+        return Err(std::io::Error::other("confirmed buy did not increase token balance").into());
+    }
 
     println!("Selling {} tokens", amount_token);
     let sell_params = sol_trade_sdk::TradeSellParams {
@@ -175,7 +171,7 @@ async fn bonk_sniper_trade_with_shreds(trade_info: BonkTradeEvent) -> AnyResult<
         mint: mint_pubkey,
         input_token_amount: amount_token,
         slippage_basis_points: slippage_basis_points,
-        recent_blockhash: Some(recent_blockhash),
+        recent_blockhash: Some(client.infrastructure.rpc.get_latest_blockhash().await?),
         extension_params: DexParamEnum::Bonk(BonkParams::immediate_sell(
             trade_info.base_token_program,
             trade_info.platform_config,
@@ -183,7 +179,7 @@ async fn bonk_sniper_trade_with_shreds(trade_info: BonkTradeEvent) -> AnyResult<
             trade_info.creator_associated_account,
             trade_info.global_config,
         )),
-        address_lookup_table_account: None,
+        address_lookup_table_accounts: Vec::new(),
         wait_tx_confirmed: true,
         wait_for_all_submits: false,
         create_output_token_ata: true,
@@ -196,7 +192,12 @@ async fn bonk_sniper_trade_with_shreds(trade_info: BonkTradeEvent) -> AnyResult<
         simulate: false,
         grpc_recv_us: None,
     };
-    client.sell(sell_params).await?;
+    let (ok, sigs, err, _) = client.sell(sell_params).await?;
+    if !ok {
+        return Err(
+            std::io::Error::other(format!("sell failed: {:?}; sigs: {:?}", err, sigs)).into()
+        );
+    }
 
     // Exit program after completing the trade
     std::process::exit(0);

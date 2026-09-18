@@ -1,5 +1,6 @@
 pub mod bonk;
 pub mod hookie_precheck;
+pub mod launchlab;
 pub mod meteora_damm_v2;
 pub mod pumpfun;
 pub(crate) mod pumpfun_ix_data;
@@ -7,5 +8,6 @@ pub mod pumpswap;
 pub(crate) mod pumpswap_ix_data;
 pub mod raydium_amm_v4;
 pub mod raydium_cpmm;
+pub mod stonkfun;
 pub(crate) mod token_account_setup;
 pub mod utils;

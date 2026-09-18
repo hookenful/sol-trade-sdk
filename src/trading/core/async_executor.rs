@@ -23,11 +23,7 @@ use solana_sdk::{
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::{
-    str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use tokio::sync::Notify;
 
 use fnv::FnvHasher;
@@ -39,7 +35,7 @@ use crate::{
     common::{nonce_cache::DurableNonceInfo, GasFeeStrategy, SwqosSubmitTiming},
     swqos::{SwqosClient, SwqosType, TradeType},
     trading::core::params::SenderConcurrencyConfig,
-    trading::{common::build_transaction, MiddlewareManager},
+    trading::{common::build_transaction_with_version, MiddlewareManager},
 };
 
 /// 与 transaction_pool::PARALLEL_SENDER_COUNT 一致，保证多路 build 不串行
@@ -47,13 +43,13 @@ const SWQOS_POOL_WORKERS: usize = 18;
 const SWQOS_QUEUE_CAP: usize = 128;
 const SWQOS_DEDICATED_DEFAULT_THREADS: usize = 18;
 const FAST_SUBMIT_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
-const CONFIRMED_MODE_RESULT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const FAST_SUBMIT_DRAIN_GRACE: Duration = Duration::from_millis(20);
 
 /// Shared across all jobs in one batch; built once, cloned as single Arc per job (minimal hot-path clone).
 struct SwqosSharedContext {
     payer: Arc<Keypair>,
     instructions: Arc<Vec<Instruction>>,
-    address_lookup_table_account: Option<AddressLookupTableAccount>,
+    address_lookup_table_accounts: Arc<Vec<AddressLookupTableAccount>>,
     recent_blockhash: Option<Hash>,
     durable_nonce: Option<DurableNonceInfo>,
     middleware_manager: Option<Arc<MiddlewareManager>>,
@@ -62,6 +58,7 @@ struct SwqosSharedContext {
     wait_transaction_confirmed: bool,
     with_tip: bool,
     collector: Arc<ResultCollector>,
+    transaction_version: crate::common::TradeTransactionVersion,
 }
 
 /// One SWQOS submit task; only per-task data + one Arc to shared (reduces hot-path clones).
@@ -88,12 +85,13 @@ async fn run_one_swqos_job(job: SwqosJob) {
 
     let tip_amount = if s.with_tip { job.tip } else { 0.0 };
 
-    let transaction = match build_transaction(
+    let transaction = match build_transaction_with_version(
         &s.payer,
         job.unit_limit,
         job.unit_price,
+        s.transaction_version,
         s.instructions.as_ref(),
-        s.address_lookup_table_account.as_ref(),
+        s.address_lookup_table_accounts.as_slice(),
         s.recent_blockhash,
         s.middleware_manager.as_ref(),
         s.protocol_name,
@@ -148,15 +146,21 @@ async fn run_one_swqos_job(job: SwqosJob) {
 
 async fn swqos_worker_loop(queue: Arc<ArrayQueue<SwqosJob>>, notify: Arc<Notify>) {
     loop {
-        let notified = notify.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
+        let job = {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            match queue.pop() {
+                Some(job) => Some(job),
+                None => {
+                    notified.await;
+                    None
+                }
+            }
+        };
 
-        if let Some(job) = queue.pop() {
-            drop(notified);
+        if let Some(job) = job {
             run_one_swqos_job(job).await;
-        } else {
-            notified.await;
         }
     }
 }
@@ -235,6 +239,7 @@ fn ensure_dedicated_pool(
         target_workers,
         &mut guard,
     );
+    drop(guard);
     (queue, notify)
 }
 
@@ -354,20 +359,22 @@ fn is_landed_error(error: &anyhow::Error) -> bool {
 }
 
 struct ResultCollector {
-    results: Arc<ArrayQueue<TaskResult>>,
-    success_flag: Arc<AtomicBool>,
-    landed_failed_flag: Arc<AtomicBool>, // 🔧 Tx landed on-chain but failed (nonce consumed)
-    completed_count: Arc<AtomicUsize>,
+    results: ArrayQueue<TaskResult>,
+    success_flag: AtomicBool,
+    landed_failed_flag: AtomicBool, // 🔧 Tx landed on-chain but failed (nonce consumed)
+    completed_count: AtomicUsize,
+    result_notify: Notify,
     total_tasks: usize,
 }
 
 impl ResultCollector {
     fn new(capacity: usize) -> Self {
         Self {
-            results: Arc::new(ArrayQueue::new(capacity)),
-            success_flag: Arc::new(AtomicBool::new(false)),
-            landed_failed_flag: Arc::new(AtomicBool::new(false)),
-            completed_count: Arc::new(AtomicUsize::new(0)),
+            results: ArrayQueue::new(capacity),
+            success_flag: AtomicBool::new(false),
+            landed_failed_flag: AtomicBool::new(false),
+            completed_count: AtomicUsize::new(0),
+            result_notify: Notify::new(),
             total_tasks: capacity,
         }
     }
@@ -387,16 +394,23 @@ impl ResultCollector {
         }
 
         self.completed_count.fetch_add(1, Ordering::Release);
+        self.result_notify.notify_one();
     }
 
     async fn wait_for_success(
         &self,
     ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
-        let start = Instant::now();
-        let timeout = std::time::Duration::from_secs(5);
-        let poll_interval = CONFIRMED_MODE_RESULT_POLL_INTERVAL;
+        let deadline = tokio::time::Instant::now() + FAST_SUBMIT_RESULT_TIMEOUT;
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
 
         loop {
+            // Register before checking state so a concurrent submit cannot be missed
+            // between the predicate check and the await.
+            let notified = self.result_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if self.success_flag.load(Ordering::Acquire) {
                 let mut signatures = Vec::new();
                 let mut has_success = false;
@@ -454,10 +468,10 @@ impl ResultCollector {
                 return None;
             }
 
-            if start.elapsed() > timeout {
-                return None;
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                _ = deadline_sleep.as_mut() => return None,
             }
-            tokio::time::sleep(poll_interval).await;
         }
     }
 
@@ -495,51 +509,80 @@ impl ResultCollector {
         &self,
         timeout: Duration,
     ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
-        let start = Instant::now();
-        let poll_interval = Duration::from_millis(1);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
+
         loop {
+            let notified = self.result_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             if self.success_flag.load(Ordering::Acquire)
                 || self.landed_failed_flag.load(Ordering::Acquire)
                 || self.completed_count.load(Ordering::Acquire) >= self.total_tasks
-                || start.elapsed() >= timeout
             {
                 return self.get_first();
             }
-            tokio::time::sleep(poll_interval).await;
+
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                _ = deadline_sleep.as_mut() => return self.get_first(),
+            }
         }
     }
 
-    /// 等待全部任务完成（不等待链上确认），然后收集并返回所有签名。用于「多路提交」时返回多笔签名。
-    /// 轮询间隔 2ms，避免 50ms 间隔在最后一笔返回时多等几十 ms 拉高 submit 耗时。
-    /// Re-enabled via `SwapParams.wait_for_all_submits` for callers that confirm
-    /// externally against a pinned durable nonce and need every submitted sig.
+    /// 等待全部任务完成（不等待链上确认），然后收集并返回所有已返回的签名。
+    /// 提交完成时由 worker 主动唤醒，避免固定间隔轮询增加调度开销和返回延迟。
+    /// Re-enabled via `SwapParams.wait_for_all_submits` for callers that need
+    /// every submitted signature, either for external monitoring or for
+    /// executor-level poll-any confirmation after parallel submit.
     async fn wait_for_all_submitted(
         &self,
         timeout_secs: u64,
     ) -> Option<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
-        let start = Instant::now();
-        let primary = Duration::from_secs(timeout_secs);
-        let poll_interval = Duration::from_millis(2);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
+
+        let mut timed_out = false;
         while self.completed_count.load(Ordering::Acquire) < self.total_tasks {
-            if start.elapsed() > primary {
+            let notified = self.result_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.completed_count.load(Ordering::Acquire) >= self.total_tasks {
                 break;
             }
-            tokio::time::sleep(poll_interval).await;
-        }
-        // 「不等待链上确认」仍会等各 SWQOS 的 HTTP 回包；主循环在收齐或触达 `timeout_secs` 后结束。
-        // 若主窗口到时仍有未回包通道，晚到的 TaskResult 若立刻 drain 会丢签名——仅在该路径上拉长 grace。
-        let all_submitted = self.completed_count.load(Ordering::Acquire) >= self.total_tasks;
-        if all_submitted {
-            tokio::task::yield_now().await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-            while self.completed_count.load(Ordering::Acquire) < self.total_tasks {
-                if start.elapsed() > primary + Duration::from_secs(6) {
+
+            tokio::select! {
+                _ = notified.as_mut() => {}
+                _ = deadline_sleep.as_mut() => {
+                    timed_out = true;
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+
+        // Bound the opt-in "all submits" path tightly. A slow relay must not
+        // delay poll-any confirmation by multiple seconds after the submit
+        // window; give only a short grace for a just-finished worker to publish.
+        if timed_out {
+            let grace_deadline = tokio::time::Instant::now() + FAST_SUBMIT_DRAIN_GRACE;
+            while self.completed_count.load(Ordering::Acquire) < self.total_tasks {
+                let notified = self.result_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+
+                if self.completed_count.load(Ordering::Acquire) >= self.total_tasks {
+                    break;
+                }
+
+                tokio::select! {
+                    _ = notified.as_mut() => {}
+                    _ = tokio::time::sleep_until(grace_deadline) => break,
+                }
+            }
         }
         self.get_first()
     }
@@ -605,11 +648,12 @@ fn select_swqos_task_configs(
 /// Execute trade on multiple SWQOS clients in parallel; returns success flag, all signatures, and last error.
 ///
 /// `sender_config` merges sender_thread_cores, effective_core_ids, max_sender_concurrency (precomputed at SDK init; no get_core_ids on hot path).
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_parallel(
     swqos_clients: &[Arc<SwqosClient>],
     payer: Arc<Keypair>,
     instructions: Vec<Instruction>,
-    address_lookup_table_account: Option<AddressLookupTableAccount>,
+    address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
     recent_blockhash: Option<Hash>,
     durable_nonce: Option<DurableNonceInfo>,
     middleware_manager: Option<Arc<MiddlewareManager>>,
@@ -622,6 +666,49 @@ pub async fn execute_parallel(
     use_dedicated_sender_threads: bool,
     sender_config: SenderConcurrencyConfig,
     check_min_tip: bool,
+) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
+    execute_parallel_with_version(
+        swqos_clients,
+        payer,
+        instructions,
+        address_lookup_table_accounts,
+        recent_blockhash,
+        durable_nonce,
+        middleware_manager,
+        protocol_name,
+        is_buy,
+        wait_transaction_confirmed,
+        wait_for_all_submits,
+        with_tip,
+        gas_fee_strategy,
+        use_dedicated_sender_threads,
+        sender_config,
+        check_min_tip,
+        crate::common::TradeTransactionVersion::V0,
+    )
+    .await
+}
+
+/// Execute a trade batch using an explicitly selected transaction message version.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_parallel_with_version(
+    swqos_clients: &[Arc<SwqosClient>],
+    payer: Arc<Keypair>,
+    instructions: Vec<Instruction>,
+    address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
+    recent_blockhash: Option<Hash>,
+    durable_nonce: Option<DurableNonceInfo>,
+    middleware_manager: Option<Arc<MiddlewareManager>>,
+    protocol_name: &'static str,
+    is_buy: bool,
+    wait_transaction_confirmed: bool,
+    wait_for_all_submits: bool,
+    with_tip: bool,
+    gas_fee_strategy: GasFeeStrategy,
+    use_dedicated_sender_threads: bool,
+    sender_config: SenderConcurrencyConfig,
+    check_min_tip: bool,
+    transaction_version: crate::common::TradeTransactionVersion,
 ) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
     if swqos_clients.is_empty() {
         return Err(anyhow!("swqos_clients is empty"));
@@ -661,17 +748,13 @@ pub async fn execute_parallel(
         return Err(anyhow!("No available gas fee strategy configs"));
     }
 
-    if is_buy && selected_task_configs.len() > 1 && durable_nonce.is_none() {
-        return Err(anyhow!("Multiple swqos transactions require durable_nonce to be set.",));
-    }
-
     // Task preparation completed: one shared context (clone once per batch), then minimal per-task data.
     let channel_count = selected_task_configs.len().max(1);
     let collector = Arc::new(ResultCollector::new(channel_count));
     let shared = Arc::new(SwqosSharedContext {
         payer,
         instructions,
-        address_lookup_table_account,
+        address_lookup_table_accounts: Arc::new(address_lookup_table_accounts),
         recent_blockhash,
         durable_nonce,
         middleware_manager,
@@ -680,6 +763,7 @@ pub async fn execute_parallel(
         wait_transaction_confirmed,
         with_tip,
         collector: collector.clone(),
+        transaction_version,
     });
 
     let (queue, notify) = if use_dedicated_sender_threads {
@@ -784,9 +868,22 @@ pub async fn execute_parallel(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     fn value(cu_price: u64, tip: f64) -> GasFeeStrategyValue {
         GasFeeStrategyValue { cu_limit: 100_000, cu_price, tip }
+    }
+
+    fn task_result(success: bool, landed_on_chain: bool) -> TaskResult {
+        TaskResult {
+            success,
+            signature: Signature::default(),
+            error: (!success).then(|| anyhow!("submit failed")),
+            swqos_type: SwqosType::Default,
+            strategy_type: GasFeeStrategyType::Normal,
+            landed_on_chain,
+            submit_done_us: crate::common::clock::now_micros(),
+        }
     }
 
     #[test]
@@ -850,8 +947,71 @@ mod tests {
         assert_eq!(selected[0].gas_fee_config.2.tip, 0.0);
     }
 
-    #[test]
-    fn confirmed_mode_result_poll_interval_is_100ms() {
-        assert_eq!(CONFIRMED_MODE_RESULT_POLL_INTERVAL, Duration::from_millis(100));
+    #[tokio::test]
+    async fn wait_for_all_submitted_timeout_is_bounded() {
+        let collector = ResultCollector::new(1);
+        let start = Instant::now();
+
+        let result = collector.wait_for_all_submitted(0).await;
+
+        assert!(result.is_none());
+        assert!(
+            start.elapsed() < Duration::from_millis(150),
+            "wait_for_all_submitted should not add multi-second grace after timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_for_first_submitted_wakes_on_success() {
+        let collector = Arc::new(ResultCollector::new(2));
+        let waiter = collector.clone();
+        let waiting =
+            tokio::spawn(
+                async move { waiter.wait_for_first_submitted(Duration::from_secs(1)).await },
+            );
+
+        tokio::task::yield_now().await;
+        collector.submit(task_result(true, true));
+
+        let result = tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("success notification should wake the waiter")
+            .expect("waiter task should finish")
+            .expect("submitted result should be returned");
+        assert!(result.0);
+        assert_eq!(result.1.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_for_success_wakes_on_landed_failure() {
+        let collector = Arc::new(ResultCollector::new(2));
+        let waiter = collector.clone();
+        let waiting = tokio::spawn(async move { waiter.wait_for_success().await });
+
+        tokio::task::yield_now().await;
+        collector.submit(task_result(false, true));
+
+        let result = tokio::time::timeout(Duration::from_millis(100), waiting)
+            .await
+            .expect("landed-failure notification should wake the waiter")
+            .expect("waiter task should finish")
+            .expect("landed failure should be returned");
+        assert!(!result.0);
+        assert!(result.2.is_some());
+    }
+
+    #[tokio::test]
+    async fn wait_for_all_submitted_handles_preexisting_notifications() {
+        let collector = ResultCollector::new(2);
+        collector.submit(task_result(false, false));
+        collector.submit(task_result(true, true));
+
+        let result =
+            tokio::time::timeout(Duration::from_millis(100), collector.wait_for_all_submitted(1))
+                .await
+                .expect("completed state should be observed without polling")
+                .expect("completed results should be returned");
+        assert!(result.0);
+        assert_eq!(result.1.len(), 2);
     }
 }

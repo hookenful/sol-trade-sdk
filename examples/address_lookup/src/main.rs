@@ -24,7 +24,6 @@ use sol_trade_sdk::{
 };
 use solana_commitment_config::CommitmentConfig;
 use solana_sdk::pubkey::Pubkey;
-use solana_sdk::signature::Keypair;
 
 static ALREADY_EXECUTED: AtomicBool = AtomicBool::new(false);
 
@@ -105,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn create_solana_trade_client() -> AnyResult<SolanaTrade> {
     println!("🚀 Initializing SolanaTrade client...");
-    let payer = Keypair::from_base58_string("use_your_payer_keypair_here");
+    let payer = sol_trade_sdk::common::keypair::load_keypair_from_env("PRIVATE_KEY")?;
     let rpc_url = "https://api.mainnet-beta.solana.com".to_string();
     let commitment = CommitmentConfig::confirmed();
     let swqos_configs: Vec<SwqosConfig> = vec![SwqosConfig::Default(rpc_url.clone())];
@@ -144,10 +143,9 @@ async fn pumpfun_copy_trade_with_grpc(
     let recent_blockhash = client.infrastructure.rpc.get_latest_blockhash().await?;
 
     let lookup_table_key = Pubkey::from_str("use_your_lookup_table_key_here").unwrap();
-    let address_lookup_table_account =
-        fetch_address_lookup_table_account(&client.infrastructure.rpc, &lookup_table_key)
-            .await
-            .ok();
+    let alt = fetch_address_lookup_table_account(&client.infrastructure.rpc, &lookup_table_key)
+        .await
+        .ok();
 
     let gas_fee_strategy = GasFeeStrategy::new();
     gas_fee_strategy.set_global_fee_strategy(150000, 150000, 500000, 500000, 0.001, 0.001);
@@ -177,7 +175,7 @@ async fn pumpfun_copy_trade_with_grpc(
             trade_info.is_cashback_coin,
             Some(trade_info.mayhem_mode),
         )),
-        address_lookup_table_account,
+        address_lookup_table_accounts: alt.into_iter().collect(),
         wait_tx_confirmed: true,
         wait_for_all_submits: false,
         create_input_token_ata: false,
