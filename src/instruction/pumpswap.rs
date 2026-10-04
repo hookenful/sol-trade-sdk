@@ -719,6 +719,7 @@ mod tests {
             transaction_version: crate::common::TradeTransactionVersion::V0,
             grpc_recv_us: None,
             use_exact_sol_amount: Some(true),
+            precheck: None,
         }
     }
 

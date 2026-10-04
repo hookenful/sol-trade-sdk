@@ -2,6 +2,7 @@ use crate::common::nonce_cache::DurableNonceInfo;
 use crate::common::{GasFeeStrategy, SolanaRpcClient, TradeTransactionVersion};
 use crate::swqos::{SwqosClient, TradeType};
 use crate::trading::MiddlewareManager;
+use crate::PrecheckConfig;
 use core_affinity::CoreId;
 use solana_hash::Hash;
 use solana_message::AddressLookupTableAccount;
@@ -10,6 +11,7 @@ use std::sync::Arc;
 
 use super::bonk::BonkParams;
 use super::meteora_damm_v2::MeteoraDammV2Params;
+use super::meteora_dbc::MeteoraDbcParams;
 use super::meteora_dlmm::MeteoraDlmmParams;
 use super::pumpfun::PumpFunParams;
 use super::pumpswap::PumpSwapParams;
@@ -46,6 +48,9 @@ pub enum DexParamEnum {
     RaydiumCpmm(RaydiumCpmmParams),
     RaydiumAmmV4(RaydiumAmmV4Params),
     MeteoraDammV2(MeteoraDammV2Params),
+    /// Meteora Dynamic Bonding Curve pool, the curve a token trades on before
+    /// it migrates to a DAMM pool.
+    MeteoraDbc(MeteoraDbcParams),
     RaydiumClmm(RaydiumClmmParams),
     OrcaWhirlpool(WhirlpoolParams),
     MeteoraDlmm(MeteoraDlmmParams),
@@ -67,6 +72,7 @@ impl DexParamEnum {
             DexParamEnum::RaydiumCpmm(p) => p,
             DexParamEnum::RaydiumAmmV4(p) => p,
             DexParamEnum::MeteoraDammV2(p) => p,
+            DexParamEnum::MeteoraDbc(p) => p,
             DexParamEnum::RaydiumClmm(p) => p,
             DexParamEnum::OrcaWhirlpool(p) => p,
             DexParamEnum::MeteoraDlmm(p) => p,
@@ -136,6 +142,8 @@ pub struct SwapParams {
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
+    /// Optional on-chain precheck instruction inserted before PumpFun buy flow.
+    pub precheck: Option<PrecheckConfig>,
 }
 
 impl SwapParams {

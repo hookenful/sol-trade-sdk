@@ -9,9 +9,14 @@
 //! directly with `curve_direct` / `graduated_direct`, without conversion hops.
 //!
 //! [`StonkFunViaSolParams`] covers both the LaunchLab curve (inner) and graduated
-//! CPMM (outer) meme legs. Legacy single hops support CPMM and AMM v4;
-//! [`StonkFunSolHop::Route`] also accepts externally quoted CLMM, Whirlpool,
-//! DLMM and split/multi-hop conversion paths.
+//! CPMM (outer) meme legs. The funding↔quote hop goes through a Raydium CPMM,
+//! Raydium AMM v4, Raydium CLMM, Orca Whirlpool or Meteora DLMM pool; a quote
+//! that only trades against another currency (USDC) takes a second hop from it.
+//! Raydium and DLMM hops are quoted exactly ([`StonkFunSolHop::quote_exact_in`]),
+//! CLMM and DLMM ones when loaded with their quote state; Whirlpool hops, and
+//! those loaded without it, at the pool's spot price ([`super::HopSpot`]), which
+//! their loaders fill in. [`StonkFunSolHop::Route`] takes an explicit,
+//! externally quoted path instead: any number of hops, with splits and merges.
 //!
 //! # Quick start
 //!
@@ -30,7 +35,13 @@
 //! );
 //! ```
 
-use super::{BonkParams, RaydiumAmmV4Params, RaydiumCpmmParams};
+use solana_sdk::pubkey::Pubkey;
+
+use super::{
+    BonkParams, MeteoraDammV2Params, MeteoraDbcParams, MeteoraDlmmParams, RaydiumAmmV4Params,
+    RaydiumClmmParams, RaydiumCpmmParams, WhirlpoolParams,
+};
+use crate::utils::calc::{raydium_amm_v4, raydium_cpmm};
 
 /// SOL, WSOL or USDC ↔ quote ↔ meme routing. The legacy name remains compatible.
 pub type StonkFunViaQuoteParams = StonkFunViaSolParams;
@@ -42,15 +53,97 @@ pub enum StonkFunMemeLeg {
     Curve(BonkParams),
     /// Graduated external CPMM pool (`DexParamEnum::StonkFunSwap`).
     Graduated(RaydiumCpmmParams),
+    /// Meteora Dynamic Bonding Curve pool (`DexParamEnum::MeteoraDbc`): the
+    /// same routing serves a launch pool of any venue priced in another token.
+    MeteoraDbc(MeteoraDbcParams),
+    /// Meteora DAMM v2 pool a DBC curve migrated to
+    /// (`DexParamEnum::MeteoraDammV2`).
+    MeteoraDammV2(MeteoraDammV2Params),
 }
 
-/// Funding asset ↔ StonkFun-quote conversion. Legacy name retained for compatibility.
+/// A pool on the route between the funding asset (SOL/WSOL or USDC) and the
+/// StonkFun quote, used when the wallet does not hold the quote mint, or an
+/// explicit route of such pools. Legacy name retained for compatibility.
 #[derive(Clone)]
 pub enum StonkFunSolHop {
     RaydiumCpmm(RaydiumCpmmParams),
     RaydiumAmmV4(RaydiumAmmV4Params),
+    /// Quoted exactly when loaded with its quote state, else at its `spot` price.
+    RaydiumClmm(RaydiumClmmParams),
+    /// Quoted at the pool's `spot` price.
+    OrcaWhirlpool(WhirlpoolParams),
+    /// Quoted exactly when loaded with its quote state, else at its `spot` price.
+    MeteoraDlmm(MeteoraDlmmParams),
     /// Explicit externally quoted paths, including concentrated venues and splits.
     Route(super::StonkFunQuoteRoute),
+}
+
+impl StonkFunSolHop {
+    /// The pool's address; the default key for a [`Self::Route`], which is
+    /// not one pool.
+    pub fn pool(&self) -> Pubkey {
+        match self {
+            Self::RaydiumCpmm(pool) => pool.pool_state,
+            Self::RaydiumAmmV4(pool) => pool.amm,
+            Self::RaydiumClmm(pool) => pool.pool_state,
+            Self::OrcaWhirlpool(pool) => pool.whirlpool,
+            Self::MeteoraDlmm(pool) => pool.lb_pair,
+            Self::Route(_) => Pubkey::default(),
+        }
+    }
+
+    /// The pool's two mints, in the pool's own order; default keys for a
+    /// [`Self::Route`], which is not one pool.
+    pub fn mints(&self) -> (Pubkey, Pubkey) {
+        match self {
+            Self::RaydiumCpmm(pool) => (pool.base_mint, pool.quote_mint),
+            Self::RaydiumAmmV4(pool) => (pool.coin_mint, pool.pc_mint),
+            Self::RaydiumClmm(pool) => (pool.token_0_mint, pool.token_1_mint),
+            Self::OrcaWhirlpool(pool) => (pool.mint_a, pool.mint_b),
+            Self::MeteoraDlmm(pool) => (pool.token_x_mint, pool.token_y_mint),
+            Self::Route(_) => (Pubkey::default(), Pubkey::default()),
+        }
+    }
+
+    /// What the wallet receives for `amount_in` of `input_mint` swapped
+    /// through the pool, exactly as the program pays it. Raydium CPMM, AMM v4
+    /// and CLMM pools and Meteora DLMM pairs only: Whirlpools are quoted at a
+    /// spot price, and a [`Self::Route`] carries the quotes of its own hops.
+    pub fn quote_exact_in(&self, input_mint: &Pubkey, amount_in: u64) -> anyhow::Result<u64> {
+        let input = if *input_mint == crate::constants::SOL_TOKEN_ACCOUNT {
+            crate::constants::WSOL_TOKEN_ACCOUNT
+        } else {
+            *input_mint
+        };
+        let (mint_0, mint_1) = self.mints();
+        if !matches!(self, Self::Route(_)) && input != mint_0 && input != mint_1 {
+            anyhow::bail!("{input} is not a mint of pool {}", self.pool());
+        }
+        match self {
+            Self::RaydiumCpmm(pool) => Ok(raydium_cpmm::compute_swap_amount_for_pool(
+                pool,
+                input == pool.base_mint,
+                amount_in,
+                0,
+            )?
+            .amount_out),
+            Self::RaydiumAmmV4(pool) => Ok(raydium_amm_v4::compute_swap_amount_for_pool(
+                pool,
+                input == pool.coin_mint,
+                amount_in,
+                0,
+            )?
+            .amount_out),
+            Self::RaydiumClmm(pool) => Ok(pool.quote_exact_in(&input, amount_in)?.amount_out),
+            Self::MeteoraDlmm(pool) => Ok(pool.quote_exact_in(&input, amount_in)?.amount_out),
+            Self::OrcaWhirlpool(_) => {
+                anyhow::bail!("pool {} is quoted at its spot price, not exactly", self.pool())
+            }
+            Self::Route(_) => {
+                anyhow::bail!("an explicit route carries the quotes of its hops, none of its own")
+            }
+        }
+    }
 }
 
 impl From<super::StonkFunQuoteRoute> for StonkFunSolHop {
@@ -71,6 +164,24 @@ impl From<RaydiumAmmV4Params> for StonkFunSolHop {
     }
 }
 
+impl From<RaydiumClmmParams> for StonkFunSolHop {
+    fn from(params: RaydiumClmmParams) -> Self {
+        Self::RaydiumClmm(params)
+    }
+}
+
+impl From<WhirlpoolParams> for StonkFunSolHop {
+    fn from(params: WhirlpoolParams) -> Self {
+        Self::OrcaWhirlpool(params)
+    }
+}
+
+impl From<MeteoraDlmmParams> for StonkFunSolHop {
+    fn from(params: MeteoraDlmmParams) -> Self {
+        Self::MeteoraDlmm(params)
+    }
+}
+
 /// Funding/receipt wrapper around an inner or graduated StonkFun leg.
 ///
 /// Prefer the `curve_with_*` / `graduated_with_*` constructors, then pass the
@@ -86,7 +197,17 @@ impl From<RaydiumAmmV4Params> for StonkFunSolHop {
 #[derive(Clone)]
 pub struct StonkFunViaSolParams {
     pub meme_leg: StonkFunMemeLeg,
+    /// The pool trading the funding asset (SOL, or USDC): against the quote
+    /// itself, or against the currency `quote_hop` trades the quote against.
+    /// A [`StonkFunSolHop::Route`] is the whole conversion by itself.
     pub sol_hop: StonkFunSolHop,
+    /// Second hop, between the currency `sol_hop` trades and the quote; not
+    /// with a [`StonkFunSolHop::Route`], which lists its own hops.
+    pub quote_hop: Option<StonkFunSolHop>,
+    /// Slippage of each hop; `None` uses the trade's slippage. On buys each leg
+    /// spends the minimum output of the one before, so every basis point of hop
+    /// slippage a pool does not use stays behind in that currency.
+    pub hop_slippage_basis_points: Option<u64>,
 }
 
 impl StonkFunViaSolParams {
@@ -101,12 +222,65 @@ impl StonkFunViaSolParams {
     }
     /// Inner-curve meme leg + arbitrary SOL hop.
     pub fn curve(meme_leg: BonkParams, sol_hop: impl Into<StonkFunSolHop>) -> Self {
-        Self { meme_leg: StonkFunMemeLeg::Curve(meme_leg), sol_hop: sol_hop.into() }
+        Self {
+            meme_leg: StonkFunMemeLeg::Curve(meme_leg),
+            sol_hop: sol_hop.into(),
+            quote_hop: None,
+            hop_slippage_basis_points: None,
+        }
+    }
+
+    /// The route alone, to sell the quote itself back to SOL (or to USDC, when
+    /// the route starts there): a sale whose input is the route's quote never
+    /// builds the meme leg.
+    pub fn quote_sale(sol_hop: impl Into<StonkFunSolHop>) -> Self {
+        Self::curve(BonkParams::default(), sol_hop)
     }
 
     /// Graduated CPMM meme leg + arbitrary SOL hop.
     pub fn graduated(meme_leg: RaydiumCpmmParams, sol_hop: impl Into<StonkFunSolHop>) -> Self {
-        Self { meme_leg: StonkFunMemeLeg::Graduated(meme_leg), sol_hop: sol_hop.into() }
+        Self {
+            meme_leg: StonkFunMemeLeg::Graduated(meme_leg),
+            sol_hop: sol_hop.into(),
+            quote_hop: None,
+            hop_slippage_basis_points: None,
+        }
+    }
+
+    /// Meteora DBC curve meme leg + arbitrary SOL hop.
+    pub fn meteora_dbc(meme_leg: MeteoraDbcParams, sol_hop: impl Into<StonkFunSolHop>) -> Self {
+        Self {
+            meme_leg: StonkFunMemeLeg::MeteoraDbc(meme_leg),
+            sol_hop: sol_hop.into(),
+            quote_hop: None,
+            hop_slippage_basis_points: None,
+        }
+    }
+
+    /// Meteora DAMM v2 meme leg + arbitrary SOL hop.
+    pub fn meteora_damm_v2(
+        meme_leg: MeteoraDammV2Params,
+        sol_hop: impl Into<StonkFunSolHop>,
+    ) -> Self {
+        Self {
+            meme_leg: StonkFunMemeLeg::MeteoraDammV2(meme_leg),
+            sol_hop: sol_hop.into(),
+            quote_hop: None,
+            hop_slippage_basis_points: None,
+        }
+    }
+
+    /// Slippage of the hops, separate from the meme leg's.
+    pub fn with_hop_slippage_basis_points(mut self, basis_points: u64) -> Self {
+        self.hop_slippage_basis_points = Some(basis_points);
+        self
+    }
+
+    /// A second hop from the currency `sol_hop` trades to the quote, for a
+    /// quote that does not trade against SOL.
+    pub fn with_quote_hop(mut self, quote_hop: impl Into<StonkFunSolHop>) -> Self {
+        self.quote_hop = Some(quote_hop.into());
+        self
     }
 
     /// Inner curve priced in a stock quote, with a Raydium CPMM `WSOL/quote` hop.

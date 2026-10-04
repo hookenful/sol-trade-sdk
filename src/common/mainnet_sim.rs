@@ -713,6 +713,7 @@ pub fn swap_params(
         transaction_version: crate::common::TradeTransactionVersion::V0,
         grpc_recv_us: None,
         use_exact_sol_amount: None,
+        precheck: None,
     }
 }
 

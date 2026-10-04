@@ -1,6 +1,8 @@
 pub mod bonk;
+pub mod hookie_precheck;
 pub mod launchlab;
 pub mod meteora_damm_v2;
+pub mod meteora_dbc;
 pub mod meteora_dlmm;
 pub mod pumpfun;
 pub(crate) mod pumpfun_ix_data;
@@ -13,6 +15,8 @@ pub mod stonkfun;
 pub(crate) mod stonkfun_quote_route;
 #[cfg(test)]
 mod meteora_damm_v2_mainnet;
+#[cfg(test)]
+mod meteora_dbc_mainnet;
 #[cfg(test)]
 mod meteora_dlmm_mainnet;
 #[cfg(test)]

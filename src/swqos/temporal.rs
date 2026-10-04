@@ -221,11 +221,43 @@ impl TemporalClient {
 
 impl Drop for TemporalClient {
     fn drop(&mut self) {
+        // Only the last client instance should stop the shared ping task.
+        if Arc::strong_count(&self.ping_handle) != 1 {
+            return;
+        }
+
         self.stop_ping.store(true, Ordering::Relaxed);
         if let Ok(mut guard) = self.ping_handle.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> TemporalClient {
+        TemporalClient {
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            auth_token: "token".to_string(),
+            http_client: default_http_client_builder().build().unwrap(),
+            quic_sender: None,
+            ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_clone_does_not_stop_shared_ping_task() {
+        let client = test_client();
+        let clone = client.clone();
+
+        drop(clone);
+
+        assert!(!client.stop_ping.load(Ordering::Relaxed));
     }
 }

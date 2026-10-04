@@ -5,7 +5,9 @@ mod cached_quote;
 #[cfg(test)]
 mod cached_quote_mainnet;
 mod dex_swap;
+mod hop_spot;
 mod meteora_damm_v2;
+mod meteora_dbc;
 mod meteora_dlmm;
 mod pumpfun;
 mod pumpswap;
@@ -21,13 +23,24 @@ mod whirlpool;
 pub use bonk::{BonkParams, LaunchLabParams, StonkFunParams};
 pub use cached_quote::{CachedQuoteRequest, CachedRouteStep, CachedSwapQuote};
 pub use dex_swap::{DexParamEnum, SenderConcurrencyConfig, SwapParams};
+pub use hop_spot::HopSpot;
 pub use meteora_damm_v2::MeteoraDammV2Params;
-pub use meteora_dlmm::MeteoraDlmmParams;
+pub use meteora_dbc::{DbcQuoteState, DbcTransferHook, MeteoraDbcParams};
+#[cfg(test)]
+pub(crate) use meteora_dlmm::fixture_pair as dlmm_fixture_pair;
+pub use meteora_dlmm::{
+    DlmmHopQuote, DlmmQuoteAccounts, DlmmQuoteState, MeteoraDlmmParams, QUOTE_BIN_ARRAYS,
+};
 pub use pumpfun::PumpFunParams;
 pub use pumpswap::PumpSwapParams;
 pub use raydium_amm_v4::RaydiumAmmV4Params;
-pub use raydium_clmm::RaydiumClmmParams;
-pub use raydium_cpmm::{RaydiumCpmmParams, TokenTransferFee};
+pub use raydium_clmm::{
+    ClmmHopQuote, ClmmQuoteAccounts, ClmmQuoteState, RaydiumClmmParams, CLOCK_SYSVAR,
+    QUOTE_TICK_ARRAYS,
+};
+pub use raydium_cpmm::{
+    token_transfer_fee_for_epoch, CpmmQuoteAccounts, RaydiumCpmmParams, TokenTransferFee,
+};
 pub use stonkfun_preparation::PreparedStonkFunTrade;
 pub use stonkfun_quote_route::{
     StonkFunQuoteHop, StonkFunQuoteHopPreview, StonkFunQuoteRoute, StonkFunQuoteRoutePreview,

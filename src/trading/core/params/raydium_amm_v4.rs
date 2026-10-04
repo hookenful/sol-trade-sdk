@@ -1,4 +1,8 @@
 use crate::common::SolanaRpcClient;
+use crate::instruction::utils::raydium_amm_v4::accounts::{
+    SWAP_FEE_DENOMINATOR, SWAP_FEE_NUMERATOR,
+};
+use crate::instruction::utils::raydium_amm_v4_types::AmmInfo;
 use crate::trading::common::get_multi_token_balances;
 use solana_sdk::pubkey::Pubkey;
 
@@ -40,6 +44,8 @@ pub struct RaydiumAmmV4Params {
     pub coin_reserve: u64,
     /// Current pc reserve amount in the pool
     pub pc_reserve: u64,
+    /// Swap fee taken from the input, `swap_fee_numerator / swap_fee_denominator`
+    /// (the pool's `fees`; 25 / 10000 on standard pools).
     pub swap_fee_numerator: u64,
     pub swap_fee_denominator: u64,
 }
@@ -72,9 +78,16 @@ impl RaydiumAmmV4Params {
             serum_vault_signer: Pubkey::default(),
             coin_reserve,
             pc_reserve,
-            swap_fee_numerator: 25,
-            swap_fee_denominator: 10_000,
+            swap_fee_numerator: SWAP_FEE_NUMERATOR,
+            swap_fee_denominator: SWAP_FEE_DENOMINATOR,
         }
+    }
+
+    /// The pool's own swap fee, from its `fees`.
+    pub fn with_swap_fee(mut self, numerator: u64, denominator: u64) -> Self {
+        self.swap_fee_numerator = numerator;
+        self.swap_fee_denominator = denominator;
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -118,8 +131,10 @@ impl RaydiumAmmV4Params {
                 &amm_info.market,
                 market_state.vault_signer_nonce,
             )?;
-        let (coin_reserve, pc_reserve) =
+        let (coin_vault, pc_vault) =
             get_multi_token_balances(rpc, &amm_info.token_coin, &amm_info.token_pc).await?;
+        let (coin_reserve, pc_reserve) =
+            reserves_without_take_pnl(&amm_info, coin_vault, pc_vault)?;
         Ok(Self {
             amm,
             coin_mint: amm_info.coin_mint,
@@ -136,14 +151,60 @@ impl RaydiumAmmV4Params {
             serum_coin_vault_account: market_state.serum_coin_vault_account,
             serum_pc_vault_account: market_state.serum_pc_vault_account,
             serum_vault_signer,
-            coin_reserve: coin_reserve
-                .checked_sub(amm_info.out_put.need_take_pnl_coin)
-                .ok_or_else(|| anyhow::anyhow!("AMM coin PnL exceeds vault balance"))?,
-            pc_reserve: pc_reserve
-                .checked_sub(amm_info.out_put.need_take_pnl_pc)
-                .ok_or_else(|| anyhow::anyhow!("AMM pc PnL exceeds vault balance"))?,
+            coin_reserve,
+            pc_reserve,
             swap_fee_numerator: amm_info.fees.swap_fee_numerator,
             swap_fee_denominator: amm_info.fees.swap_fee_denominator,
         })
+    }
+
+    /// Addresses of the accounts a quote of `amm` reads: the pool, its coin
+    /// vault, its pc vault. `swap_base_in_v2` needs no market accounts.
+    pub fn quote_account_keys(amm: &Pubkey, amm_info: &AmmInfo) -> Vec<Pubkey> {
+        vec![*amm, amm_info.token_coin, amm_info.token_pc]
+    }
+
+    /// Params for `swap_base_in_v2` from the pool and vault accounts read
+    /// together, with the pool's swap fee and its reserves net of pnl.
+    pub fn from_quote_accounts(
+        amm: Pubkey,
+        amm_data: &[u8],
+        coin_vault: &[u8],
+        pc_vault: &[u8],
+    ) -> Result<Self, anyhow::Error> {
+        let amm_info = crate::instruction::utils::raydium_amm_v4_types::amm_info_decode(amm_data)
+            .ok_or_else(|| anyhow::anyhow!("{amm} is not a Raydium AMM v4 pool"))?;
+        let balance = |data: &[u8]| {
+            data.get(64..72)
+                .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+                .ok_or_else(|| anyhow::anyhow!("Raydium AMM v4 vault data is too short"))
+        };
+        let (coin_reserve, pc_reserve) =
+            reserves_without_take_pnl(&amm_info, balance(coin_vault)?, balance(pc_vault)?)?;
+        Ok(Self::new(
+            amm,
+            amm_info.coin_mint,
+            amm_info.pc_mint,
+            amm_info.token_coin,
+            amm_info.token_pc,
+            coin_reserve,
+            pc_reserve,
+        )
+        .with_swap_fee(amm_info.fees.swap_fee_numerator, amm_info.fees.swap_fee_denominator))
+    }
+}
+
+/// The reserves the program swaps against: vault balances without the pnl it
+/// has yet to take (`calc_total_without_take_pnl_no_orderbook`).
+pub fn reserves_without_take_pnl(
+    amm_info: &AmmInfo,
+    coin_vault: u64,
+    pc_vault: u64,
+) -> Result<(u64, u64), anyhow::Error> {
+    let coin = coin_vault.checked_sub(amm_info.out_put.need_take_pnl_coin);
+    let pc = pc_vault.checked_sub(amm_info.out_put.need_take_pnl_pc);
+    match (coin, pc) {
+        (Some(coin), Some(pc)) => Ok((coin, pc)),
+        _ => Err(anyhow::anyhow!("AMM v4 vaults hold less than the pnl the pool owes")),
     }
 }

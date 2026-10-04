@@ -123,6 +123,10 @@ impl SubscriptionAccountCache {
                     )?
                     .min_amount_out)
                 }
+                // Not prepared from this cache: it reads LaunchLab and CPMM pools.
+                StonkFunMemeLeg::MeteoraDbc(_) | StonkFunMemeLeg::MeteoraDammV2(_) => {
+                    Err(anyhow!("Meteora meme legs are not prepared from the subscription cache"))
+                }
             }
         };
         let (route, minimum) = if endpoint == quote {
@@ -159,7 +163,12 @@ impl SubscriptionAccountCache {
         };
         ensure!(minimum > 0, "StonkFun quote produces zero protected output");
         Ok(PreparedStonkFunTrade {
-            via: StonkFunViaQuoteParams { meme_leg: meme, sol_hop: StonkFunSolHop::Route(route) },
+            via: StonkFunViaQuoteParams {
+                meme_leg: meme,
+                sol_hop: StonkFunSolHop::Route(route),
+                quote_hop: None,
+                hop_slippage_basis_points: None,
+            },
             input_mint: if is_buy { asset } else { meme_mint },
             output_mint: if is_buy { meme_mint } else { asset },
             amount_in: request.amount_in,
