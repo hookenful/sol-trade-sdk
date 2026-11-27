@@ -1628,4 +1628,147 @@ mod tests {
         };
         assert_eq!(msg.config.loaded_accounts_data_size_limit, Some(SIXTEEN_MIB));
     }
+
+    #[tokio::test]
+    async fn http_429_and_json_rpc_error_do_not_trigger_false_success_in_result_collector() {
+        use crate::swqos::common::test_http::spawn_mock_http_server;
+        use crate::swqos::{
+            bloxroute::BloxrouteClient, flashblock::FlashBlockClient, jito::JitoClient,
+            node1::Node1Client, stellium::StelliumClient,
+        };
+
+        let jito_429 = spawn_mock_http_server(
+            "429 Too Many Requests",
+            r#"{"error":"rate limit"}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let blox_401 =
+            spawn_mock_http_server("401 Unauthorized", "unauthorized", Duration::ZERO).await;
+        let flash_500 =
+            spawn_mock_http_server("500 Internal Server Error", "down", Duration::ZERO).await;
+        let node1_rpc_err = spawn_mock_http_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","error":{"code":-32097,"message":"rate limited"},"id":1}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let stellium_ok = spawn_mock_http_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","result":"5healthySig","id":1}"#,
+            Duration::from_millis(80),
+        )
+        .await;
+
+        let rpc_url = "http://127.0.0.1:8899".to_string();
+        let clients: Vec<Arc<SwqosClient>> = vec![
+            Arc::new(JitoClient::new(rpc_url.clone(), jito_429.base_url.clone(), String::new())),
+            Arc::new(BloxrouteClient::new(
+                rpc_url.clone(),
+                blox_401.base_url.clone(),
+                "token".to_string(),
+            )),
+            Arc::new(FlashBlockClient::new(
+                rpc_url.clone(),
+                flash_500.base_url.clone(),
+                "token".to_string(),
+            )),
+            Arc::new(Node1Client::new(
+                rpc_url.clone(),
+                node1_rpc_err.base_url.clone(),
+                "token".to_string(),
+            )),
+            Arc::new(StelliumClient::new(
+                rpc_url.clone(),
+                stellium_ok.base_url.clone(),
+                "token".to_string(),
+            )),
+        ];
+
+        let strategy = GasFeeStrategy::new();
+        strategy.set_global_fee_strategy(200_000, 200_000, 1_000, 1_000, 0.002, 0.002);
+
+        let started = Instant::now();
+        let (success, signatures, error, timings) = tokio::time::timeout(
+            Duration::from_secs(3),
+            execute_parallel(
+                &clients,
+                Arc::new(Keypair::new()),
+                vec![],
+                vec![],
+                Some(Hash::new_unique()),
+                None,
+                None,
+                "http-error-no-false-success",
+                true,
+                false,
+                false, // wait_for_all_submits = false -> uses wait_for_first_submitted
+                true,
+                strategy.clone(),
+                false,
+                SenderConcurrencyConfig {
+                    sender_thread_cores: None,
+                    effective_core_ids: Arc::new(vec![]),
+                    max_sender_concurrency: 5,
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("execute_parallel must complete")
+        .expect("execute_parallel must not fail preparation");
+
+        assert!(success, "healthy Stellium lane should succeed");
+        assert!(
+            error.is_some(),
+            "earlier failing HTTP lanes should have recorded errors rather than swallowing them"
+        );
+        assert!(!signatures.is_empty());
+        assert!(
+            started.elapsed() >= Duration::from_millis(60),
+            "ResultCollector must wait for healthy delayed lane instead of returning early on 429/401/500/JSON-RPC error (elapsed={:?})",
+            started.elapsed()
+        );
+        assert!(
+            timings.iter().any(|t| t.swqos_type == SwqosType::Stellium),
+            "healthy Stellium lane must be included in winning timings: {timings:?}"
+        );
+
+        // When every HTTP lane returns an error, ResultCollector must report success = false.
+        let failing_clients: Vec<Arc<SwqosClient>> = clients[..4].to_vec();
+        let (all_fail_success, _sigs, all_fail_err, _timings) = tokio::time::timeout(
+            Duration::from_secs(3),
+            execute_parallel(
+                &failing_clients,
+                Arc::new(Keypair::new()),
+                vec![],
+                vec![],
+                Some(Hash::new_unique()),
+                None,
+                None,
+                "all-http-errors",
+                true,
+                false,
+                false,
+                true,
+                strategy,
+                false,
+                SenderConcurrencyConfig {
+                    sender_thread_cores: None,
+                    effective_core_ids: Arc::new(vec![]),
+                    max_sender_concurrency: 4,
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("failing execute_parallel must complete")
+        .expect("failing execute_parallel must return collector result");
+
+        assert!(
+            !all_fail_success,
+            "HTTP 429/401/500 and JSON-RPC error must never set success_flag in ResultCollector"
+        );
+        assert!(all_fail_err.is_some(), "last error must be preserved when all lanes fail");
+    }
 }

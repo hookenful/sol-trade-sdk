@@ -1,5 +1,6 @@
 use crate::swqos::common::{
-    default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode,
+    default_http_client_builder, parse_http_json_submit_response, poll_transaction_confirmation,
+    serialize_transaction_and_encode,
 };
 use rand::seq::IndexedRandom;
 use reqwest::Client;
@@ -108,6 +109,64 @@ impl FlashBlockClient {
         Ok(())
     }
 
+    fn validate_submit_response(
+        trade_type: TradeType,
+        elapsed: Duration,
+        status: reqwest::StatusCode,
+        response_text: &str,
+    ) -> Result<()> {
+        let response_json = parse_http_json_submit_response(
+            "FlashBlock",
+            trade_type,
+            elapsed,
+            status,
+            response_text,
+        )?;
+
+        if response_json.get("success") == Some(&serde_json::Value::Bool(false)) {
+            let detail = response_json
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(response_text);
+            if crate::common::sdk_log::sdk_log_enabled() {
+                crate::common::sdk_log::log_swqos_submission_failed(
+                    "FlashBlock",
+                    trade_type,
+                    elapsed,
+                    detail,
+                );
+            }
+            return Err(anyhow::anyhow!("FlashBlock submission failed: {detail}"));
+        }
+
+        let has_success_true = response_json.get("success") == Some(&serde_json::Value::Bool(true));
+        let has_result = response_json.get("result").is_some_and(|v| !v.is_null());
+        let has_data_signatures = response_json
+            .get("data")
+            .and_then(|d| d.get("signatures"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|arr| !arr.is_empty())
+            && response_json.get("code").is_none_or(|code| code == 200 || code == 0);
+
+        if has_success_true || has_result || has_data_signatures {
+            if crate::common::sdk_log::sdk_log_enabled() {
+                crate::common::sdk_log::log_swqos_submitted("FlashBlock", trade_type, elapsed);
+            }
+            return Ok(());
+        }
+
+        let detail = format!("unexpected JSON (missing result/success): {response_text}");
+        if crate::common::sdk_log::sdk_log_enabled() {
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "FlashBlock",
+                trade_type,
+                elapsed,
+                &detail,
+            );
+        }
+        Err(anyhow::anyhow!("FlashBlock submission failed: {detail}"))
+    }
+
     pub async fn send_transaction(
         &self,
         trade_type: TradeType,
@@ -126,7 +185,7 @@ impl FlashBlockClient {
         let url = format!("{}/api/v2/submit-batch", self.endpoint);
 
         // Send request to FlashBlock
-        let response_text = self
+        let response = self
             .http_client
             .post(&url)
             .body(request_body)
@@ -135,36 +194,11 @@ impl FlashBlockClient {
             .header("Connection", "keep-alive")
             .header("Keep-Alive", "timeout=30, max=1000")
             .send()
-            .await?
-            .text()
             .await?;
+        let status = response.status();
+        let response_text = response.text().await?;
 
-        // Parse response
-        if crate::common::sdk_log::sdk_log_enabled() {
-            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-                if response_json.get("success").is_some() || response_json.get("result").is_some() {
-                    crate::common::sdk_log::log_swqos_submitted(
-                        "FlashBlock",
-                        trade_type,
-                        start_time.elapsed(),
-                    );
-                } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(
-                        " [FlashBlock] {} submission failed after {:?}: {:?}",
-                        trade_type,
-                        start_time.elapsed(),
-                        _error
-                    );
-                }
-            } else {
-                crate::common::sdk_log::log_swqos_submission_failed(
-                    "FlashBlock",
-                    trade_type,
-                    start_time.elapsed(),
-                    response_text,
-                );
-            }
-        }
+        Self::validate_submit_response(trade_type, start_time.elapsed(), status, &response_text)?;
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
@@ -218,5 +252,80 @@ impl Drop for FlashBlockClient {
             return;
         }
         self.stop_ping.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::swqos::common::test_http::{dummy_versioned_transaction, spawn_mock_http_server};
+
+    fn test_client_for(endpoint: String) -> FlashBlockClient {
+        FlashBlockClient {
+            endpoint,
+            auth_token: "test-token".to_string(),
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            http_client: default_http_client_builder().build().unwrap(),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_http_429_401_500() {
+        let tx = dummy_versioned_transaction();
+        for (status_line, body, expected_code) in [
+            ("429 Too Many Requests", r#"{"error":"rate limited"}"#, "429"),
+            ("401 Unauthorized", "unauthorized", "401"),
+            ("500 Internal Server Error", "internal error", "500"),
+        ] {
+            let server = spawn_mock_http_server(status_line, body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            let err = client
+                .send_transaction(TradeType::Buy, &tx, false)
+                .await
+                .expect_err("non-2xx HTTP status must fail");
+            assert!(
+                err.to_string().contains(expected_code),
+                "expected error to mention {expected_code}, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_json_error_success_false_missing_result_and_invalid_json() {
+        let tx = dummy_versioned_transaction();
+        for body in [
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"rate limit"},"id":1}"#,
+            r#"{"success":false,"message":"tip too low"}"#,
+            r#"{"success":true,"error":"rejected"}"#,
+            r#"{"code":400,"message":"bad request"}"#,
+            r#"{}"#,
+            "not-json",
+        ] {
+            let server = spawn_mock_http_server("200 OK", body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            assert!(
+                client.send_transaction(TradeType::Buy, &tx, false).await.is_err(),
+                "expected error for response body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_accepts_success_true_result_and_data_signatures() {
+        let tx = dummy_versioned_transaction();
+        for body in [
+            r#"{"success":true}"#,
+            r#"{"jsonrpc":"2.0","result":"5sig","id":1}"#,
+            r#"{"code":200,"message":"ok","data":{"signatures":["5sig"]}}"#,
+        ] {
+            let server = spawn_mock_http_server("200 OK", body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            client
+                .send_transaction(TradeType::Buy, &tx, false)
+                .await
+                .unwrap_or_else(|e| panic!("expected Ok for {body}, got: {e}"));
+        }
     }
 }

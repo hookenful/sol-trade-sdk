@@ -1,6 +1,6 @@
 use crate::swqos::common::{
     default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode,
-    FormatBase64VersionedTransaction,
+    validate_json_rpc_submit_response, FormatBase64VersionedTransaction,
 };
 use rand::seq::IndexedRandom;
 use reqwest::Client;
@@ -153,39 +153,18 @@ impl JitoClient {
         } else {
             self.http_client.post(&endpoint).header("x-jito-auth", &self.auth_token)
         };
-        let response_text = response
-            .body(request_body)
-            .header("Content-Type", "application/json")
-            .send()
-            .await?
-            .text()
-            .await?;
+        let response =
+            response.body(request_body).header("Content-Type", "application/json").send().await?;
+        let status = response.status();
+        let response_text = response.text().await?;
 
-        if crate::common::sdk_log::sdk_log_enabled() {
-            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-                if response_json.get("result").is_some() {
-                    crate::common::sdk_log::log_swqos_submitted(
-                        "jito",
-                        trade_type,
-                        start_time.elapsed(),
-                    );
-                } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(
-                        " [jito] {} submission failed after {:?}: {:?}",
-                        trade_type,
-                        start_time.elapsed(),
-                        _error
-                    );
-                }
-            } else {
-                crate::common::sdk_log::log_swqos_submission_failed(
-                    "jito",
-                    trade_type,
-                    start_time.elapsed(),
-                    response_text,
-                );
-            }
-        }
+        validate_json_rpc_submit_response(
+            "jito",
+            trade_type,
+            start_time.elapsed(),
+            status,
+            &response_text,
+        )?;
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
@@ -247,28 +226,21 @@ impl JitoClient {
         } else {
             self.http_client.post(&endpoint).header("x-jito-auth", &self.auth_token)
         };
-        let response_text = response
+        let response = response
             .body(body.to_string())
             .header("Content-Type", "application/json")
             .send()
-            .await?
-            .text()
             .await?;
+        let status = response.status();
+        let response_text = response.text().await?;
 
-        if crate::common::sdk_log::sdk_log_enabled() {
-            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-                if response_json.get("result").is_some() {
-                    println!(" jito {} submitted: {:?}", trade_type, start_time.elapsed());
-                } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(
-                        " jito {} submission failed after {:?}: {:?}",
-                        trade_type,
-                        start_time.elapsed(),
-                        _error
-                    );
-                }
-            }
-        }
+        validate_json_rpc_submit_response(
+            "jito",
+            trade_type,
+            start_time.elapsed(),
+            status,
+            &response_text,
+        )?;
 
         Ok(())
     }
@@ -346,5 +318,122 @@ mod tests {
 
         drop(client);
         assert!(stop_ping.load(Ordering::Relaxed));
+    }
+
+    fn test_client_for(endpoint: String) -> JitoClient {
+        JitoClient {
+            endpoint,
+            auth_token: String::new(),
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            http_client: default_http_client_builder().build().unwrap(),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+            ping_handle: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_http_429_401_500() {
+        use crate::swqos::common::test_http::{
+            dummy_versioned_transaction, spawn_mock_http_server,
+        };
+
+        let tx = dummy_versioned_transaction();
+        for (status_line, body, expected_code) in [
+            ("429 Too Many Requests", r#"{"error":"rate limited"}"#, "429"),
+            ("401 Unauthorized", "unauthorized", "401"),
+            ("500 Internal Server Error", "internal error", "500"),
+        ] {
+            let server = spawn_mock_http_server(status_line, body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            let err = client
+                .send_transaction_impl(TradeType::Buy, &tx, false)
+                .await
+                .expect_err("non-2xx HTTP status must fail");
+            assert!(
+                err.to_string().contains(expected_code),
+                "expected error to mention {expected_code}, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_json_rpc_error_missing_result_and_invalid_json() {
+        use crate::swqos::common::test_http::{
+            dummy_versioned_transaction, spawn_mock_http_server,
+        };
+
+        let tx = dummy_versioned_transaction();
+        for body in [
+            r#"{"jsonrpc":"2.0","error":{"code":-32097,"message":"Rate limited"},"id":1}"#,
+            r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32000,"message":"bad tx"},"id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            "<html>bad gateway</html>",
+        ] {
+            let server = spawn_mock_http_server("200 OK", body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            assert!(
+                client.send_transaction_impl(TradeType::Buy, &tx, false).await.is_err(),
+                "expected error for response body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_accepts_valid_json_rpc_result() {
+        use crate::swqos::common::test_http::{
+            dummy_versioned_transaction, spawn_mock_http_server,
+        };
+
+        let tx = dummy_versioned_transaction();
+        let server = spawn_mock_http_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","result":"5sig","id":1}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let client = test_client_for(server.base_url.clone());
+        client
+            .send_transaction_impl(TradeType::Buy, &tx, false)
+            .await
+            .expect("valid JSON-RPC result should succeed");
+    }
+
+    #[tokio::test]
+    async fn send_transactions_bundle_validates_http_status_and_json_rpc() {
+        use crate::swqos::common::test_http::{
+            dummy_versioned_transaction, spawn_mock_http_server,
+        };
+
+        let txs = vec![dummy_versioned_transaction()];
+        for (status_line, body) in [
+            ("429 Too Many Requests", r#"{"error":"rate limited"}"#),
+            ("500 Internal Server Error", "boom"),
+            (
+                "200 OK",
+                r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"bundle rejected"},"id":1}"#,
+            ),
+            ("200 OK", r#"{"jsonrpc":"2.0","id":1}"#),
+            ("200 OK", "not-json"),
+        ] {
+            let server = spawn_mock_http_server(status_line, body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            assert!(
+                client.send_transactions_impl(TradeType::Buy, &txs, false).await.is_err(),
+                "expected bundle error for {status_line} / {body}"
+            );
+        }
+
+        let server = spawn_mock_http_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","result":"bundle-123","id":1}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let client = test_client_for(server.base_url.clone());
+        client
+            .send_transactions_impl(TradeType::Buy, &txs, false)
+            .await
+            .expect("valid bundle JSON-RPC result should succeed");
     }
 }
