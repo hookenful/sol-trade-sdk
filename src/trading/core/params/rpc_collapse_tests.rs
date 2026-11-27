@@ -50,7 +50,14 @@ use crate::instruction::utils::raydium_cpmm_types::{
 };
 use crate::trading::core::params::{
     BonkParams, MeteoraDammV2Params, MeteoraDbcParams, PumpFunImmutableMeta, PumpFunParams,
-    PumpSwapParams, RaydiumCpmmParams,
+    PumpSwapParams, RaydiumCpmmParams, TokenTransferFee, CLOCK_SYSVAR,
+};
+use spl_token_2022_interface::{
+    extension::{
+        transfer_fee::{TransferFee, TransferFeeConfig},
+        BaseStateWithExtensionsMut, ExtensionType, StateWithExtensionsMut,
+    },
+    state::Mint as Token2022Mint,
 };
 
 static NEXT_RPC_ID: AtomicU64 = AtomicU64::new(1);
@@ -61,6 +68,7 @@ type RpcRequestLog = Arc<Mutex<Vec<(RpcRequest, Vec<Pubkey>)>>>;
 struct CountingRpc {
     url: String,
     slot: u64,
+    epoch: u64,
     accounts: HashMap<Pubkey, (Pubkey, Vec<u8>)>,
     requests: RpcRequestLog,
 }
@@ -71,9 +79,15 @@ impl CountingRpc {
         Self {
             url: format!("counting-rpc://{id}"),
             slot,
+            epoch: 0,
             accounts: HashMap::new(),
             requests: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn epoch(mut self, epoch: u64) -> Self {
+        self.epoch = epoch;
+        self
     }
 
     fn account(mut self, key: Pubkey, owner: Pubkey, data: Vec<u8>) -> Self {
@@ -142,6 +156,14 @@ impl RpcSender for CountingRpc {
                     .collect();
                 Ok(json!({ "context": context, "value": values }))
             }
+            RpcRequest::GetEpochInfo => Ok(json!({
+                "absoluteSlot": self.slot,
+                "blockHeight": self.slot,
+                "epoch": self.epoch,
+                "slotIndex": 0,
+                "slotsInEpoch": 432_000,
+                "transactionCount": 0,
+            })),
             other => Err(rpc_err(format!("unexpected RPC request: {other:?}"))),
         }
     }
@@ -830,4 +852,297 @@ async fn pumpfun_from_mint_batches_into_one_rpc_and_cached_meta_skips_mint_and_g
     assert_eq!(upgraded.fee_sharing_creator_vault_if_active, Some(expected_sharing_vault));
     assert_eq!(upgraded.creator_vault, expected_sharing_vault);
     assert_eq!(reqs_sharing.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn pumpfun_cached_meta_honors_global_ttl_and_resolves_unknown_token_program_in_one_rpc() {
+    let mint = Pubkey::new_unique();
+    let creator = Pubkey::new_unique();
+    let stale_fee = Pubkey::new_unique();
+    let fresh_global_fee = Pubkey::new_unique();
+    let curve_pda = get_bonding_curve_pda(&mint).unwrap();
+    let sharing_pda = get_fee_sharing_config_pda(&mint).unwrap();
+
+    // 1. Cold RPC with a rotated Global fee recipient must refresh Global in the same
+    // single GetMultipleAccounts batch rather than serving stale `cached.fee_recipient`.
+    let rpc_builder = CountingRpc::new(810)
+        .account(
+            curve_pda,
+            pf_accounts::PUMPFUN,
+            encode_pumpfun_bonding_curve(creator, 900_000, 40_000, false, false, false),
+        )
+        .account(
+            pf_global::GLOBAL_ACCOUNT,
+            pf_accounts::PUMPFUN,
+            encode_pumpfun_global(fresh_global_fee),
+        );
+    let requests = rpc_builder.requests();
+    let rpc = rpc_builder.client();
+
+    let stale_meta = PumpFunImmutableMeta {
+        token_program: TOKEN_PROGRAM,
+        creator,
+        creator_vault: get_creator_vault_pda(&creator).unwrap(),
+        is_mayhem_mode: false,
+        is_cashback_coin: false,
+        quote_mint: WSOL_TOKEN_ACCOUNT,
+        fee_sharing_creator_vault_if_active: None,
+        fee_recipient: stale_fee,
+    };
+
+    let refreshed = PumpFunParams::from_cached_meta_by_rpc(&rpc, &mint, &stale_meta).await.unwrap();
+    assert_eq!(
+        refreshed.fee_recipient, fresh_global_fee,
+        "cold global cache must refresh GLOBAL_ACCOUNT instead of pinning stale fee_recipient"
+    );
+    assert_eq!(refreshed.token_program, TOKEN_PROGRAM);
+    {
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, RpcRequest::GetMultipleAccounts);
+        assert_eq!(reqs[0].1, vec![curve_pda, sharing_pda, pf_global::GLOBAL_ACCOUNT]);
+    }
+
+    // 2. Second call on the same RPC hits the 90s Global TTL cache and omits GLOBAL_ACCOUNT.
+    requests.lock().unwrap().clear();
+    let warm = PumpFunParams::from_cached_meta_by_rpc(&rpc, &mint, &stale_meta).await.unwrap();
+    assert_eq!(warm.fee_recipient, fresh_global_fee);
+    {
+        let reqs = requests.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].1, vec![curve_pda, sharing_pda]);
+    }
+
+    // 3. Mayhem coins keep their cached mayhem fee recipient without reading GLOBAL_ACCOUNT.
+    let mayhem_fee = pf_global::MAYHEM_FEE_RECIPIENTS[0];
+    let rpc_mayhem = CountingRpc::new(811).account(
+        curve_pda,
+        pf_accounts::PUMPFUN,
+        encode_pumpfun_bonding_curve(creator, 900_000, 40_000, false, true, false),
+    );
+    let mayhem_reqs = rpc_mayhem.requests();
+    let mayhem_meta =
+        PumpFunImmutableMeta { is_mayhem_mode: true, fee_recipient: mayhem_fee, ..stale_meta };
+    let mayhem_params =
+        PumpFunParams::from_cached_meta_by_rpc(&rpc_mayhem.client(), &mint, &mayhem_meta)
+            .await
+            .unwrap();
+    assert_eq!(mayhem_params.fee_recipient, mayhem_fee);
+    {
+        let reqs = mayhem_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert!(!reqs[0].1.contains(&pf_global::GLOBAL_ACCOUNT));
+    }
+
+    // 4. Unknown `token_program == Pubkey::default()` resolves a legacy SPL Token mint in the
+    // same single GetMultipleAccounts batch without fabricating TOKEN_PROGRAM_2022.
+    let legacy_mint = Pubkey::new_unique();
+    let legacy_curve = get_bonding_curve_pda(&legacy_mint).unwrap();
+    let legacy_sharing = get_fee_sharing_config_pda(&legacy_mint).unwrap();
+    let rpc_legacy = CountingRpc::new(812)
+        .account(
+            legacy_curve,
+            pf_accounts::PUMPFUN,
+            encode_pumpfun_bonding_curve(creator, 900_000, 40_000, false, false, false),
+        )
+        .account(legacy_mint, TOKEN_PROGRAM, spl_mint_bytes(1_000_000))
+        .account(
+            pf_global::GLOBAL_ACCOUNT,
+            pf_accounts::PUMPFUN,
+            encode_pumpfun_global(fresh_global_fee),
+        );
+    let legacy_reqs = rpc_legacy.requests();
+    let unknown_tp_meta = PumpFunImmutableMeta {
+        token_program: Pubkey::default(),
+        fee_recipient: Pubkey::default(),
+        ..stale_meta
+    };
+    let legacy_params = PumpFunParams::from_cached_meta_by_rpc(
+        &rpc_legacy.client(),
+        &legacy_mint,
+        &unknown_tp_meta,
+    )
+    .await
+    .unwrap();
+    assert_eq!(legacy_params.token_program, TOKEN_PROGRAM);
+    assert_eq!(legacy_params.fee_recipient, fresh_global_fee);
+    {
+        let reqs = legacy_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, RpcRequest::GetMultipleAccounts);
+        assert_eq!(
+            reqs[0].1,
+            vec![legacy_curve, legacy_mint, legacy_sharing, pf_global::GLOBAL_ACCOUNT]
+        );
+    }
+}
+
+fn clock_sysvar_bytes(epoch: u64) -> Vec<u8> {
+    let mut data = vec![0u8; 40];
+    data[16..24].copy_from_slice(&epoch.to_le_bytes());
+    data
+}
+
+fn token_2022_mint_with_transfer_fee(
+    supply: u64,
+    newer_epoch: u64,
+    older_bps: u16,
+    older_max: u64,
+    newer_bps: u16,
+    newer_max: u64,
+) -> Vec<u8> {
+    let len = ExtensionType::try_calculate_account_len::<Token2022Mint>(&[
+        ExtensionType::TransferFeeConfig,
+    ])
+    .unwrap();
+    let mut data = vec![0u8; len];
+    let mut state =
+        StateWithExtensionsMut::<Token2022Mint>::unpack_uninitialized(&mut data).unwrap();
+    state.base = Token2022Mint { supply, decimals: 6, is_initialized: true, ..Default::default() };
+    state.pack_base();
+    state.init_account_type().unwrap();
+    let ext = state.init_extension::<TransferFeeConfig>(true).unwrap();
+    ext.older_transfer_fee = TransferFee {
+        epoch: 0u64.into(),
+        maximum_fee: older_max.into(),
+        transfer_fee_basis_points: older_bps.into(),
+    };
+    ext.newer_transfer_fee = TransferFee {
+        epoch: newer_epoch.into(),
+        maximum_fee: newer_max.into(),
+        transfer_fee_basis_points: newer_bps.into(),
+    };
+    data
+}
+
+#[tokio::test]
+async fn bonk_and_cpmm_token2022_transfer_fee_uses_clock_or_falls_back_to_epoch_info() {
+    let base_mint = Pubkey::new_unique();
+    let quote_mint = Pubkey::new_unique();
+    let fee_mint_bytes = token_2022_mint_with_transfer_fee(1_000_000, 10, 150, 5_000, 325, 9_000);
+    let expected_older = TokenTransferFee { basis_points: 150, maximum_fee: 5_000 };
+    let expected_newer = TokenTransferFee { basis_points: 325, maximum_fee: 9_000 };
+
+    // --- LaunchLab (BonkParams::from_pool_state) ---
+    let bonk_pool = Pubkey::new_unique();
+    let global_config = Pubkey::new_unique();
+    let platform_config = Pubkey::new_unique();
+    let bonk_state = BonkPoolState {
+        global_config,
+        platform_config,
+        base_mint,
+        quote_mint,
+        base_vault: Pubkey::new_unique(),
+        quote_vault: Pubkey::new_unique(),
+        creator: Pubkey::new_unique(),
+        virtual_base: 1_000_000_000,
+        virtual_quote: 30_000_000_000,
+        ..BonkPoolState::default()
+    };
+
+    // With CLOCK_SYSVAR at epoch 12 (>= 10): 1 GetMultipleAccounts RPC, 0 GetEpochInfo, newer fee.
+    let bonk_with_clock = CountingRpc::new(900)
+        .account(base_mint, TOKEN_PROGRAM_2022, fee_mint_bytes.clone())
+        .account(quote_mint, TOKEN_PROGRAM, spl_mint_bytes(1_000_000))
+        .account(global_config, BONK, bonk_global_config_bytes(2_500))
+        .account(platform_config, BONK, bonk_platform_config_bytes(10_000, 1_000))
+        .account(CLOCK_SYSVAR, solana_sdk::sysvar::ID, clock_sysvar_bytes(12));
+    let bonk_clock_reqs = bonk_with_clock.requests();
+    let bonk_params_clock =
+        BonkParams::from_pool_state(&bonk_with_clock.client(), &bonk_pool, &bonk_state)
+            .await
+            .unwrap();
+    assert_eq!(bonk_params_clock.base_transfer_fee, expected_newer);
+    assert_eq!(bonk_params_clock.quote_transfer_fee, TokenTransferFee::default());
+    {
+        let reqs = bonk_clock_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, RpcRequest::GetMultipleAccounts);
+    }
+
+    // Without CLOCK_SYSVAR: falls back to GetEpochInfo (epoch 7 < 10 -> older fee).
+    let bonk_no_clock = CountingRpc::new(901)
+        .epoch(7)
+        .account(base_mint, TOKEN_PROGRAM_2022, fee_mint_bytes.clone())
+        .account(quote_mint, TOKEN_PROGRAM, spl_mint_bytes(1_000_000))
+        .account(global_config, BONK, bonk_global_config_bytes(2_500))
+        .account(platform_config, BONK, bonk_platform_config_bytes(10_000, 1_000));
+    let bonk_no_clock_reqs = bonk_no_clock.requests();
+    let bonk_params_fallback =
+        BonkParams::from_pool_state(&bonk_no_clock.client(), &bonk_pool, &bonk_state)
+            .await
+            .unwrap();
+    assert_eq!(bonk_params_fallback.base_transfer_fee, expected_older);
+    {
+        let reqs = bonk_no_clock_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].0, RpcRequest::GetMultipleAccounts);
+        assert_eq!(reqs[1].0, RpcRequest::GetEpochInfo);
+    }
+
+    // --- Raydium CPMM (RaydiumCpmmParams::from_pool_state) ---
+    let cpmm_pool = Pubkey::new_unique();
+    let amm_config = Pubkey::new_unique();
+    let vault0 = Pubkey::new_unique();
+    let vault1 = Pubkey::new_unique();
+    let cpmm_state = CpmmPoolState {
+        amm_config,
+        token0_vault: vault0,
+        token1_vault: vault1,
+        token0_mint: base_mint,
+        token1_mint: quote_mint,
+        token0_program: TOKEN_PROGRAM_2022,
+        token1_program: TOKEN_PROGRAM,
+        observation_key: Pubkey::new_unique(),
+        ..CpmmPoolState::default()
+    };
+    let amm_config_bytes = encode_amm_config(&AmmConfig {
+        trade_fee_rate: 2_500,
+        protocol_fee_rate: 120_000,
+        fund_fee_rate: 40_000,
+        creator_fee_rate: 1_000,
+        ..AmmConfig::default()
+    });
+
+    // With CLOCK_SYSVAR at epoch 12: 1 GetMultipleAccounts RPC, 0 GetEpochInfo, newer fee.
+    let cpmm_with_clock = CountingRpc::new(902)
+        .account(amm_config, RAYDIUM_CPMM, amm_config_bytes.clone())
+        .account(vault0, TOKEN_PROGRAM_2022, spl_token_account_bytes(base_mint, 1_000))
+        .account(vault1, TOKEN_PROGRAM, spl_token_account_bytes(quote_mint, 2_000))
+        .account(base_mint, TOKEN_PROGRAM_2022, fee_mint_bytes.clone())
+        .account(quote_mint, TOKEN_PROGRAM, spl_mint_bytes(1_000_000))
+        .account(CLOCK_SYSVAR, solana_sdk::sysvar::ID, clock_sysvar_bytes(12));
+    let cpmm_clock_reqs = cpmm_with_clock.requests();
+    let cpmm_params_clock =
+        RaydiumCpmmParams::from_pool_state(&cpmm_with_clock.client(), &cpmm_pool, &cpmm_state)
+            .await
+            .unwrap();
+    assert_eq!(cpmm_params_clock.base_transfer_fee, expected_newer);
+    assert_eq!(cpmm_params_clock.quote_transfer_fee, TokenTransferFee::default());
+    {
+        let reqs = cpmm_clock_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].0, RpcRequest::GetMultipleAccounts);
+    }
+
+    // Without CLOCK_SYSVAR: falls back to GetEpochInfo (epoch 7 -> older fee).
+    let cpmm_no_clock = CountingRpc::new(903)
+        .epoch(7)
+        .account(amm_config, RAYDIUM_CPMM, amm_config_bytes)
+        .account(vault0, TOKEN_PROGRAM_2022, spl_token_account_bytes(base_mint, 1_000))
+        .account(vault1, TOKEN_PROGRAM, spl_token_account_bytes(quote_mint, 2_000))
+        .account(base_mint, TOKEN_PROGRAM_2022, fee_mint_bytes)
+        .account(quote_mint, TOKEN_PROGRAM, spl_mint_bytes(1_000_000));
+    let cpmm_no_clock_reqs = cpmm_no_clock.requests();
+    let cpmm_params_fallback =
+        RaydiumCpmmParams::from_pool_state(&cpmm_no_clock.client(), &cpmm_pool, &cpmm_state)
+            .await
+            .unwrap();
+    assert_eq!(cpmm_params_fallback.base_transfer_fee, expected_older);
+    {
+        let reqs = cpmm_no_clock_reqs.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].0, RpcRequest::GetMultipleAccounts);
+        assert_eq!(reqs[1].0, RpcRequest::GetEpochInfo);
+    }
 }

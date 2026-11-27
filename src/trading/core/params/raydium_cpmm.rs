@@ -257,14 +257,16 @@ impl RaydiumCpmmParams {
         let keys = Self::quote_account_keys(pool_address, &pool);
         let accounts = rpc.get_multiple_accounts(&keys).await?;
         let data = |index: usize| {
-            accounts[index]
-                .as_ref()
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
                 .map(|account| account.data.as_slice())
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
         };
         let owner = |index: usize| {
-            accounts[index]
-                .as_ref()
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
                 .map(|account| account.owner)
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
         };
@@ -272,7 +274,7 @@ impl RaydiumCpmmParams {
         let token_1_mint = (owner(5)?, data(5)?);
         // RPCs return the clock with the rest; only query `get_epoch_info` if
         // the clock is missing AND a Token-2022 mint actually configures a transfer fee.
-        let clock = match &accounts[6] {
+        let clock = match accounts.get(6).and_then(Option::as_ref) {
             Some(account) => account.data.clone(),
             None => {
                 let mut clock = vec![0u8; 40];
@@ -318,20 +320,22 @@ impl RaydiumCpmmParams {
         ];
         let accounts = rpc.get_multiple_accounts(&keys).await?;
         let data = |index: usize| {
-            accounts[index]
-                .as_ref()
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
                 .map(|account| account.data.as_slice())
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
         };
         let owner = |index: usize| {
-            accounts[index]
-                .as_ref()
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
                 .map(|account| account.owner)
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
         };
         let token_0_mint = (owner(3)?, data(3)?);
         let token_1_mint = (owner(4)?, data(4)?);
-        let epoch = match &accounts[5] {
+        let epoch = match accounts.get(5).and_then(Option::as_ref) {
             Some(account) => account
                 .data
                 .get(16..24)

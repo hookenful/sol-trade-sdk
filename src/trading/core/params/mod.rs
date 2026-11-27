@@ -18,13 +18,13 @@ pub(crate) use pumpswap_route_search::{canonical_conversion_pools, ConversionGra
 mod raydium_amm_v4;
 mod raydium_clmm;
 mod raydium_cpmm;
+#[cfg(test)]
+mod rpc_collapse_tests;
 mod stonkfun_preparation;
 mod stonkfun_quote_route;
 mod stonkfun_via_sol;
 mod subscription_cache;
 mod whirlpool;
-#[cfg(test)]
-mod rpc_collapse_tests;
 
 pub use bonk::{BonkParams, LaunchLabParams, StonkFunParams};
 pub use cached_quote::{

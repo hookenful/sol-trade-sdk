@@ -429,9 +429,10 @@ impl PumpFunParams {
     /// Exit fast path using cached immutable per-mint fields (`token_program`, `creator`,
     /// `creator_vault`, `is_mayhem_mode`, `is_cashback_coin`, `quote_mint`).
     ///
-    /// Performs a single RPC to refresh live bonding curve reserves/completion (and checks
-    /// `SharingConfig` in the same batch when fee sharing was not yet active, or Global only
-    /// if no fee recipient is cached), never re-reading the mint account.
+    /// Performs a single batched `getMultipleAccounts` RPC to refresh live bonding curve
+    /// reserves/completion, checking `SharingConfig` when fee sharing was not yet active,
+    /// `Global` when the 90s global fee-recipient cache is cold (for non-mayhem coins),
+    /// and the mint account only when `cached.token_program` is unset.
     pub async fn from_cached_meta_by_rpc(
         rpc: &SolanaRpcClient,
         mint: &Pubkey,
@@ -451,14 +452,26 @@ impl PumpFunParams {
         } else {
             None
         };
-        let known_fee_recipient = if cached.fee_recipient != Pubkey::default() {
+        // Mayhem coins use a dedicated mayhem fee recipient; normal coins must honor
+        // the 90s Global fee-recipient TTL cache so protocol fee-recipient rotations
+        // propagate without using a stale per-mint entry.
+        let known_fee_recipient = if cached.is_mayhem_mode
+            && global_constants::MAYHEM_FEE_RECIPIENTS.contains(&cached.fee_recipient)
+        {
             Some(cached.fee_recipient)
         } else {
             cached_global_fee_recipient(rpc)
         };
 
-        let mut keys = Vec::with_capacity(3);
+        let mut keys = Vec::with_capacity(4);
         keys.push(bonding_curve_pda);
+        let mint_idx = if cached.token_program == Pubkey::default() {
+            let idx = keys.len();
+            keys.push(*mint);
+            Some(idx)
+        } else {
+            None
+        };
         let sharing_idx = fee_sharing_pda.map(|pda| {
             let idx = keys.len();
             keys.push(pda);
@@ -503,19 +516,26 @@ impl PumpFunParams {
             recipient
         } else {
             let idx = global_idx.expect("global account requested when fee recipient unknown");
-            let global_account = accounts
-                .get(idx)
-                .and_then(Option::as_ref)
-                .ok_or_else(|| anyhow::anyhow!("PumpFun Global account not found"))?;
-            let recipient = decode_global_fee_recipient_account(global_account)?;
-            cache_global_fee_recipient(rpc, recipient);
-            recipient
+            if let Some(global_account) = accounts.get(idx).and_then(Option::as_ref) {
+                let recipient = decode_global_fee_recipient_account(global_account)?;
+                cache_global_fee_recipient(rpc, recipient);
+                recipient
+            } else if cached.fee_recipient != Pubkey::default() {
+                cached.fee_recipient
+            } else {
+                return Err(anyhow::anyhow!("PumpFun Global account not found"));
+            }
         };
 
         let token_program = if cached.token_program != Pubkey::default() {
             cached.token_program
         } else {
-            crate::constants::TOKEN_PROGRAM_2022
+            let idx = mint_idx.expect("mint account requested when token_program unknown");
+            accounts
+                .get(idx)
+                .and_then(Option::as_ref)
+                .map(|account| account.owner)
+                .ok_or_else(|| anyhow::anyhow!("PumpFun mint account {mint} not found"))?
         };
         let associated_bonding_curve =
             crate::common::fast_fn::get_associated_token_address_with_program_id_fast(

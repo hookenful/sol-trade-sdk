@@ -232,13 +232,10 @@ impl MeteoraDbcParams {
         };
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs());
-        // Only fees that change with time need the slot, taken directly from `context.slot`.
+        // Slot-based configs need the current slot for fee schedulers and rate limiters,
+        // taken directly from `context.slot` without an extra `get_slot` RPC.
         let slot =
-            if config.activation_type == ACTIVATION_SLOT && config.base_fee.second_factor != 0 {
-                response.context.slot
-            } else {
-                0
-            };
+            if config.activation_type == ACTIVATION_SLOT { response.context.slot } else { 0 };
         let point = current_point(&config, slot, now);
         // Priced as a sale: a rate-limited buy pays more, by its size.
         let fee_numerator = fee_numerator(
