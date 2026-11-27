@@ -12,7 +12,7 @@ use solana_sdk::signer::Signer;
 use solana_sdk::{signature::Keypair, transaction::VersionedTransaction};
 use std::time::Instant;
 use std::{
-    net::{SocketAddr, ToSocketAddrs as _},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::Arc,
     time::Duration,
 };
@@ -127,12 +127,9 @@ impl SoyasClient {
         transport.max_idle_timeout(Some(IdleTimeout::try_from(MAX_IDLE_TIMEOUT)?));
         client_config.transport_config(Arc::new(transport));
 
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse()?)?;
+        let addr = resolve_quic_addr(&endpoint_string).await?;
+        let mut endpoint = Endpoint::client(local_bind_addr(addr))?;
         endpoint.set_default_client_config(client_config.clone());
-        let addr = endpoint_string
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Address not resolved"))?;
         let connection = endpoint.connect(addr, SOYAS_SERVER)?.await?;
 
         Ok(Self {
@@ -256,5 +253,39 @@ impl SwqosClientTrait for SoyasClient {
 
     fn get_swqos_type(&self) -> SwqosType {
         SwqosType::Soyas
+    }
+}
+
+async fn resolve_quic_addr(endpoint_string: &str) -> Result<SocketAddr> {
+    let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(endpoint_string)
+        .await
+        .with_context(|| format!("Failed to resolve Soyas QUIC endpoint: {endpoint_string}"))?
+        .collect();
+    addrs.sort_by_key(|addr| if addr.is_ipv4() { 0 } else { 1 });
+    addrs.into_iter().next().ok_or_else(|| anyhow::anyhow!("Address not resolved"))
+}
+
+fn local_bind_addr(remote: SocketAddr) -> SocketAddr {
+    match remote.ip() {
+        IpAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        IpAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn resolve_quic_addr_resolves_literal_and_rejects_invalid_host() {
+        let addr = resolve_quic_addr("127.0.0.1:443").await.unwrap();
+        assert_eq!(addr, "127.0.0.1:443".parse::<SocketAddr>().unwrap());
+        assert!(local_bind_addr(addr).is_ipv4());
+
+        let v6 = resolve_quic_addr("[::1]:443").await.unwrap();
+        assert!(v6.is_ipv6());
+        assert!(local_bind_addr(v6).is_ipv6());
+
+        assert!(resolve_quic_addr("not-a-valid-host-missing-port").await.is_err());
     }
 }

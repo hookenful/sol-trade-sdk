@@ -834,9 +834,11 @@ impl TradingInfrastructure {
         let mut swqos_clients: Vec<Arc<SwqosClient>> = vec![];
         for swqos in &swqos_configs {
             if swqos.is_blacklisted() {
-                if sdk_log::sdk_log_enabled() {
-                    warn!(target: "sol_trade_sdk", "⚠️ SWQOS {:?} is blacklisted, skipping", swqos.swqos_type());
-                }
+                warn!(
+                    target: "sol_trade_sdk",
+                    "⚠️ SWQOS {:?} is blacklisted in SWQOS_BLACKLIST, skipping",
+                    swqos.swqos_type()
+                );
                 continue;
             }
             match tokio::time::timeout(
@@ -1084,7 +1086,8 @@ pub struct TradeBuyParams {
     /// Whether to simulate the transaction instead of executing it
     pub simulate: bool,
     /// Use exact quote-input buy instructions (legacy PumpFun uses SOL quote; V2/PumpSwap use generic quote).
-    /// When Some(true) or None (default), the exact SOL/quote amount is spent and slippage is applied to output tokens.
+    /// When Some(true) or None (default), the exact SOL/quote amount is spent and slippage is applied to output tokens
+    /// (both behave identically across PumpFun and PumpSwap; pass 100% slippage / 10_000 bps for a 1-token floor).
     /// When Some(false), uses regular buy instruction where slippage is applied to SOL/quote input.
     /// This option only applies to PumpFun and PumpSwap DEXes; it is ignored for other DEXes.
     pub use_exact_sol_amount: Option<bool>,
