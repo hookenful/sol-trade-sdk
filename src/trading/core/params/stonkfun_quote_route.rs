@@ -1,4 +1,4 @@
-//! Explicit, externally quoted StonkFun quote-conversion routes.
+//! Explicit conversion routes shared by StonkFun, PumpSwap and Pump.fun curves.
 use super::raydium_cpmm::TokenTransferFee;
 use super::{
     MeteoraDlmmParams, RaydiumAmmV4Params, RaydiumClmmParams, RaydiumCpmmParams, WhirlpoolParams,
@@ -7,12 +7,44 @@ use solana_sdk::pubkey::Pubkey;
 
 #[derive(Clone)]
 pub enum StonkFunQuoteVenue {
+    /// Compact V3 inner curve. The hop minimum overrides params.minimum_output_amount.
+    PumpFunV3 {
+        mint: Pubkey,
+        params: super::PumpFunV3Params,
+    },
+    /// Pump.fun bonding curve, not PumpSwap or LaunchLab. Supply a current
+    /// curve snapshot and verified zero transfer-fee snapshots for both mints.
+    /// Use the quote mint's actual owner (SPL Token or Token-2022).
+    PumpFun {
+        mint: Pubkey,
+        curve: super::PumpFunParams,
+        quote_token_program: Pubkey,
+        base_transfer_fee: TokenTransferFee,
+        quote_transfer_fee: TokenTransferFee,
+    },
+    /// PumpSwap legacy exact-input leg. Supply current fee snapshots for both
+    /// mints; transfer-fee-bearing PumpSwap routes are not supported here.
+    PumpSwap {
+        pool: super::PumpSwapParams,
+        base_transfer_fee: TokenTransferFee,
+        quote_transfer_fee: TokenTransferFee,
+    },
     RaydiumCpmm(RaydiumCpmmParams),
     RaydiumAmmV4(RaydiumAmmV4Params),
     RaydiumClmm(RaydiumClmmParams),
     OrcaWhirlpool(WhirlpoolParams),
     MeteoraDlmm(MeteoraDlmmParams),
 }
+
+/// Explicit funding conversion plus PumpSwap legs, executed atomically.
+pub type PumpSwapQuoteRoute = StonkFunQuoteRoute;
+pub type PumpSwapQuoteHop = StonkFunQuoteHop;
+pub type PumpSwapQuoteVenue = StonkFunQuoteVenue;
+
+/// Explicit funding conversion plus a Pump.fun bonding-curve trade.
+pub type PumpFunQuoteRoute = StonkFunQuoteRoute;
+pub type PumpFunQuoteHop = StonkFunQuoteHop;
+pub type PumpFunQuoteVenue = StonkFunQuoteVenue;
 
 /// One exact-input swap. Obtain fresh min-out quotes and amount-appropriate
 /// tick/bin arrays before building. Historical parser amounts are not quotes.
@@ -78,6 +110,9 @@ impl StonkFunQuoteHop {
 pub struct StonkFunQuoteRoute {
     pub buy_hops: Vec<StonkFunQuoteHop>,
     pub sell_hops: Vec<StonkFunQuoteHop>,
+    /// Auto prefers official Pump execution only with an explicit official final limit.
+    pub buy_execution: crate::PumpRouteOptions,
+    pub sell_execution: crate::PumpRouteOptions,
 }
 
 /// Preflight amounts and account requirements for an explicitly quoted route.
@@ -98,7 +133,9 @@ pub struct StonkFunQuoteHopPreview {
 }
 
 impl StonkFunQuoteRoute {
-    /// Validate without RPC or instructions. Pool state and quotes must be fresh.
+    /// Preview the sequential hop plan without RPC or instructions.
+    /// This is not an official multi_hop_swap quote; execution options are not applied.
+    /// Pool state and quotes must be fresh.
     pub fn preview(
         &self,
         input_mint: Pubkey,
@@ -132,13 +169,23 @@ impl StonkFunQuoteRoute {
         })
     }
     pub fn buy(hops: Vec<StonkFunQuoteHop>) -> Self {
-        Self { buy_hops: hops, sell_hops: Vec::new() }
+        Self { buy_hops: hops, sell_hops: Vec::new(), ..Self::default() }
     }
     pub fn sell(hops: Vec<StonkFunQuoteHop>) -> Self {
-        Self { buy_hops: Vec::new(), sell_hops: hops }
+        Self { buy_hops: Vec::new(), sell_hops: hops, ..Self::default() }
     }
     pub fn with_sell_hops(mut self, hops: Vec<StonkFunQuoteHop>) -> Self {
         self.sell_hops = hops;
+        self
+    }
+
+    pub fn with_buy_execution(mut self, options: crate::PumpRouteOptions) -> Self {
+        self.buy_execution = options;
+        self
+    }
+
+    pub fn with_sell_execution(mut self, options: crate::PumpRouteOptions) -> Self {
+        self.sell_execution = options;
         self
     }
 }

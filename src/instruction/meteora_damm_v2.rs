@@ -26,33 +26,31 @@ use solana_sdk::{
 /// Instruction builder for RaydiumCpmm protocol
 pub struct MeteoraDammV2InstructionBuilder;
 
-/// Whether the token a buy receives, or a sale spends, is the pool's token A.
-/// A caller that names neither pool mint trades the pool's token against its
-/// WSOL or USDC side.
-fn traded_is_token_a(
+/// Whether the input side of the swap is the pool's token A.
+/// Both `input_mint` and `output_mint` (with native SOL normalized to WSOL)
+/// must match opposite sides of the DAMM v2 pool.
+fn resolve_is_a_in(
     pool: &MeteoraDammV2Params,
-    traded_mint: Pubkey,
-    is_buy: bool,
+    input_mint: Pubkey,
+    output_mint: Pubkey,
 ) -> Result<bool> {
-    let traded = if traded_mint == crate::constants::SOL_TOKEN_ACCOUNT {
+    let requested_input = if input_mint == crate::constants::SOL_TOKEN_ACCOUNT {
         crate::constants::WSOL_TOKEN_ACCOUNT
     } else {
-        traded_mint
+        input_mint
     };
-    if traded == pool.token_a_mint {
-        return Ok(true);
-    }
-    if traded == pool.token_b_mint {
-        return Ok(false);
-    }
-    let is_currency = |mint: &Pubkey| {
-        *mint == crate::constants::WSOL_TOKEN_ACCOUNT
-            || *mint == crate::constants::USDC_TOKEN_ACCOUNT
+    let requested_output = if output_mint == crate::constants::SOL_TOKEN_ACCOUNT {
+        crate::constants::WSOL_TOKEN_ACCOUNT
+    } else {
+        output_mint
     };
-    if !is_currency(&pool.token_a_mint) && !is_currency(&pool.token_b_mint) {
-        return Err(anyhow!("Pool must contain WSOL or USDC"));
+    let is_a_in = requested_input == pool.token_a_mint;
+    if !((is_a_in && requested_output == pool.token_b_mint)
+        || (requested_input == pool.token_b_mint && requested_output == pool.token_a_mint))
+    {
+        return Err(anyhow!("Input/output mints must match opposite DAMM v2 pool sides"));
     }
-    Ok(if is_buy { !is_currency(&pool.token_a_mint) } else { is_currency(&pool.token_b_mint) })
+    Ok(is_a_in)
 }
 
 /// `swap2`'s `(amount_0, amount_1)`: the input and its minimum output, or for
@@ -104,7 +102,7 @@ impl InstructionBuilder for MeteoraDammV2InstructionBuilder {
         // ========================================
         // Trade calculation and account address preparation
         // ========================================
-        let is_a_in = !traded_is_token_a(protocol_params, params.output_mint, true)?;
+        let is_a_in = resolve_is_a_in(protocol_params, params.input_mint, params.output_mint)?;
         let input_mint =
             if is_a_in { protocol_params.token_a_mint } else { protocol_params.token_b_mint };
         let input_token_program =
@@ -163,9 +161,8 @@ impl InstructionBuilder for MeteoraDammV2InstructionBuilder {
         // When there is no referral, Anchor/optional encoding uses the program
         // id as the None placeholder; omitting it shifts event_authority and
         // triggers ConstraintSeeds (2006).
-        let mut account_metas = Vec::with_capacity(
-            14 + usize::from(protocol_params.include_rate_limiter_sysvar),
-        );
+        let mut account_metas =
+            Vec::with_capacity(14 + usize::from(protocol_params.include_rate_limiter_sysvar));
         account_metas.extend([
             accounts::AUTHORITY_META,                      // Pool Authority (readonly)
             AccountMeta::new(protocol_params.pool, false), // Pool
@@ -225,7 +222,7 @@ impl InstructionBuilder for MeteoraDammV2InstructionBuilder {
         // ========================================
         // Trade calculation and account address preparation
         // ========================================
-        let is_a_in = traded_is_token_a(protocol_params, params.input_mint, false)?;
+        let is_a_in = resolve_is_a_in(protocol_params, params.input_mint, params.output_mint)?;
         let input_mint =
             if is_a_in { protocol_params.token_a_mint } else { protocol_params.token_b_mint };
         let input_token_program =
@@ -268,9 +265,8 @@ impl InstructionBuilder for MeteoraDammV2InstructionBuilder {
         }
 
         // Same fixed referral slot rule as buy (see comment there).
-        let mut account_metas = Vec::with_capacity(
-            14 + usize::from(protocol_params.include_rate_limiter_sysvar),
-        );
+        let mut account_metas =
+            Vec::with_capacity(14 + usize::from(protocol_params.include_rate_limiter_sysvar));
         account_metas.extend([
             accounts::AUTHORITY_META,                      // Pool Authority (readonly)
             AccountMeta::new(protocol_params.pool, false), // Pool
@@ -392,6 +388,66 @@ mod tests {
             grpc_recv_us: None,
             use_exact_sol_amount: None,
             precheck: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn sol_usdc_direction_follows_explicit_mints_on_both_pool_orderings() {
+        use crate::common::fast_fn::get_associated_token_address_with_program_id_fast;
+        for (a, b) in [
+            (crate::constants::WSOL_TOKEN_ACCOUNT, crate::constants::USDC_TOKEN_ACCOUNT),
+            (crate::constants::USDC_TOKEN_ACCOUNT, crate::constants::WSOL_TOKEN_ACCOUNT),
+        ] {
+            let pool = MeteoraDammV2Params::new(
+                pk(1),
+                pk(2),
+                pk(3),
+                a,
+                b,
+                crate::constants::TOKEN_PROGRAM,
+                crate::constants::TOKEN_PROGRAM,
+            );
+            for sell in [false, true] {
+                let mut params = swap_params(pool.clone());
+                params.open_seed_optimize = false;
+                params.input_mint = if sell {
+                    crate::constants::USDC_TOKEN_ACCOUNT
+                } else {
+                    crate::constants::WSOL_TOKEN_ACCOUNT
+                };
+                params.output_mint = if sell {
+                    crate::constants::WSOL_TOKEN_ACCOUNT
+                } else {
+                    crate::constants::USDC_TOKEN_ACCOUNT
+                };
+                let builder = MeteoraDammV2InstructionBuilder;
+                let ixs = if sell {
+                    builder.build_sell_instructions(&params).await
+                } else {
+                    builder.build_buy_instructions(&params).await
+                }
+                .unwrap();
+                let ix = ixs.last().unwrap();
+                assert_eq!(
+                    ix.accounts[2].pubkey,
+                    get_associated_token_address_with_program_id_fast(
+                        &params.payer.pubkey(),
+                        &params.input_mint,
+                        &crate::constants::TOKEN_PROGRAM
+                    )
+                );
+                assert_eq!(
+                    ix.accounts[3].pubkey,
+                    get_associated_token_address_with_program_id_fast(
+                        &params.payer.pubkey(),
+                        &params.output_mint,
+                        &crate::constants::TOKEN_PROGRAM
+                    )
+                );
+                params.output_mint = params.input_mint;
+                assert!(builder.build_buy_instructions(&params).await.is_err());
+                assert!(builder.build_sell_instructions(&params).await.is_err());
+            }
         }
     }
 
@@ -518,8 +574,8 @@ mod tests {
             );
         let swap_ix = instructions.last().unwrap();
 
-        assert_eq!(instructions[0].program_id, crate::constants::SYSTEM_PROGRAM);
-        assert_eq!(instructions[1].program_id, crate::constants::TOKEN_PROGRAM_2022);
+        assert_eq!(instructions[0].program_id, crate::constants::ASSOCIATED_TOKEN_PROGRAM_ID);
+        assert_eq!(instructions[0].accounts[5].pubkey, crate::constants::TOKEN_PROGRAM_2022);
         assert_eq!(swap_ix.accounts[3].pubkey, expected_output_ata);
         assert_ne!(swap_ix.accounts[3].pubkey, wrong_output_ata);
         assert_eq!(swap_ix.accounts[10].pubkey, crate::constants::TOKEN_PROGRAM_2022);

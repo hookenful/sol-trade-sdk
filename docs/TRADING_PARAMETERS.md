@@ -306,3 +306,43 @@ When `simulate: true`:
   - Estimating compute unit consumption
   - Validating transaction parameters
 - 📝 **Note**: Simulation uses RPC's `simulateTransaction` method with processed commitment level
+
+
+## Pump compact trades and Pump coin quotes (October 2026)
+
+Aligned with [pump-public-docs](https://github.com/pump-fun/pump-public-docs/tree/8cda1fa30ea658b20909d8aedf002047119388d2).
+
+- Compact trades: `instruction::pump_upgrade`. Pump v3 / PumpSwap v2 each use 17 accounts. Existing v2 / v1 APIs remain available for cashback coins.
+- Account derivation: `derive_pump_v3_accounts`, `derive_pump_swap_v2_accounts`, `derive_pump_multi_hop_accounts`. Multi-hop validates continuity, one direction, canonical migration pools, Mayhem restrictions and cashback at the currency endpoint. Four or more hops require v0 + ALT.
+- Pump coin creation: `instruction::pump_create_v2::build_pump_create_v2_instruction`; the coin-quote creation account helper supplies 5 roles while Q is on its curve, or 8 after migration. Supply decoded venue state, Q's depth, Global.max_curve_depth and listed quote mints. Complete Q without a migrated pool is rejected. QuoteControl decoding includes its new reserves-admin header; the initial-quote-reserves helper validates depth and graduation raise against Q's supply.
+- Synthetic completing buy: `instruction::pump_v3_quote`. Supply the **actual curve base vault balance**, current resolved protocol/creator fee rates and SOL migration fee (zero for token quotes). Normal non-Mayhem v3 fees use the fixed 1e15 curve market-cap supply. Completed curves reject further trades. Mayhem uses the old capped/partial-fill behavior.
+- Pool effective quote reserve is `quote_vault_amount + signed virtual_quote_reserves`; retained protocol/creator fees are not subtracted again. Fee selection distinguishes SOL, USDC and exotic/Pump coin quotes.
+
+Account derivation accepts the native SOL zero key from decoded curve state and the SDK internal SOL selector, normalizing both to WSOL for quote accounts and route endpoints. Caller-owned parameters and hop state are preserved.
+
+These are bare instruction builders: fetch current state and create required token accounts first. On a SOL **curve**, a single compact trade uses native SOL; on an AMM **pool**, it uses WSOL. Multi-hop requires the user's WSOL ATA even for a native SOL curve endpoint. Its buyback recipient is always the currency quote ATA; a single SOL curve trade instead takes the recipient wallet. Set a compute budget for the route and simulate the full multi-hop instruction to determine final output and slippage; do not quote each hop with all fees enabled, since protocol fees apply at the currency endpoint and creator/LP fees at the coin endpoint.
+
+Synthetic execution emits TradeEvent, CompleteEvent and PostCompleteBuyEvent. Sum the curve and post-completion execution legs within the same invocation; neither instruction limits nor the curve TradeEvent alone represent the whole completing buy. Multi-hop emits the existing per-hop trade events, not a new aggregate log event.
+
+### Mainnet validation on 2026-10-08
+
+All six compact buy/sell variants executed successfully with `simulateTransaction` (`sigVerify=false`, no broadcasts). Their instruction bytes and account flags are retained as cross-language regression fixtures. Standard `create_v2` also simulated successfully.
+
+The announced features were not all available in the tested mainnet deployment: `multi_hop_swap` returned `InstructionFallbackNotFound` (101); creating with an unlisted Pump coin quote returned `UnsupportedQuoteMint` (6063), both for curve and migrated-pool quotes; buys above the remaining curve supply returned `NotEnoughTokensToBuy` (6021). The live Global account was 1087 bytes and did not yet include `max_curve_depth`. These outcomes are recorded as unresolved deployment validation, not successful feature tests. The announced-interface builders and synthetic quote math remain opt-in; validate program availability with a fresh simulation before using them.
+
+### Multi-hop deployment confirmed on 2026-10-25
+
+The historical `multi_hop_swap` availability result above is superseded by the successful mainnet transaction
+[`g1fC9wYK…BqxApvFZ`](https://solscan.io/tx/g1fC9wYKdndDZAyMCWkfFAqUNBCzj1brvNb3aAnRjxkrVhaSzsvELXFXz11U3DdmbM2AeFbwcaSgG86BqxApvFZ),
+slot 460910106. It executes the official PumpSwap instruction followed by a Pump.fun
+`multi_hop_curve_swap` CPI. The existing `derive_pump_multi_hop_accounts` and
+`build_pump_amm_multi_hop_swap_instruction` APIs build this route from caller-supplied
+state and accounts. Explicit quote routes now support `PumpRouteOptions` with
+`Auto`, `Official` or `Sequential`; see [execution selection](PUMPFUN_STOCK_ROUTES.md#official-or-sequential-execution).
+Auto requires a supported chain plus an explicit official final minimum and current
+buyback recipient. This observation does not revalidate the other historical failures above.
+
+中文：该笔真实交易已确认官方多跳在主网执行成功。SDK 已提供账户派生与指令构建接口，
+显式 quote route 支持选择执行方式；调用者仍需准备最新状态、账户和官方最终滑点限制。
+See the [official multi-hop example](../examples/SIMULATION.md#official-pump-multi-hop)
+for current-account curve/pool buys and sells, including unsigned RPC simulation.

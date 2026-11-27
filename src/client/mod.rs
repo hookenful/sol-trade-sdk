@@ -1,5 +1,10 @@
 //! High-level [`TradingClient`], [`TradingInfrastructure`], and trade parameter types.
 
+mod pumpswap_routing;
+mod pumpswap_routing_feed;
+pub use pumpswap_routing::{PumpSwapRouting, PumpSwapRoutingConfig};
+pub use pumpswap_routing_feed::PumpSwapRoutingFeed;
+
 use crate::common::nonce_cache::DurableNonceInfo;
 use crate::common::sdk_log;
 use crate::common::GasFeeStrategy;
@@ -19,8 +24,6 @@ use crate::swqos::TradeType;
 use crate::trading::core::params::DexParamEnum;
 use crate::trading::core::params::MeteoraDammV2Params;
 use crate::trading::core::params::MeteoraDlmmParams;
-use crate::trading::core::params::PumpFunParams;
-use crate::trading::core::params::PumpSwapParams;
 use crate::trading::core::params::RaydiumAmmV4Params;
 use crate::trading::core::params::RaydiumClmmParams;
 use crate::trading::core::params::RaydiumCpmmParams;
@@ -44,8 +47,16 @@ use tracing::{debug, error, info, warn};
 #[inline(always)]
 fn validate_protocol_params(dex_type: DexType, params: &DexParamEnum) -> bool {
     match dex_type {
-        DexType::PumpFun => params.as_any().downcast_ref::<PumpFunParams>().is_some(),
-        DexType::PumpSwap => params.as_any().downcast_ref::<PumpSwapParams>().is_some(),
+        DexType::PumpFun => matches!(
+            params,
+            DexParamEnum::PumpFun(_)
+                | DexParamEnum::PumpFunVersioned { .. }
+                | DexParamEnum::PumpFunV3(_)
+                | DexParamEnum::PumpFunQuoteRoute(_)
+        ),
+        DexType::PumpSwap => {
+            matches!(params, DexParamEnum::PumpSwap(_) | DexParamEnum::PumpSwapQuoteRoute(_))
+        }
         DexType::LaunchLab => matches!(params, DexParamEnum::LaunchLab(_)),
         DexType::Bonk => matches!(params, DexParamEnum::Bonk(_)),
         DexType::StonkFun => {
@@ -72,6 +83,54 @@ fn validate_protocol_params(dex_type: DexType, params: &DexParamEnum) -> bool {
         DexType::OrcaWhirlpool => params.as_any().downcast_ref::<WhirlpoolParams>().is_some(),
         DexType::MeteoraDlmm => params.as_any().downcast_ref::<MeteoraDlmmParams>().is_some(),
     }
+}
+
+fn resolve_pumpfun_version(
+    mut params: DexParamEnum,
+    version: crate::common::PumpFunVersion,
+) -> anyhow::Result<DexParamEnum> {
+    use crate::common::PumpFunVersion;
+    if let DexParamEnum::PumpFun(curve) = params {
+        return Ok(DexParamEnum::PumpFunVersioned { params: curve, version });
+    }
+    let route = match &mut params {
+        DexParamEnum::PumpFunQuoteRoute(r)
+        | DexParamEnum::PumpSwapQuoteRoute(r)
+        | DexParamEnum::StonkFunQuoteRoute(r) => Some(r),
+        _ => None,
+    };
+    if let Some(route) = route {
+        for hop in route.buy_hops.iter_mut().chain(&mut route.sell_hops) {
+            if let crate::PumpFunQuoteVenue::PumpFun {
+                mint,
+                curve,
+                quote_token_program,
+                base_transfer_fee,
+                quote_transfer_fee,
+            } = &hop.venue
+            {
+                match version {
+                    PumpFunVersion::Legacy => anyhow::bail!(
+                        "Legacy Pump.fun does not support stock quote routes; select V2 or V3"
+                    ),
+                    PumpFunVersion::V2 => {}
+                    PumpFunVersion::V3 => {
+                        hop.venue = crate::PumpFunQuoteVenue::PumpFunV3 {
+                            mint: *mint,
+                            params: crate::PumpFunV3Params {
+                                curve: curve.clone(),
+                                quote_token_program: *quote_token_program,
+                                minimum_output_amount: hop.minimum_amount_out,
+                                base_transfer_fee: *base_transfer_fee,
+                                quote_transfer_fee: *quote_transfer_fee,
+                            },
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(params)
 }
 
 /// Optional pre-buy gate for cached token/routing risk checks.
@@ -913,6 +972,8 @@ pub fn recommended_sender_thread_core_indices(swqos_count: usize) -> Option<Vec<
 /// including PumpFun, PumpSwap, Bonk, Raydium AMM V4, and Raydium CPMM.
 /// It manages RPC connections, transaction signing, and SWQOS (Solana Web Quality of Service) settings.
 pub struct TradingClient {
+    /// Optional instance-scoped, RPC-free PumpSwap bridge routing.
+    pub pumpswap_routing: Option<Arc<PumpSwapRouting>>,
     /// The keypair used for signing all transactions
     pub payer: Arc<Keypair>,
     /// Shared infrastructure (RPC client, SWQOS clients)
@@ -940,6 +1001,7 @@ pub struct TradingClient {
     pub check_min_tip: bool,
     /// Solana transaction construction mode selected in `TradeConfig`.
     pub transaction_version: TradeTransactionVersion,
+    pub pumpfun_version: crate::common::PumpFunVersion,
 }
 
 static INSTANCE: Mutex<Option<Arc<TradingClient>>> = Mutex::new(None);
@@ -954,6 +1016,7 @@ impl Clone for TradingClient {
             infrastructure: self.infrastructure.clone(),
             middleware_manager: self.middleware_manager.clone(),
             risk_gate: self.risk_gate.clone(),
+            pumpswap_routing: self.pumpswap_routing.clone(),
             use_seed_optimize: self.use_seed_optimize,
             use_dedicated_sender_threads: self.use_dedicated_sender_threads,
             sender_thread_cores: self.sender_thread_cores.clone(),
@@ -962,6 +1025,7 @@ impl Clone for TradingClient {
             log_enabled: self.log_enabled,
             check_min_tip: self.check_min_tip,
             transaction_version: self.transaction_version,
+            pumpfun_version: self.pumpfun_version,
         }
     }
 }
@@ -1095,7 +1159,11 @@ fn buy_account_flags_for(policy: AccountPolicy, extension: &DexParamEnum) -> (bo
     if matches!(policy, AccountPolicy::Auto)
         && matches!(
             extension,
-            DexParamEnum::StonkFunViaSol(_) | DexParamEnum::StonkFunQuoteRoute(_)
+            DexParamEnum::StonkFunViaSol(_)
+                | DexParamEnum::PumpFunQuoteRoute(_)
+                | DexParamEnum::StonkFunQuoteRoute(_)
+                | DexParamEnum::PumpSwapQuoteRoute(_)
+                | DexParamEnum::PumpSwapAutoRoute(_)
         )
     {
         return (true, true, false);
@@ -1123,7 +1191,11 @@ fn sell_account_flags_for(
     if matches!(policy, AccountPolicy::Auto)
         && matches!(
             extension,
-            DexParamEnum::StonkFunViaSol(_) | DexParamEnum::StonkFunQuoteRoute(_)
+            DexParamEnum::StonkFunViaSol(_)
+                | DexParamEnum::PumpFunQuoteRoute(_)
+                | DexParamEnum::StonkFunQuoteRoute(_)
+                | DexParamEnum::PumpSwapQuoteRoute(_)
+                | DexParamEnum::PumpSwapAutoRoute(_)
         )
         && matches!(receive_as, TradeTokenType::SOL | TradeTokenType::WSOL)
     {
@@ -1239,14 +1311,16 @@ impl TradingClient {
             infrastructure,
             middleware_manager: None,
             risk_gate: None,
+            pumpswap_routing: None,
             use_seed_optimize,
             use_dedicated_sender_threads: false,
             sender_thread_cores: None,
             max_sender_concurrency,
             effective_core_ids,
-            log_enabled: true,
+            log_enabled: false,
             check_min_tip: false,
             transaction_version: TradeTransactionVersion::V0,
+            pumpfun_version: crate::common::PumpFunVersion::default(),
         }
     }
 
@@ -1287,14 +1361,16 @@ impl TradingClient {
             infrastructure,
             middleware_manager: None,
             risk_gate: None,
+            pumpswap_routing: None,
             use_seed_optimize,
             use_dedicated_sender_threads: false,
             sender_thread_cores: None,
             max_sender_concurrency,
             effective_core_ids,
-            log_enabled: true,
+            log_enabled: false,
             check_min_tip: false,
             transaction_version: TradeTransactionVersion::V0,
+            pumpfun_version: crate::common::PumpFunVersion::default(),
         }
     }
 
@@ -1467,6 +1543,7 @@ impl TradingClient {
             infrastructure: infrastructure.clone(),
             middleware_manager: None,
             risk_gate: None,
+            pumpswap_routing: trade_config.pumpswap_routing.clone(),
             use_seed_optimize: trade_config.use_seed_optimize,
             use_dedicated_sender_threads: false,
             sender_thread_cores: None,
@@ -1475,12 +1552,101 @@ impl TradingClient {
             log_enabled: trade_config.log_enabled,
             check_min_tip: trade_config.check_min_tip,
             transaction_version: trade_config.transaction_version,
+            pumpfun_version: trade_config.pumpfun_version,
         };
 
         let mut current = INSTANCE.lock();
         *current = Some(Arc::new(instance.clone()));
 
         instance
+    }
+
+    /// Attach bridge routing when constructing a client from shared infrastructure.
+    pub fn with_pumpswap_routing(mut self, routing: Arc<PumpSwapRouting>) -> Self {
+        self.pumpswap_routing = Some(routing);
+        self
+    }
+
+    /// Configure Pump.fun on clients built from shared infrastructure. Default: V3.
+    pub fn with_pumpfun_version(mut self, version: crate::common::PumpFunVersion) -> Self {
+        self.pumpfun_version = version;
+        self
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_pumpswap_route(
+        &self,
+        dex: DexType,
+        extension: &mut DexParamEnum,
+        token: Pubkey,
+        asset: Pubkey,
+        amount: u64,
+        slippage: Option<u64>,
+        exact_output: bool,
+        simulate: bool,
+        confirm: bool,
+        is_buy: bool,
+    ) -> anyhow::Result<()> {
+        if !matches!(dex, DexType::PumpSwap) {
+            return Ok(());
+        }
+        let Some(routing) = &self.pumpswap_routing else {
+            anyhow::ensure!(
+                !matches!(extension, DexParamEnum::PumpSwapAutoRoute(_)),
+                "PumpSwapAutoRoute requires configured PumpSwapRouting"
+            );
+            return Ok(());
+        };
+        anyhow::ensure!(
+            !simulate && !confirm,
+            "Configured PumpSwap routing forbids RPC simulation/confirmation on the hot path"
+        );
+        let pool = match extension {
+            DexParamEnum::PumpSwap(p) => Some(p.pool),
+            DexParamEnum::PumpSwapAutoRoute(pool) => Some(*pool),
+            _ => None,
+        };
+        if let Some(pool) = pool {
+            anyhow::ensure!(
+                !exact_output,
+                "Configured PumpSwap routing requires exact-input sizing"
+            );
+            let prepared = routing.prepare(
+                pool,
+                token,
+                asset,
+                amount,
+                slippage.unwrap_or(crate::constants::trade::trade::DEFAULT_SLIPPAGE),
+                is_buy,
+            )?;
+            *extension = DexParamEnum::PumpSwapQuoteRoute(prepared.into_quote_route());
+        }
+        Ok(())
+    }
+
+    /// Same preparation as buy_simple, without broadcast. Auto account flags are
+    /// resolved after routing so first-time bridge/WSOL ATAs are included.
+    pub fn prepare_simple_buy(&self, params: SimpleBuyParams) -> anyhow::Result<SwapParams> {
+        let policy = params.account_policy;
+        let mut swap = self.prepare_buy(params.into())?;
+        let (input, output, close) = buy_account_flags_for(policy, &swap.protocol_params);
+        swap.create_input_mint_ata = input;
+        swap.create_output_mint_ata = output;
+        swap.close_input_mint_ata = close;
+        Ok(swap)
+    }
+
+    /// Same preparation as sell_simple, with independent reverse-route quotes.
+    pub fn prepare_simple_sell(&self, params: SimpleSellParams) -> anyhow::Result<SwapParams> {
+        let policy = params.account_policy;
+        let receive = params.receive_as;
+        let mut swap = self.prepare_sell(params.into())?;
+        let (create, close_output, close_input) =
+            sell_account_flags_for(policy, &receive, &swap.protocol_params);
+        swap.create_output_mint_ata = create;
+        swap.close_output_mint_ata = close_output;
+        swap.close_input_mint_ata = close_input;
+        Ok(swap)
     }
 
     /// Adds a middleware manager to the SolanaTrade instance
@@ -1611,6 +1777,36 @@ impl TradingClient {
         (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
         anyhow::Error,
     > {
+        let executor = TradeFactory::create_executor(params.dex_type);
+        let buy_params = self.prepare_buy(params)?;
+        let swap_result = executor.swap(buy_params).await;
+        let result = swap_result.map(|(success, sigs, err, timings)| {
+            let legacy_timings = timings
+                .into_iter()
+                .map(|timing| (timing.swqos_type, timing.submit_done_us))
+                .collect();
+            (success, sigs, err.map(TradeError::from), legacy_timings)
+        });
+        result
+    }
+
+    /// Prepare locally without submitting. Configured PumpSwap routing never uses RPC.
+    pub fn prepare_buy(&self, mut params: TradeBuyParams) -> anyhow::Result<SwapParams> {
+        self.resolve_pumpswap_route(
+            params.dex_type,
+            &mut params.extension_params,
+            params.mint,
+            params.input_token_type.mint(),
+            params.input_token_amount,
+            params.slippage_basis_points,
+            params.fixed_output_token_amount.is_some()
+                || params.use_exact_sol_amount == Some(false),
+            params.simulate,
+            params.wait_tx_confirmed,
+            true,
+        )?;
+        let rpc_free =
+            self.pumpswap_routing.is_some() && matches!(params.dex_type, DexType::PumpSwap);
         validate_trade_safety(
             "buy",
             params.input_token_amount,
@@ -1639,9 +1835,9 @@ impl TradingClient {
         if let Some(risk_gate) = self.risk_gate.as_deref() {
             risk_gate.check_buy(&params)?;
         }
-        let protocol_params = params.extension_params;
+        let protocol_params =
+            resolve_pumpfun_version(params.extension_params, self.pumpfun_version)?;
         let input_token_mint = params.input_token_type.mint();
-        let executor = TradeFactory::create_executor(params.dex_type);
         let buy_params = SwapParams {
             rpc: Some(self.infrastructure.rpc.clone()),
             payer: self.payer.clone(),
@@ -1681,15 +1877,11 @@ impl TradingClient {
             precheck: params.precheck,
         };
 
-        let swap_result = executor.swap(buy_params).await;
-        let result = swap_result.map(|(success, sigs, err, timings)| {
-            let legacy_timings = timings
-                .into_iter()
-                .map(|timing| (timing.swqos_type, timing.submit_done_us))
-                .collect();
-            (success, sigs, err.map(TradeError::from), legacy_timings)
-        });
-        result
+        if rpc_free {
+            buy_params.without_rpc()
+        } else {
+            Ok(buy_params)
+        }
     }
 
     /// Execute a high-level buy request.
@@ -1701,7 +1893,17 @@ impl TradingClient {
         (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
         anyhow::Error,
     > {
-        self.buy(params.into()).await
+        let executor = TradeFactory::create_executor(params.dex_type);
+        executor.swap(self.prepare_simple_buy(params)?).await.map(
+            |(ok, signatures, error, timings)| {
+                (
+                    ok,
+                    signatures,
+                    error.map(TradeError::from),
+                    timings.into_iter().map(|t| (t.swqos_type, t.submit_done_us)).collect(),
+                )
+            },
+        )
     }
 
     /// Execute a sell order for a specified token
@@ -1737,6 +1939,35 @@ impl TradingClient {
         (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
         anyhow::Error,
     > {
+        let executor = TradeFactory::create_executor(params.dex_type);
+        let sell_params = self.prepare_sell(params)?;
+        let swap_result = executor.swap(sell_params).await;
+        let result = swap_result.map(|(success, sigs, err, timings)| {
+            let legacy_timings = timings
+                .into_iter()
+                .map(|timing| (timing.swqos_type, timing.submit_done_us))
+                .collect();
+            (success, sigs, err.map(TradeError::from), legacy_timings)
+        });
+        result
+    }
+
+    /// Prepare locally without submitting. Configured PumpSwap routing never uses RPC.
+    pub fn prepare_sell(&self, mut params: TradeSellParams) -> anyhow::Result<SwapParams> {
+        self.resolve_pumpswap_route(
+            params.dex_type,
+            &mut params.extension_params,
+            params.mint,
+            params.output_token_type.mint(),
+            params.input_token_amount,
+            params.slippage_basis_points,
+            params.fixed_output_token_amount.is_some(),
+            params.simulate,
+            params.wait_tx_confirmed,
+            false,
+        )?;
+        let rpc_free =
+            self.pumpswap_routing.is_some() && matches!(params.dex_type, DexType::PumpSwap);
         validate_trade_safety(
             "sell",
             params.input_token_amount,
@@ -1756,14 +1987,14 @@ impl TradingClient {
                 "Must provide either recent_blockhash or durable_nonce for sell (required for transaction validity)"
             ));
         }
-        let protocol_params = params.extension_params;
+        let protocol_params =
+            resolve_pumpfun_version(params.extension_params, self.pumpfun_version)?;
         if !validate_protocol_params(params.dex_type, &protocol_params) {
             return Err(anyhow::anyhow!(
                 "Invalid protocol params for Trade (dex={:?})",
                 params.dex_type
             ));
         }
-        let executor = TradeFactory::create_executor(params.dex_type);
         let output_token_mint = params.output_token_type.mint();
         let sell_params = SwapParams {
             rpc: Some(self.infrastructure.rpc.clone()),
@@ -1804,15 +2035,11 @@ impl TradingClient {
             precheck: None,
         };
 
-        let swap_result = executor.swap(sell_params).await;
-        let result = swap_result.map(|(success, sigs, err, timings)| {
-            let legacy_timings = timings
-                .into_iter()
-                .map(|timing| (timing.swqos_type, timing.submit_done_us))
-                .collect();
-            (success, sigs, err.map(TradeError::from), legacy_timings)
-        });
-        result
+        if rpc_free {
+            sell_params.without_rpc()
+        } else {
+            Ok(sell_params)
+        }
     }
 
     /// Execute a high-level sell request.
@@ -1824,7 +2051,17 @@ impl TradingClient {
         (bool, Vec<Signature>, Option<TradeError>, Vec<(crate::swqos::SwqosType, i64)>),
         anyhow::Error,
     > {
-        self.sell(params.into()).await
+        let executor = TradeFactory::create_executor(params.dex_type);
+        executor.swap(self.prepare_simple_sell(params)?).await.map(
+            |(ok, signatures, error, timings)| {
+                (
+                    ok,
+                    signatures,
+                    error.map(TradeError::from),
+                    timings.into_iter().map(|t| (t.swqos_type, t.submit_done_us)).collect(),
+                )
+            },
+        )
     }
 
     /// Execute a sell order for a percentage of the specified token amount
@@ -2105,8 +2342,25 @@ mod tests {
     use super::*;
     use crate::instruction::utils::pumpfun::global_constants;
     use crate::swqos::SwqosRegion;
+    use crate::trading::core::params::PumpFunParams;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn pumpswap_route_uses_the_pumpswap_executor_and_creates_bridge_accounts() {
+        let route = DexParamEnum::PumpSwapQuoteRoute(Default::default());
+        assert!(validate_protocol_params(DexType::PumpSwap, &route));
+        assert!(!validate_protocol_params(DexType::PumpFun, &route));
+        assert_eq!(buy_account_flags_for(AccountPolicy::Auto, &route), (true, true, false));
+        assert_eq!(
+            sell_account_flags_for(AccountPolicy::Auto, &TradeTokenType::SOL, &route),
+            (true, true, false),
+        );
+        assert_eq!(
+            buy_account_flags_for(AccountPolicy::AssumePrepared, &route),
+            (false, false, false),
+        );
+    }
 
     fn dummy_pumpfun_params() -> DexParamEnum {
         DexParamEnum::PumpFun(PumpFunParams {
@@ -2120,6 +2374,123 @@ mod tests {
             fee_recipient: global_constants::FEE_RECIPIENT,
             quote_mint: Pubkey::default(),
         })
+    }
+
+    #[tokio::test]
+    async fn pumpfun_client_version_controls_both_instruction_directions() {
+        use crate::common::PumpFunVersion;
+        use crate::instruction::pumpfun::PumpFunInstructionBuilder;
+        use crate::trading::core::traits::InstructionBuilder;
+        let infra = Arc::new(TradingInfrastructure {
+            rpc: Arc::new(SolanaRpcClient::new("https://example.invalid".into())),
+            swqos_clients: Arc::new(Vec::new()),
+            config: InfrastructureConfig::new(
+                "https://example.invalid".into(),
+                Vec::new(),
+                solana_commitment_config::CommitmentConfig::processed(),
+            ),
+            max_sender_concurrency: 1,
+            effective_core_ids: Arc::new(Vec::new()),
+        });
+        let client = TradingClient::from_infrastructure(Arc::new(Keypair::new()), infra, true);
+        assert_eq!(client.pumpfun_version, PumpFunVersion::V3);
+        let mint = Pubkey::new_unique();
+        let DexParamEnum::PumpFun(mut curve) = dummy_pumpfun_params() else { unreachable!() };
+        let state = Arc::make_mut(&mut curve.bonding_curve);
+        state.account = crate::instruction::utils::pumpfun::get_bonding_curve_pda(&mint).unwrap();
+        state.virtual_token_reserves = 1_000_000_000_000;
+        state.virtual_sol_reserves = 30_000_000_000;
+        state.real_token_reserves = 800_000_000_000;
+        state.creator = Pubkey::new_unique();
+        curve.creator_vault =
+            crate::instruction::utils::pumpfun::get_creator_vault_pda(&state.creator).unwrap();
+        for version in [PumpFunVersion::V3, PumpFunVersion::V2, PumpFunVersion::Legacy] {
+            let selected = client.clone().with_pumpfun_version(version);
+            let buy = selected
+                .prepare_simple_buy(SimpleBuyParams::new(
+                    DexType::PumpFun,
+                    TradeTokenType::SOL,
+                    mint,
+                    BuyAmount::ExactInput(1_000_000),
+                    DexParamEnum::PumpFun(curve.clone()),
+                    Hash::new_unique(),
+                    GasFeeStrategy::new(),
+                ))
+                .unwrap();
+            let sell = selected
+                .prepare_simple_sell(SimpleSellParams::new(
+                    DexType::PumpFun,
+                    TradeTokenType::SOL,
+                    mint,
+                    SellAmount::ExactInput(1_000_000),
+                    DexParamEnum::PumpFun(curve.clone()),
+                    Hash::new_unique(),
+                    GasFeeStrategy::new(),
+                ))
+                .unwrap();
+            let buy_ixs = PumpFunInstructionBuilder.build_buy_instructions(&buy).await.unwrap();
+            let sell_ixs = PumpFunInstructionBuilder.build_sell_instructions(&sell).await.unwrap();
+            let program = crate::instruction::utils::pumpfun::accounts::PUMPFUN;
+            let buy_ix = buy_ixs.iter().find(|ix| ix.program_id == program).unwrap();
+            let sell_ix = sell_ixs.iter().find(|ix| ix.program_id == program).unwrap();
+            use crate::instruction::utils::pumpfun::*;
+            let (b, s) = match version {
+                PumpFunVersion::V3 => {
+                    ([225, 247, 80, 30, 213, 179, 132, 136], [28, 146, 222, 119, 38, 196, 105, 213])
+                }
+                PumpFunVersion::V2 => (BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR, SELL_V2_DISCRIMINATOR),
+                PumpFunVersion::Legacy => (BUY_EXACT_SOL_IN_DISCRIMINATOR, SELL_DISCRIMINATOR),
+            };
+            assert_eq!(&buy_ix.data[..8], &b);
+            assert_eq!(&sell_ix.data[..8], &s);
+            // Explicit request versions override the client default.
+            assert!(matches!(
+                resolve_pumpfun_version(
+                    DexParamEnum::PumpFunVersioned {
+                        params: curve.clone(),
+                        version: PumpFunVersion::V2
+                    },
+                    version
+                )
+                .unwrap(),
+                DexParamEnum::PumpFunVersioned { version: PumpFunVersion::V2, .. }
+            ));
+        }
+        // A stock route inherits the default without losing its caller's limit.
+        let mut stock_curve = curve;
+        let quote = Pubkey::new_unique();
+        stock_curve.quote_mint = quote;
+        Arc::make_mut(&mut stock_curve.bonding_curve).quote_mint = quote;
+        let route = crate::PumpFunQuoteRoute::buy(vec![crate::PumpFunQuoteHop::exact_in(
+            crate::PumpFunQuoteVenue::PumpFun {
+                mint,
+                curve: stock_curve,
+                quote_token_program: crate::constants::TOKEN_PROGRAM_2022,
+                base_transfer_fee: Default::default(),
+                quote_transfer_fee: Default::default(),
+            },
+            quote,
+            mint,
+            100,
+        )]);
+        for version in [PumpFunVersion::V2, PumpFunVersion::V3] {
+            let DexParamEnum::PumpFunQuoteRoute(resolved) =
+                resolve_pumpfun_version(DexParamEnum::PumpFunQuoteRoute(route.clone()), version)
+                    .unwrap()
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                matches!(resolved.buy_hops[0].venue, crate::PumpFunQuoteVenue::PumpFunV3 { .. }),
+                version == PumpFunVersion::V3
+            );
+            assert_eq!(resolved.buy_hops[0].minimum_amount_out, 100);
+        }
+        assert!(resolve_pumpfun_version(
+            DexParamEnum::PumpFunQuoteRoute(route),
+            PumpFunVersion::Legacy
+        )
+        .is_err());
     }
 
     #[test]
@@ -2138,7 +2509,8 @@ mod tests {
 
     #[test]
     fn normalize_swqos_configs_adds_default_rpc_route() {
-        let configs = vec![SwqosConfig::Jito("uuid".to_string(), SwqosRegion::Frankfurt, None)];
+        let configs =
+            vec![SwqosConfig::Jito("uuid".to_string(), SwqosRegion::Frankfurt, None, None)];
         let normalized = normalize_swqos_configs("https://rpc.example", &configs);
 
         assert_eq!(normalized.len(), 2);

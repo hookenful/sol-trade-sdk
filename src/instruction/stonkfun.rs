@@ -1952,7 +1952,29 @@ pub(crate) mod tests {
         let (stock, meme) = (pk(170), pk(171));
         let wsol = crate::constants::WSOL_TOKEN_ACCOUNT;
         let pool = cpmm_pool(wsol, stock);
-        // The route's hop asks for its pool's quote less 1%.
+        let un_discounted =
+            compute_swap_amount_for_pool(&pool, true, 1_000_000, 0).unwrap().min_amount_out;
+        // A hop above the pool's un-discounted quote is rejected.
+        let too_high = StonkFunQuoteRoute::buy(vec![StonkFunQuoteHop::exact_in(
+            StonkFunQuoteVenue::RaydiumCpmm(pool.clone()),
+            wsol,
+            stock,
+            un_discounted + 1,
+        )]);
+        let params = swap_params(
+            TradeType::Buy,
+            wsol,
+            meme,
+            DexParamEnum::StonkFunViaSol(StonkFunViaSolParams::curve(
+                curve_params(stock),
+                too_high,
+            )),
+        );
+        let err = StonkFunInstructionBuilder.build_buy_instructions(&params).await.unwrap_err();
+        assert!(err.to_string().contains("min-out exceeds"), "{err}");
+
+        // Each prepared hop owns its own tolerance: a tighter 1% bridge minimum
+        // is allowed even under a 15% meme-leg slippage, and the meme leg spends it.
         let min_out =
             compute_swap_amount_for_pool(&pool, true, 1_000_000, 100).unwrap().min_amount_out;
         let route = StonkFunQuoteRoute::buy(vec![StonkFunQuoteHop::exact_in(
@@ -1965,15 +1987,14 @@ pub(crate) mod tests {
         let mut params =
             swap_params(TradeType::Buy, wsol, meme, DexParamEnum::StonkFunViaSol(via.clone()));
         params.slippage_basis_points = Some(1_500);
-        // At the trade's 15% the pool protects less than the route asks for.
-        let err = StonkFunInstructionBuilder.build_buy_instructions(&params).await.unwrap_err();
-        assert!(err.to_string().contains("min-out exceeds"), "{err}");
-
-        // The hop slippage covers the route, and the meme leg spends its minimum.
-        params.protocol_params = via.clone().with_hop_slippage_basis_points(100).into();
         let ixs = StonkFunInstructionBuilder.build_buy_instructions(&params).await.unwrap();
         assert_eq!(amounts(only(&ixs, cpmm_accounts::RAYDIUM_CPMM)), (1_000_000, min_out));
         assert_eq!(amounts(only(&ixs, launchlab_accounts::BONK)).0, min_out);
+
+        // The hop slippage still feeds route planning validation.
+        params.protocol_params = via.clone().with_hop_slippage_basis_points(10_001).into();
+        let err = StonkFunInstructionBuilder.build_buy_instructions(&params).await.unwrap_err();
+        assert!(err.to_string().contains("slippage exceeds 10000"), "{err}");
 
         // A route lists its own hops.
         params.protocol_params = via.with_quote_hop(cpmm_pool(stock, pk(172))).into();

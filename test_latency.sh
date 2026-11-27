@@ -1,4 +1,5 @@
 #!/bin/bash
+cd "$(dirname "${BASH_SOURCE[0]}")" || exit 1
 
 # PumpFun 真实买入延迟测试
 # 测试从调用buy到提交交易的完整流程
@@ -116,22 +117,22 @@ async fn main() -> AnyResult<()> {
             String::new(),  // uuid
             SwqosRegion::Default,
             Some(env::var("SWQOS_JITO").unwrap_or_else(|_| "https://mainnet.block-engine.jito.wtf/api/v1/transactions".to_string()))
-        ),
+        , None),
         SwqosConfig::Bloxroute(
             String::new(),  // api_token
             SwqosRegion::Default,
             Some(env::var("SWQOS_BLOXROUTE").unwrap_or_else(|_| "https://ny.solana.dex.blxrbdn.com".to_string()))
-        ),
+        , None),
         SwqosConfig::NextBlock(
             String::new(),  // api_token
             SwqosRegion::Default,
             Some(env::var("SWQOS_NEXTBLOCK").unwrap_or_else(|_| "https://api.nextblock.io/v1/solana".to_string()))
-        ),
+        , None),
         SwqosConfig::FlashBlock(
             String::new(),  // api_token
             SwqosRegion::Default,
             Some(env::var("SWQOS_FLASHBLOCK").unwrap_or_else(|_| "https://api.flashblock.io/v1/solana".to_string()))
-        ),
+        , None),
     ];
 
     println!("🚀 SWQOS配置: {} 个并发节点", swqos_configs.len());

@@ -40,7 +40,10 @@ use solana_sdk::{
 };
 
 #[inline]
-fn effective_pump_mint_token_program(protocol_params: &PumpFunParams, mint: &Pubkey) -> Pubkey {
+pub(super) fn effective_pump_mint_token_program(
+    protocol_params: &PumpFunParams,
+    mint: &Pubkey,
+) -> Pubkey {
     let mut encoded = [0_u8; 44];
     let has_pump_suffix = bs58::encode(mint.as_ref())
         .onto(&mut encoded[..])
@@ -129,11 +132,152 @@ pub struct PumpFunInstructionBuilder;
 #[async_trait::async_trait]
 impl InstructionBuilder for PumpFunInstructionBuilder {
     async fn build_buy_instructions(&self, params: &SwapParams) -> Result<Vec<Instruction>> {
-        build_buy(params)
+        let mut instructions = if let crate::trading::core::params::DexParamEnum::PumpFunVersioned {
+            params: curve,
+            version,
+        } = &params.protocol_params
+        {
+            build_versioned(params, curve, *version, true)?
+        } else if let crate::trading::core::params::DexParamEnum::PumpFunV3(v3) =
+            &params.protocol_params
+        {
+            super::pumpfun_v3::build(params, v3, true)?
+        } else if let crate::trading::core::params::DexParamEnum::PumpFunQuoteRoute(route) =
+            &params.protocol_params
+        {
+            validate_curve_route_endpoint(route, params.output_mint, true)?;
+            super::stonkfun_quote_route::build_quote_route(params, route, true).await?
+        } else {
+            return build_buy(params);
+        };
+        prepend_precheck_if_needed(params, &mut instructions)?;
+        Ok(instructions)
     }
 
     async fn build_sell_instructions(&self, params: &SwapParams) -> Result<Vec<Instruction>> {
+        if let crate::trading::core::params::DexParamEnum::PumpFunVersioned {
+            params: curve,
+            version,
+        } = &params.protocol_params
+        {
+            return build_versioned(params, curve, *version, false);
+        }
+        if let crate::trading::core::params::DexParamEnum::PumpFunV3(v3) = &params.protocol_params {
+            return super::pumpfun_v3::build(params, v3, false);
+        }
+        if let crate::trading::core::params::DexParamEnum::PumpFunQuoteRoute(route) =
+            &params.protocol_params
+        {
+            validate_curve_route_endpoint(route, params.input_mint, false)?;
+            return super::stonkfun_quote_route::build_quote_route(params, route, false).await;
+        }
         build_sell(params)
+    }
+}
+
+fn build_versioned(
+    params: &SwapParams,
+    curve: &PumpFunParams,
+    version: crate::common::PumpFunVersion,
+    buy: bool,
+) -> Result<Vec<Instruction>> {
+    use crate::common::PumpFunVersion;
+    match version {
+        PumpFunVersion::Legacy => {
+            anyhow::ensure!(
+                curve.bonding_curve.effective_quote_mint() == crate::constants::WSOL_TOKEN_ACCOUNT,
+                "Legacy Pump.fun requires a native SOL curve"
+            );
+            if buy {
+                build_buy_legacy(params)
+            } else {
+                build_sell_legacy(params)
+            }
+        }
+        PumpFunVersion::V2 => {
+            if buy {
+                build_buy_unified(params)
+            } else {
+                build_sell_unified(params)
+            }
+        }
+        PumpFunVersion::V3 => {
+            // Existing unversioned native-SOL requests retain their reserve-based
+            // sizing. Arbitrary token quotes need explicit fee/program snapshots.
+            anyhow::ensure!(curve.bonding_curve.effective_quote_mint() == crate::constants::WSOL_TOKEN_ACCOUNT,
+                "V3 token-quote trades require PumpFunV3Params or PumpFunQuoteRoute with current mint fee/program snapshots");
+            let amount = params.input_amount.unwrap_or(0);
+            let slippage = params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE);
+            let c = &curve.bonding_curve;
+            let estimated = if buy {
+                get_buy_token_amount_from_sol_amount(
+                    c.virtual_token_reserves as u128,
+                    c.virtual_sol_reserves as u128,
+                    c.real_token_reserves as u128,
+                    curve.effective_creator_for_trade(),
+                    amount,
+                )
+            } else {
+                get_sell_sol_amount_from_token_amount(
+                    c.virtual_token_reserves as u128,
+                    c.virtual_sol_reserves as u128,
+                    curve.effective_creator_for_trade(),
+                    amount,
+                )
+            };
+            anyhow::ensure!(!buy || params.fixed_output_amount.is_some() || estimated < c.real_token_reserves,
+                "V3 buy reaches graduation; supply PumpFunV3Params with an explicit current output minimum");
+            let v3 = crate::PumpFunV3Params {
+                curve: curve.clone(),
+                quote_token_program: crate::constants::TOKEN_PROGRAM,
+                minimum_output_amount: calculate_with_slippage_sell(estimated, slippage),
+                base_transfer_fee: Default::default(),
+                quote_transfer_fee: Default::default(),
+            };
+            let mut sized = params.clone();
+            if buy
+                && params.fixed_output_amount.is_none()
+                && params.use_exact_sol_amount == Some(false)
+            {
+                sized.fixed_output_amount = Some(estimated);
+                sized.input_amount = Some(calculate_with_slippage_buy(amount, slippage));
+            }
+            super::pumpfun_v3::build(&sized, &v3, buy)
+        }
+    }
+}
+
+fn validate_curve_route_endpoint(
+    route: &crate::PumpFunQuoteRoute,
+    mint: Pubkey,
+    buy: bool,
+) -> Result<()> {
+    let endpoint = if buy { route.buy_hops.last() } else { route.sell_hops.first() };
+    if !endpoint.is_some_and(|hop| {
+        matches!(&hop.venue,
+        crate::PumpFunQuoteVenue::PumpFun { mint: base, .. }
+        | crate::PumpFunQuoteVenue::PumpFunV3 { mint: base, .. } if *base == mint)
+    }) {
+        return Err(anyhow!(
+            "PumpFun quote route must buy into or sell from the requested bonding-curve mint"
+        ));
+    }
+    Ok(())
+}
+
+/// Explicit exact-input hop limits; never infer a fill from a prior transaction.
+pub(super) fn build_quote_hop(
+    params: &SwapParams,
+    minimum: u64,
+    buy: bool,
+    quote_program: Pubkey,
+) -> Result<Vec<Instruction>> {
+    if buy {
+        build_buy_unified_with_minimum(params, Some(minimum), Some(quote_program))
+    } else {
+        let mut sell = params.clone();
+        sell.fixed_output_amount = Some(minimum);
+        build_sell_unified_with_quote_program(&sell, Some(quote_program))
     }
 }
 
@@ -162,13 +306,10 @@ fn should_use_v2_layout(params: &SwapParams) -> Result<bool> {
 }
 
 #[inline]
-fn build_buy(params: &SwapParams) -> Result<Vec<Instruction>> {
-    let mut instructions = if should_use_v2_layout(params)? {
-        build_buy_unified(params)
-    } else {
-        build_buy_legacy(params)
-    }?;
-
+fn prepend_precheck_if_needed(
+    params: &SwapParams,
+    instructions: &mut Vec<Instruction>,
+) -> Result<()> {
     if let Some(precheck) = &params.precheck {
         let bonding_curve = get_bonding_curve_pda(&params.output_mint).ok_or_else(|| {
             anyhow!("bonding_curve PDA derivation failed for mint {}", params.output_mint)
@@ -181,7 +322,17 @@ fn build_buy(params: &SwapParams) -> Result<Vec<Instruction>> {
             )?,
         );
     }
+    Ok(())
+}
 
+#[inline]
+fn build_buy(params: &SwapParams) -> Result<Vec<Instruction>> {
+    let mut instructions = if should_use_v2_layout(params)? {
+        build_buy_unified(params)
+    } else {
+        build_buy_legacy(params)
+    }?;
+    prepend_precheck_if_needed(params, &mut instructions)?;
     Ok(instructions)
 }
 
@@ -492,6 +643,14 @@ fn build_sell_legacy(params: &SwapParams) -> Result<Vec<Instruction>> {
 // ---------------------------------------------------------------------------
 
 fn build_buy_unified(params: &SwapParams) -> Result<Vec<Instruction>> {
+    build_buy_unified_with_minimum(params, None, None)
+}
+
+fn build_buy_unified_with_minimum(
+    params: &SwapParams,
+    minimum: Option<u64>,
+    quote_program: Option<Pubkey>,
+) -> Result<Vec<Instruction>> {
     use crate::instruction::pumpfun_ix_data::{
         encode_pumpfun_buy_exact_quote_in_ix_data, encode_pumpfun_buy_ix_data, PumpFunIxVersion,
     };
@@ -536,8 +695,9 @@ fn build_buy_unified(params: &SwapParams) -> Result<Vec<Instruction>> {
     };
 
     let (quote_mint, quote_token_program) = effective_quote_mint_and_token_program(protocol_params);
+    let quote_token_program = quote_program.unwrap_or(quote_token_program);
     validate_v2_buy_quote_mint(&params.input_mint, &quote_mint)?;
-    let quote_token_program_meta = crate::constants::TOKEN_PROGRAM_META;
+    let quote_token_program_meta = AccountMeta::new_readonly(quote_token_program, false);
 
     let associated_base_bonding_curve =
         crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
@@ -618,7 +778,12 @@ fn build_buy_unified(params: &SwapParams) -> Result<Vec<Instruction>> {
         );
     }
 
-    let (buy_data, quote_amount_to_fund) = if let Some(token_amount) = params.fixed_output_amount {
+    let (buy_data, quote_amount_to_fund) = if let Some(minimum) = minimum {
+        (
+            encode_pumpfun_buy_exact_quote_in_ix_data(lamports_in, minimum, PumpFunIxVersion::V2),
+            lamports_in,
+        )
+    } else if let Some(token_amount) = params.fixed_output_amount {
         (encode_pumpfun_buy_ix_data(token_amount, lamports_in, PumpFunIxVersion::V2), lamports_in)
     } else {
         let buy_token_amount = get_buy_token_amount_from_sol_amount(
@@ -704,6 +869,13 @@ fn build_buy_unified(params: &SwapParams) -> Result<Vec<Instruction>> {
 }
 
 fn build_sell_unified(params: &SwapParams) -> Result<Vec<Instruction>> {
+    build_sell_unified_with_quote_program(params, None)
+}
+
+fn build_sell_unified_with_quote_program(
+    params: &SwapParams,
+    quote_program: Option<Pubkey>,
+) -> Result<Vec<Instruction>> {
     use crate::instruction::pumpfun_ix_data::{encode_pumpfun_sell_ix_data, PumpFunIxVersion};
     use crate::instruction::utils::pumpfun::{
         get_buyback_fee_recipient_random, get_fee_sharing_config_pda,
@@ -773,8 +945,9 @@ fn build_sell_unified(params: &SwapParams) -> Result<Vec<Instruction>> {
     };
 
     let (quote_mint, quote_token_program) = effective_quote_mint_and_token_program(protocol_params);
+    let quote_token_program = quote_program.unwrap_or(quote_token_program);
     validate_v2_sell_quote_mint(&params.output_mint, &quote_mint)?;
-    let quote_token_program_meta = crate::constants::TOKEN_PROGRAM_META;
+    let quote_token_program_meta = AccountMeta::new_readonly(quote_token_program, false);
 
     let associated_base_bonding_curve =
         crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
@@ -1040,17 +1213,437 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn official_curve_route_preserves_final_limit_and_native_sol_settlement() {
+        use crate::constants::{SOL_TOKEN_ACCOUNT, USDC_TOKEN_ACCOUNT, WSOL_TOKEN_ACCOUNT};
+        use crate::{PumpFunQuoteHop, PumpFunQuoteRoute, PumpFunQuoteVenue, PumpRouteOptions};
+        for asset in [SOL_TOKEN_ACCOUNT, USDC_TOKEN_ACCOUNT] {
+            for buy in [true, false] {
+                let middle = Pubkey::new_unique();
+                let target = Pubkey::new_unique();
+                let mut params = swap_params_for_buy(target, TOKEN_PROGRAM_2022);
+                let venue = |mint, quote| {
+                    let DexParamEnum::PumpFun(mut curve) =
+                        swap_params_for_buy(mint, TOKEN_PROGRAM_2022).protocol_params
+                    else {
+                        unreachable!()
+                    };
+                    curve.quote_mint = quote;
+                    Arc::make_mut(&mut curve.bonding_curve).quote_mint = quote;
+                    curve.associated_bonding_curve =
+                        crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
+                            &curve.bonding_curve.account,
+                            &mint,
+                            &TOKEN_PROGRAM_2022,
+                        );
+                    PumpFunQuoteVenue::PumpFun {
+                        mint,
+                        curve,
+                        quote_token_program: TOKEN_PROGRAM_2022,
+                        base_transfer_fee: Default::default(),
+                        quote_transfer_fee: Default::default(),
+                    }
+                };
+                let currency = if asset == SOL_TOKEN_ACCOUNT { WSOL_TOKEN_ACCOUNT } else { asset };
+                let mut steps = vec![
+                    PumpFunQuoteHop::exact_in(venue(middle, currency), asset, middle, 900),
+                    PumpFunQuoteHop::exact_in(venue(target, middle), middle, target, 800),
+                ];
+                if asset == SOL_TOKEN_ACCOUNT {
+                    if let PumpFunQuoteVenue::PumpFun { quote_token_program, .. } =
+                        &mut steps[0].venue
+                    {
+                        *quote_token_program = crate::constants::TOKEN_PROGRAM;
+                    }
+                }
+                if !buy {
+                    steps.reverse();
+                    for step in &mut steps {
+                        std::mem::swap(&mut step.input_mint, &mut step.output_mint);
+                    }
+                }
+                let options = PumpRouteOptions {
+                    minimum_output_amount: Some(700),
+                    buyback_recipient: Some(params.payer.pubkey()),
+                    ..Default::default()
+                };
+                let route = if buy {
+                    PumpFunQuoteRoute::buy(steps).with_buy_execution(options)
+                } else {
+                    PumpFunQuoteRoute::sell(steps).with_sell_execution(options)
+                };
+                params.input_mint = if buy { asset } else { target };
+                params.output_mint = if buy { target } else { asset };
+                params.protocol_params = DexParamEnum::PumpFunQuoteRoute(route);
+                params.create_input_mint_ata = true;
+                params.close_output_mint_ata = !buy;
+                let ixs = if buy {
+                    PumpFunInstructionBuilder.build_buy_instructions(&params).await
+                } else {
+                    PumpFunInstructionBuilder.build_sell_instructions(&params).await
+                }
+                .unwrap();
+                let swaps: Vec<_> = ixs
+                    .iter()
+                    .filter(|ix| ix.data.starts_with(&[43, 100, 73, 19, 233, 246, 111, 148]))
+                    .collect();
+                assert_eq!(swaps.len(), 1);
+                assert_eq!(&swaps[0].data[8..16], &params.input_amount.unwrap().to_le_bytes());
+                assert_eq!(&swaps[0].data[16..24], &700u64.to_le_bytes());
+                assert_eq!(swaps[0].accounts.len(), 26);
+                assert!(
+                    !ixs.iter().any(|ix| ix.program_id == Pubkey::default()),
+                    "curve currency uses wallet SOL without wrapping"
+                );
+                assert!(
+                    !ixs.iter().any(|ix| ix.data == [9]),
+                    "do not close the unused native curve WSOL ATA"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stock_curve_route_preserves_amounts_programs_and_account_lifecycle() {
+        use crate::trading::core::params::{RaydiumCpmmParams, TokenTransferFee};
+        use crate::{PumpFunQuoteHop, PumpFunQuoteRoute, PumpFunQuoteVenue};
+        for asset in [
+            crate::constants::SOL_TOKEN_ACCOUNT,
+            crate::constants::WSOL_TOKEN_ACCOUNT,
+            crate::constants::USDC_TOKEN_ACCOUNT,
+        ] {
+            for buy in [true, false] {
+                let mint = Pubkey::new_unique();
+                let stock = Pubkey::new_unique();
+                let mut params = swap_params_for_buy(mint, TOKEN_PROGRAM_2022);
+                let DexParamEnum::PumpFun(mut curve) = params.protocol_params.clone() else {
+                    unreachable!()
+                };
+                curve.quote_mint = stock;
+                Arc::make_mut(&mut curve.bonding_curve).quote_mint = stock;
+                curve.close_token_account_when_sell = Some(true); // Must not close a route leg's ATA.
+                let venue = PumpFunQuoteVenue::PumpFun {
+                    mint,
+                    curve,
+                    quote_token_program: TOKEN_PROGRAM_2022,
+                    base_transfer_fee: TokenTransferFee::default(),
+                    quote_transfer_fee: TokenTransferFee::default(),
+                };
+                let funding = if asset == crate::constants::SOL_TOKEN_ACCOUNT {
+                    crate::constants::WSOL_TOKEN_ACCOUNT
+                } else {
+                    asset
+                };
+                let conversion = RaydiumCpmmParams::from_trade(
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    funding,
+                    stock,
+                    Pubkey::new_unique(),
+                    Pubkey::new_unique(),
+                    TOKEN_PROGRAM,
+                    TOKEN_PROGRAM_2022,
+                    Pubkey::new_unique(),
+                    1_000_000_000,
+                    1_000_000_000,
+                );
+                let bridge = PumpFunQuoteVenue::RaydiumCpmm(conversion);
+                let route = if buy {
+                    PumpFunQuoteRoute::buy(vec![
+                        PumpFunQuoteHop::exact_in(bridge, asset, stock, 900),
+                        PumpFunQuoteHop::exact_in(venue, stock, mint, 800),
+                    ])
+                } else {
+                    PumpFunQuoteRoute::sell(vec![
+                        PumpFunQuoteHop::exact_in(venue, mint, stock, 900),
+                        PumpFunQuoteHop::exact_in(bridge, stock, asset, 800),
+                    ])
+                };
+                params.protocol_params = DexParamEnum::PumpFunQuoteRoute(route.clone());
+                params.input_mint = if buy { asset } else { mint };
+                params.output_mint = if buy { mint } else { asset };
+                params.input_amount = Some(1000);
+                params.trade_type = if buy { TradeType::Buy } else { TradeType::Sell };
+                params.create_input_mint_ata = true;
+                params.create_output_mint_ata = true;
+                params.close_output_mint_ata = !buy && asset == crate::constants::SOL_TOKEN_ACCOUNT;
+                let ixs = if buy {
+                    PumpFunInstructionBuilder.build_buy_instructions(&params).await
+                } else {
+                    PumpFunInstructionBuilder.build_sell_instructions(&params).await
+                }
+                .unwrap();
+                let curve_index =
+                    ixs.iter().position(|ix| ix.program_id == accounts::PUMPFUN).unwrap();
+                let bridge_index = ixs
+                    .iter()
+                    .position(|ix| {
+                        ix.program_id
+                            == crate::instruction::utils::raydium_cpmm::accounts::RAYDIUM_CPMM
+                    })
+                    .unwrap();
+                assert_eq!(curve_index > bridge_index, buy);
+                assert_eq!(
+                    u64::from_le_bytes(ixs[bridge_index].data[16..24].try_into().unwrap()),
+                    if buy { 900 } else { 800 }
+                );
+                let ix = &ixs[curve_index];
+                assert_eq!(
+                    &ix.data[..8],
+                    if buy {
+                        &crate::instruction::utils::pumpfun::BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
+                    } else {
+                        &crate::instruction::utils::pumpfun::SELL_V2_DISCRIMINATOR
+                    }
+                );
+                assert_eq!(
+                    u64::from_le_bytes(ix.data[8..16].try_into().unwrap()),
+                    if buy { 900 } else { 1000 }
+                );
+                assert_eq!(
+                    u64::from_le_bytes(ix.data[16..24].try_into().unwrap()),
+                    if buy { 800 } else { 900 }
+                );
+                assert_eq!(ix.accounts[2].pubkey, stock);
+                assert_eq!(ix.accounts[4].pubkey, TOKEN_PROGRAM_2022);
+                let stock_ata = crate::common::spl_associated_token_account::get_associated_token_address_with_program_id(&params.payer.pubkey(), &stock, &TOKEN_PROGRAM_2022);
+                assert_eq!(ix.accounts[15].pubkey, stock_ata);
+                assert!(!ixs
+                    .iter()
+                    .any(|ix| ix.program_id == TOKEN_PROGRAM_2022 && ix.data == [9]));
+                let preview =
+                    route.preview(params.input_mint, params.output_mint, 1000, 100, buy).unwrap();
+                assert_eq!(preview.hops[1].input_amount, 900);
+                assert_eq!(preview.minimum_output_credit, 800);
+                // The same guaranteed-balance route must also assemble compact V3.
+                let mut v3_route = route.clone();
+                let hops = if buy { &mut v3_route.buy_hops } else { &mut v3_route.sell_hops };
+                let index = if buy { 1 } else { 0 };
+                let PumpFunQuoteVenue::PumpFun {
+                    mint,
+                    curve,
+                    quote_token_program,
+                    base_transfer_fee,
+                    quote_transfer_fee,
+                } = hops[index].venue.clone()
+                else {
+                    unreachable!()
+                };
+                hops[index].venue = PumpFunQuoteVenue::PumpFunV3 {
+                    mint,
+                    params: crate::PumpFunV3Params {
+                        curve,
+                        quote_token_program,
+                        base_transfer_fee,
+                        quote_transfer_fee,
+                        minimum_output_amount: 1,
+                    },
+                };
+                let mut v3_params = params.clone();
+                v3_params.protocol_params = DexParamEnum::PumpFunQuoteRoute(v3_route);
+                let compact = if buy {
+                    PumpFunInstructionBuilder.build_buy_instructions(&v3_params).await
+                } else {
+                    PumpFunInstructionBuilder.build_sell_instructions(&v3_params).await
+                }
+                .unwrap();
+                let v3_ix = compact.iter().find(|ix| ix.program_id == accounts::PUMPFUN).unwrap();
+                assert_eq!(v3_ix.accounts.len(), 17);
+                assert_eq!(
+                    &v3_ix.data[..8],
+                    if buy {
+                        &[225, 247, 80, 30, 213, 179, 132, 136]
+                    } else {
+                        &[28, 146, 222, 119, 38, 196, 105, 213]
+                    }
+                );
+                assert_eq!(&v3_ix.data[8..24], &ix.data[8..24]); // Hop minimum, not params' placeholder.
+                if buy {
+                    assert_eq!(&v3_ix.data[24..], &[0]);
+                } else {
+                    assert_eq!(v3_ix.data.len(), 24);
+                }
+                let mapping = if buy {
+                    [0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 20, 22, 9, 24, 25, 26]
+                } else {
+                    [0, 1, 2, 3, 4, 10, 11, 12, 13, 14, 15, 19, 21, 9, 23, 24, 25]
+                };
+                for (i, old) in mapping.into_iter().enumerate() {
+                    // Buyback recipient is independently selected for each instruction.
+                    if i != 13 {
+                        assert_eq!(v3_ix.accounts[i], ix.accounts[old]);
+                    }
+                }
+                assert!(!compact
+                    .iter()
+                    .any(|ix| ix.program_id == TOKEN_PROGRAM_2022 && ix.data == [9]));
+                // Reject unsafe snapshots and unprotected/oversized route legs.
+                for invalid in 0..7 {
+                    let mut bad = route.clone();
+                    let hops = if buy { &mut bad.buy_hops } else { &mut bad.sell_hops };
+                    let curve_hop = if buy { 1 } else { 0 };
+                    if invalid == 5 {
+                        hops[curve_hop].minimum_amount_out = 0;
+                    } else if invalid == 6 {
+                        hops[1].input_amount = Some(901);
+                    } else {
+                        let PumpFunQuoteVenue::PumpFun {
+                            curve,
+                            quote_token_program,
+                            quote_transfer_fee,
+                            ..
+                        } = &mut hops[curve_hop].venue
+                        else {
+                            unreachable!()
+                        };
+                        match invalid {
+                            0 => Arc::make_mut(&mut curve.bonding_curve).complete = true,
+                            1 => {
+                                Arc::make_mut(&mut curve.bonding_curve).account =
+                                    Pubkey::new_unique()
+                            }
+                            2 => curve.quote_mint = Pubkey::new_unique(),
+                            3 => *quote_token_program = Pubkey::new_unique(),
+                            4 => quote_transfer_fee.basis_points = 1,
+                            _ => unreachable!(),
+                        }
+                    }
+                    assert!(bad
+                        .preview(params.input_mint, params.output_mint, 1000, 100, buy)
+                        .is_err());
+                }
+                params.fixed_output_amount = Some(800);
+                let result = if buy {
+                    PumpFunInstructionBuilder.build_buy_instructions(&params).await
+                } else {
+                    PumpFunInstructionBuilder.build_sell_instructions(&params).await
+                };
+                assert!(result.is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v3_direct_limits_and_account_validation() {
+        use crate::trading::core::params::TokenTransferFee;
+        for native in [false, true] {
+            let mint = Pubkey::new_unique();
+            let mut params = swap_params_for_buy(mint, TOKEN_PROGRAM_2022);
+            let DexParamEnum::PumpFun(mut curve) = params.protocol_params.clone() else {
+                unreachable!()
+            };
+            let quote =
+                if native { crate::constants::WSOL_TOKEN_ACCOUNT } else { Pubkey::new_unique() };
+            curve.quote_mint = quote;
+            Arc::make_mut(&mut curve.bonding_curve).quote_mint = quote;
+            let v3 = crate::PumpFunV3Params {
+                curve,
+                quote_token_program: if native { TOKEN_PROGRAM } else { TOKEN_PROGRAM_2022 },
+                minimum_output_amount: 80,
+                base_transfer_fee: TokenTransferFee::default(),
+                quote_transfer_fee: TokenTransferFee::default(),
+            };
+            params.protocol_params = DexParamEnum::PumpFunV3(v3.clone());
+            params.input_amount = Some(100);
+            params.input_mint = if native { crate::constants::SOL_TOKEN_ACCOUNT } else { quote };
+            params.open_seed_optimize = true; // V3 uses canonical ATAs even with this preference.
+            let assert_compact_parity = |ix: &Instruction, name: &str, amount, limit, fill| {
+                use super::super::pump_compact_accounts::{
+                    derive_pump_v3_accounts, PumpCompactAccountParams,
+                };
+                use super::super::pump_upgrade::build_pump_upgrade_instruction;
+                let expected = global_constants::BUYBACK_FEE_RECIPIENTS
+                    .iter()
+                    .find_map(|recipient| {
+                        let keys = derive_pump_v3_accounts(PumpCompactAccountParams {
+                            user: params.payer.pubkey(),
+                            base_mint: mint,
+                            quote_mint: quote,
+                            base_token_program: TOKEN_PROGRAM_2022,
+                            quote_token_program: v3.quote_token_program,
+                            buyback_recipient: *recipient,
+                            cashback: false,
+                            complete: false,
+                        })
+                        .unwrap();
+                        (keys["buyback_fee_recipient"] == ix.accounts[13].pubkey).then_some(keys)
+                    })
+                    .expect("buyback recipient belongs to the configured set");
+                assert_eq!(
+                    *ix,
+                    build_pump_upgrade_instruction(name, &expected, &[amount, limit], fill, &[])
+                        .unwrap()
+                );
+            };
+            for exact_out in [false, true] {
+                params.fixed_output_amount = exact_out.then_some(70);
+                let ixs = PumpFunInstructionBuilder.build_buy_instructions(&params).await.unwrap();
+                let ix = ixs.iter().find(|ix| ix.program_id == accounts::PUMPFUN).unwrap();
+                assert_eq!(ix.accounts.len(), 17);
+                assert_eq!(
+                    &ix.data[..8],
+                    if exact_out {
+                        &[7, 5, 29, 196, 245, 23, 101, 80]
+                    } else {
+                        &[225, 247, 80, 30, 213, 179, 132, 136]
+                    }
+                );
+                assert_eq!(
+                    u64::from_le_bytes(ix.data[8..16].try_into().unwrap()),
+                    if exact_out { 70 } else { 100 }
+                );
+                assert_eq!(
+                    u64::from_le_bytes(ix.data[16..24].try_into().unwrap()),
+                    if exact_out { 100 } else { 80 }
+                );
+                assert_eq!(ix.data[24], 0);
+                assert_compact_parity(
+                    ix,
+                    if exact_out { "pump_buy_v3" } else { "pump_buy_exact_quote_in_v3" },
+                    if exact_out { 70 } else { 100 },
+                    if exact_out { 100 } else { 80 },
+                    Some(false),
+                );
+                assert_eq!(ix.accounts[9].pubkey, crate::common::spl_associated_token_account::get_associated_token_address_with_program_id(&params.payer.pubkey(), &mint, &TOKEN_PROGRAM_2022));
+                if native {
+                    assert!(!ixs.iter().any(|i| i.program_id == TOKEN_PROGRAM));
+                }
+            }
+            params.fixed_output_amount = None;
+            std::mem::swap(&mut params.input_mint, &mut params.output_mint);
+            let ixs = PumpFunInstructionBuilder.build_sell_instructions(&params).await.unwrap();
+            let ix = ixs.iter().find(|ix| ix.program_id == accounts::PUMPFUN).unwrap();
+            assert_eq!(ix.data.len(), 24);
+            assert_eq!(u64::from_le_bytes(ix.data[16..24].try_into().unwrap()), 80);
+            assert_compact_parity(ix, "pump_sell_v3", 100, 80, None);
+            for invalid in 0..5 {
+                let mut bad = v3.clone();
+                match invalid {
+                    0 => Arc::make_mut(&mut bad.curve.bonding_curve).is_cashback_coin = true,
+                    1 => Arc::make_mut(&mut bad.curve.bonding_curve).complete = true,
+                    2 => bad.base_transfer_fee.basis_points = 1,
+                    3 => bad.minimum_output_amount = 0,
+                    4 => bad.quote_token_program = Pubkey::new_unique(),
+                    _ => unreachable!(),
+                }
+                params.protocol_params = DexParamEnum::PumpFunV3(bad);
+                assert!(PumpFunInstructionBuilder.build_sell_instructions(&params).await.is_err());
+            }
+        }
+    }
+
     #[test]
     fn pump_suffix_buy_forces_token_2022_even_with_explicit_legacy_token_program() {
         crate::common::seed::set_default_rents();
         let params = swap_params_for_buy(pump_mint(), TOKEN_PROGRAM);
         let instructions = build_buy(&params).unwrap();
 
-        assert_eq!(instructions.len(), 3);
-        assert_eq!(instructions[2].accounts[8].pubkey, TOKEN_PROGRAM_2022);
-        assert_eq!(instructions[1].program_id, TOKEN_PROGRAM_2022);
-        assert_eq!(instructions[2].accounts.len(), 18);
-        assert_eq!(instructions[2].data.len(), 25);
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[1].accounts[8].pubkey, TOKEN_PROGRAM_2022);
+        assert_eq!(instructions[0].program_id, crate::constants::ASSOCIATED_TOKEN_PROGRAM_ID);
+        assert_eq!(instructions[0].accounts[5].pubkey, TOKEN_PROGRAM_2022);
+        assert_eq!(instructions[1].accounts.len(), 18);
+        assert_eq!(instructions[1].data.len(), 25);
     }
 
     #[test]
@@ -1103,6 +1696,28 @@ mod tests {
 
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].program_id, accounts::PUMPFUN);
+    }
+
+    #[tokio::test]
+    async fn pumpfun_versioned_buy_includes_precheck_instruction_first() {
+        crate::common::seed::set_default_rents();
+        let mut params = swap_params_for_buy(Pubkey::new_unique(), TOKEN_PROGRAM);
+        params.create_output_mint_ata = false;
+        params.precheck = Some(precheck_config());
+        let curve = match params.protocol_params {
+            DexParamEnum::PumpFun(curve) => curve,
+            _ => unreachable!(),
+        };
+        params.protocol_params = DexParamEnum::PumpFunVersioned {
+            params: curve,
+            version: crate::common::PumpFunVersion::Legacy,
+        };
+
+        let instructions = PumpFunInstructionBuilder.build_buy_instructions(&params).await.unwrap();
+
+        assert_eq!(instructions.len(), 2);
+        assert_eq!(instructions[0].program_id, DEFAULT_PRECHECK_PROGRAM_ID);
+        assert_eq!(instructions[1].program_id, accounts::PUMPFUN);
     }
 
     #[test]
@@ -1210,8 +1825,7 @@ mod tests {
     }
 
     #[test]
-    fn pumpfun_v2_explicit_wsol_input_with_output_ata_create_reports_oversized_without_dropping_priority(
-    ) {
+    fn pumpfun_v2_explicit_wsol_input_with_output_ata_create_fits_without_dropping_priority() {
         let mut params = swap_params_for_buy(pump_mint(), TOKEN_PROGRAM);
         params.input_mint = crate::constants::WSOL_TOKEN_ACCOUNT;
         params.create_input_mint_ata = true;
@@ -1223,7 +1837,7 @@ mod tests {
         }
 
         let business_instructions = build_buy(&params).unwrap();
-        let err = crate::trading::common::transaction_builder::build_transaction(
+        let transaction = crate::trading::common::transaction_builder::build_transaction(
             &params.payer,
             150_000,
             500_000,
@@ -1238,11 +1852,9 @@ mod tests {
             0.001,
             None,
         )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("transaction too large"), "{err}");
-        assert!(err.contains("did not remove compute budget or relay tip"), "{err}");
+        .unwrap();
+        assert!(wincode::serialize(&transaction).unwrap().len() <= 1232);
+        assert_eq!(transaction.message.instructions().len(), business_instructions.len() + 3);
     }
 
     #[test]

@@ -5,6 +5,19 @@ use crate::instruction::utils::pumpfun::reconcile_mayhem_mode_for_trade;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
+/// Explicit V3 trade with a fresh caller-supplied minimum output (raw units).
+/// Exact-output buys use SwapParams.fixed_output_amount and input_amount as the
+/// maximum quote budget. Partial fills are disabled. No RPC during construction.
+#[derive(Clone)]
+pub struct PumpFunV3Params {
+    pub curve: PumpFunParams,
+    pub quote_token_program: Pubkey,
+    pub minimum_output_amount: u64,
+    /// Verified current mint fees; V3 integration currently requires zero fees.
+    pub base_transfer_fee: super::TokenTransferFee,
+    pub quote_transfer_fee: super::TokenTransferFee,
+}
+
 /// PumpFun protocol specific parameters
 /// Configuration parameters specific to PumpFun trading protocol.
 ///
@@ -14,10 +27,12 @@ use std::sync::Arc;
 /// **Buy/sell**：`creator_vault` 及（若可得）**`tradeEvent` / CPI 日志中的 `creator`** 优先于陈旧的曲线快照；
 /// ix 组装与链下询价见 [`Self::effective_creator_for_trade`]、[`crate::instruction::utils::pumpfun::resolve_creator_vault_for_ix_with_fee_sharing`]。
 ///
-/// **Instruction layout**: The SDK selects the smallest valid layout automatically from
+/// **Low-level compatibility layout**: Unversioned builders select the layout from
 /// `quote_mint`. Native SOL-paired coins use the legacy SOL layout when `quote_mint`
 /// is default, the Solscan SOL sentinel (`SOL_TOKEN_ACCOUNT`), or the WSOL sentinel
 /// (`WSOL_TOKEN_ACCOUNT`). Non-native quote mints such as USDC use V2.
+/// TradingClient applies TradeConfig's version (V3 by default); explicit
+/// PumpFunVersioned/PumpFunV3 parameters override that default.
 #[derive(Clone)]
 pub struct PumpFunParams {
     pub bonding_curve: Arc<BondingCurveAccount>,
@@ -314,6 +329,15 @@ impl PumpFunParams {
             is_mayhem_mode: account.0.is_mayhem_mode,
             is_cashback_coin: account.0.is_cashback_coin,
             quote_mint: account.0.quote_mint,
+            creator_fee_bps: account.0.creator_fee_bps,
+            can_edit_creator_fee: account.0.can_edit_creator_fee,
+            is_holder_reward: account.0.is_holder_reward,
+            creator_fee: account.0.creator_fee,
+            protocol_fees: account.0.protocol_fees,
+            depth: account.0.depth,
+            initial_virtual_quote_reserves: account.0.initial_virtual_quote_reserves,
+            post_complete_base_out: account.0.post_complete_base_out,
+            post_complete_quote_in: account.0.post_complete_quote_in,
         };
         let associated_bonding_curve = get_associated_token_address_with_program_id(
             &bonding_curve.account,

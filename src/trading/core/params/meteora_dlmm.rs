@@ -344,11 +344,19 @@ impl MeteoraDlmmParams {
         } else {
             anyhow::bail!("DLMM swap mints do not match pool");
         };
-        let extension = first[1]
-            .as_ref()
-            .map(|account| BinArrayBitmapExtension::decode(&account.data))
-            .transpose()
-            .map_err(|err| anyhow!("DLMM bitmap extension of {lb_pair}: {err}"))?;
+        let extension = match first[1].as_ref() {
+            Some(account) if account.owner == Pubkey::default() && account.data.is_empty() => None,
+            Some(account) => {
+                if account.owner != PROGRAM_ID {
+                    anyhow::bail!("DLMM bitmap extension of {lb_pair}: invalid owner");
+                }
+                Some(
+                    BinArrayBitmapExtension::decode(&account.data)
+                        .map_err(|err| anyhow!("DLMM bitmap extension of {lb_pair}: {err}"))?,
+                )
+            }
+            None => None,
+        };
         let keys = Self::quote_account_keys(lb_pair, &state, extension.as_ref(), QUOTE_BIN_ARRAYS);
         let accounts = rpc.get_multiple_accounts(&keys).await?;
         let data = |index: usize, what: &str| {
@@ -363,11 +371,21 @@ impl MeteoraDlmmParams {
                 .map(|account| (account.owner, account.data.as_slice()))
                 .ok_or_else(|| anyhow!("DLMM {what} of {lb_pair} missing"))
         };
+        let bitmap_extension = match accounts[1].as_ref() {
+            Some(account) if account.owner == Pubkey::default() && account.data.is_empty() => None,
+            Some(account) => {
+                if account.owner != PROGRAM_ID {
+                    anyhow::bail!("DLMM bitmap extension of {lb_pair}: invalid owner");
+                }
+                Some(account.data.as_slice())
+            }
+            None => None,
+        };
         let mut params = Self::from_quote_accounts(
             *lb_pair,
             &DlmmQuoteAccounts {
                 lb_pair: data(0, "pair")?,
-                bitmap_extension: accounts[1].as_ref().map(|account| account.data.as_slice()),
+                bitmap_extension,
                 token_x_mint: mint(2, "token X mint")?,
                 token_y_mint: mint(3, "token Y mint")?,
                 clock: data(4, "clock")?,
@@ -377,6 +395,9 @@ impl MeteoraDlmmParams {
                     .collect(),
             },
         )?;
+        if params.token_x_mint != state.token_x_mint || params.token_y_mint != state.token_y_mint {
+            anyhow::bail!("DLMM mints changed during snapshot refresh");
+        }
         let quote_state = params.quote_state.as_ref().expect("loaded with its quote state");
         let start = bin_id_to_bin_array_index(quote_state.pair.active_id);
         params.bin_arrays = quote_state

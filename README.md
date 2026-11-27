@@ -39,113 +39,80 @@
     <a href="https://discord.gg/vuazbGkqQE">Discord</a>
 </p>
 
-## 📋 Table of Contents
+Current Rust version: **11.0.1**. Read the [migration notes](RELEASE_NOTES.md) before upgrading; earlier changes are in the [changelog](CHANGELOG.md).
 
-- [✨ Features](#-features)
-- [📚 Documentation Guides](#-documentation-guides)
-- [📦 Installation](#-installation)
-- [🛠️ Usage Examples](#️-usage-examples)
-  - [📋 Example Usage](#-example-usage)
-  - [⚡ Trading Parameters](#-trading-parameters)
-  - [📊 Usage Examples Summary Table](#-usage-examples-summary-table)
-  - [⚙️ SWQoS Service Configuration](#️-swqos-service-configuration)
-  - [Astralane (Binary / Plain / QUIC)](#astralane-binary--plain--quic)
-  - [Glaive (Binary HTTP / QUIC)](#glaive-binary-http--quic)
-  - [🔧 Middleware System](#-middleware-system)
-  - [🔍 Address Lookup Tables](#-address-lookup-tables)
-  - [🔍 Nonce Cache](#-nonce-cache)
-- [💰 Cashback Support (PumpFun / PumpSwap)](#-cashback-support-pumpfun--pumpswap)
-- [🔄 PumpFun V1 vs V2 Instructions](#-pumpfun-v1-vs-v2-instructions)
-- [🛡️ MEV Protection Services](#️-mev-protection-services)
-- [📁 Project Structure](#-project-structure)
-- [📄 License](#-license)
-- [💬 Contact](#-contact)
-- [⚠️ Important Notes](#️-important-notes)
+Protocol fee rotation (November 21, 2026 announcement): this source revision uses the 8 new normal fee recipients shared by Pump.fun and Pump AMM. When building trades, known old recipients from events, caches, or normal-mode overrides are replaced locally; Mayhem and buyback recipients are unchanged. Old recipients expire November 25. No additional RPC calls are made.
 
----
+## Contents
 
-## 📦 SDK Versions
+- [Related SDKs](#related-sdks)
+- [Installation](#installation)
+- [Features](#features)
+- [Routing and cached quotes](#routing)
+- [Usage examples](#usage)
+- [Protocol notes](#protocols)
+- [Documentation](#documentation)
+- [Project structure](#project-structure)
 
-This SDK is available in multiple languages:
+<a id="related-sdks"></a>
 
-| Language | Repository | Description |
-|----------|------------|-------------|
-| **Rust** | [sol-trade-sdk](https://github.com/0xfnzero/sol-trade-sdk) | Ultra-low latency with zero-copy optimization |
-| **Node.js** | [sol-trade-sdk-nodejs](https://github.com/0xfnzero/sol-trade-sdk-nodejs) | TypeScript/JavaScript for Node.js |
-| **Python** | [sol-trade-sdk-python](https://github.com/0xfnzero/sol-trade-sdk-python) | Async/await native support |
-| **Go** | [sol-trade-sdk-golang](https://github.com/0xfnzero/sol-trade-sdk-golang) | Concurrent-safe with goroutine support |
+## Related SDKs
 
-## What This SDK Is For
+Repositories are versioned independently; follow each SDK’s installation guide for compatible dependencies.
 
-`sol-trade-sdk` is the Rust implementation of the FnZero Solana trading SDK family. It focuses on low-latency transaction construction and submission for Solana DEX trading bots, copy-trading systems, sniper bots, arbitrage strategies, and private trading infrastructure.
+| Language | Repository | Purpose | Version |
+|----------|------------|-------------|---------|
+| Rust | [sol-parser-sdk](https://github.com/0xfnzero/sol-parser-sdk) | DEX transaction and account event parsing | `v0.11.0` |
+| Node.js | [sol-parser-sdk-nodejs](https://github.com/0xfnzero/sol-parser-sdk-nodejs) | DEX transaction and account event parsing | `v0.11.0` |
+| Python | [sol-parser-sdk-python](https://github.com/0xfnzero/sol-parser-sdk-python) | DEX transaction and account event parsing | `v0.11.0` |
+| Go | [sol-parser-sdk-golang](https://github.com/0xfnzero/sol-parser-sdk-golang) | DEX transaction and account event parsing | `v0.11.0` |
+| Rust | [sol-trade-sdk](https://github.com/0xfnzero/sol-trade-sdk) | Transaction building, signing and multi-channel submission | `v11.0.1` |
+| Node.js | [sol-trade-sdk-nodejs](https://github.com/0xfnzero/sol-trade-sdk-nodejs) | Transaction building, signing and multi-channel submission | `v11.0.1` |
+| Python | [sol-trade-sdk-python](https://github.com/0xfnzero/sol-trade-sdk-python) | Transaction building, signing and multi-channel submission | `v11.0.1` |
+| Go | [sol-trade-sdk-golang](https://github.com/0xfnzero/sol-trade-sdk-golang) | Transaction building, signing and multi-channel submission | `v11.0.1` |
+| Rust | [sol-shred-sdk](https://github.com/0xfnzero/sol-shred-sdk) | Raw shred decoding and ShredStream instruction events | `v7.0.0` |
+| Rust | [solana-streamer](https://github.com/0xfnzero/solana-streamer) | gRPC / ShredStream subscriptions and event streaming | `v6.0.0` |
+| Rust | [sol-trade-router-sdk](https://github.com/0xfnzero/sol-trade-router-sdk) | On-chain multi-hop router and client SDK | `v0.5.0` |
 
-| Area | Coverage |
-|------|----------|
-| DEX protocols | PumpFun, PumpSwap, LaunchLab, Bonk, StonkFun, Meteora DAMM v2, Raydium AMM v4, Raydium CPMM |
-| Submit lanes | Default Solana RPC plus Jito, Nextblock, ZeroSlot, Temporal, Bloxroute, FlashBlock, BlockRazor, Node1, Astralane, Glaive, SpeedLanding, and other SWQoS providers |
-| Trading workflows | Buy/sell, exact input/output, copy trading, sniper trading, address lookup tables, durable nonce, middleware, shared infrastructure |
-| Hot-path design | Caller supplies recent blockhash or durable nonce; trade execution avoids RPC reads for blockhash, account, or balance data |
+<a id="installation"></a>
 
-## 🔖 Current Release
+## Installation
 
-**Rust crate:** `sol-trade-sdk = "5.0.6"`
+Add the dependency to `Cargo.toml`:
 
-Version 5.0.6 adds cache-backed StonkFun quote routes for independent SOL/WSOL/USDC/stock buys and sells, including direct USDC/stock conversion. The optional `parser-adapter` feature connects parser route clues and gRPC snapshots to local quote/build without hot-path RPC. See [gRPC simulations](docs/STONKFUN_GRPC_EXAMPLES.md) for verified V1 examples and cache boundaries.
-
-This release adds first-class shared-program trading through `DexType::LaunchLab`, `DexParamEnum::LaunchLab`, and `LaunchLabParams`, plus platform-specific StonkFun names through `DexType::StonkFun`, `DexParamEnum::StonkFun`, and `StonkFunParams`. It supports dynamic quote mints and token programs, reads current LaunchLab pool and fee configuration by RPC, and builds the current 18-account buy/sell instruction layout. The same `DexType::StonkFun` routes graduated pools when paired with `DexParamEnum::StonkFunSwap` / `StonkFunSwapParams`: arbitrary token pairs, mixed SPL Token/Token-2022 programs, current AmmConfig and creator fees, transfer fees, vault balances, and both swap directions are resolved from mainnet state. Buy quotes also reduce the submitted input at the curve graduation boundary, matching the official LaunchLab SDK. For wallets that only hold SOL, `DexParamEnum::StonkFunViaSol` / `StonkFunViaSolParams` builds an atomic `SOL ↔ quote ↔ meme` two-hop for both the LaunchLab curve and graduated CPMM legs; the SOL↔quote hop currently supports Raydium CPMM and AMM v4. Existing Bonk and `RaydiumCpmm` names remain available for compatibility and direct underlying-protocol access.
-
-Explicit `StonkFunSolHop::Route` funding paths additionally support CLMM, Whirlpool, DLMM, intermediate mints and split/merge execution, with independently quoted buy/sell paths. See [StonkFun quote routes](docs/STONKFUN_ROUTES.md) for the API, fee handling and subscription-fed local quotes and remaining discovery requirements. With `parser-adapter`, `SubscriptionAccountCache::prepare_stonkfun_trade` prepares a complete independent buy or sell without hot-path RPC; see `examples/stonkfun_cached_prepare.rs`.
-
-PublicNode gRPC cache + mainnet simulation examples: [guide](docs/STONKFUN_GRPC_EXAMPLES.md).
-
-`SimpleBuyParams::stonkfun_with_token` / `SimpleSellParams::stonkfun_to_token` accept SOL, USDC, WSOL or the pool's stock quote. SOL funds wrapping; WSOL spends existing tokens. Under Auto, SOL receipt unwraps while WSOL/USDC accounts stay open. `StonkFunViaQuoteParams::curve_direct` / `graduated_direct` skip conversion for already-held quotes. Each buy/sell is a separate transaction composed directly from DEX instructions, requiring no router contract.
-
-The gated mainnet regressions use a current StonkFun reward pool and the graduated KNOTS/STONK CPMM pool. Run them without submitting a transaction:
-
-```bash
-# All mainnet simulate suites (ViaSol / direct StonkFun / Raydium CPMM)
-# Prefer a private RPC — public mainnet endpoints rate-limit under this suite.
-SOLANA_RPC_URL=... RUN_MAINNET_TESTS=1 cargo test --lib mainnet -- --nocapture --test-threads=1
-
-# Optional live PumpFun bonding-curve buy:
-PUMPFUN_MINT=<mint> RUN_MAINNET_TESTS=1 cargo test --lib pumpfun_mainnet -- --nocapture
+```toml
+[dependencies]
+sol-trade-sdk = "11.0.1"
 ```
 
-Tests create an ephemeral `Keypair::new()` wallet and virtually fund it inside `simulateTransaction(sigVerify=false)` from a high-balance mainnet account. No `PRIVATE_KEY` and no on-chain submit. Shared helpers live in `src/common/mainnet_sim.rs` (retry + soft-skip on transient RPC errors).
+Enable the optional `parser-adapter` feature to connect parsed events to cached quote preparation:
 
-Coverage:
-
-| Suite | Paths |
-|---|---|
-| `stonkfun_via_sol_mainnet` | graduated buy, curve buy, buy+sell, HotPathMinimal, wider slip, close-WSOL sell |
-| `stonkfun_mainnet` | direct curve quote↔meme, graduated StonkFunSwap, roundtrips, Bonk/LaunchLab aliases |
-| `raydium_cpmm_mainnet` | WSOL↔STONK, WSOL↔CARDS, graduated KNOTS/STONK, exact-out (STONK+CARDS) |
-| `raydium_amm_v4_mainnet` | WSOL↔USDT buy/sell/roundtrip, WSOL→USDC buy/exact-out, seed-optimize |
-| `raydium_clmm_mainnet` | SOL↔USDC buy/roundtrip, reverse after hop, SOL↔USDT, larger+wide-slip |
-| `whirlpool_mainnet` | SOL→USDC buy/roundtrip, USDC→SOL after hop, SOL→USDT, USDT reverse |
-| `pumpswap_mainnet` | from_mint, canonical/seed buy+sell, close-WSOL, USDC combined, classic/tiny/seed-optimize |
-| `meteora_damm_v2_mainnet` | USDC meme hop, exact-out, sell build, SOL/USDC direct buy + reverse build |
-| `meteora_dlmm_mainnet` | SOL→USDC buy/roundtrip, reverse after hop, high-TVL alt both dirs |
-| `cross_dex_mainnet` | CLMM↔Whirlpool compose, AMM→DAMM/DLMM/CLMM, triangle AMM→Whirlpool, CLMM→PumpSwap |
-| `pumpfun_mainnet` | optional `PUMPFUN_MINT=...` bonding-curve buy + buy/sell |
-
-Example:
-
-```bash
-RPC_URL=... cargo run -p stonkfun_via_sol_simulate
-RPC_URL=... cargo run -p stonkfun_via_sol_simulate -- --curve
+```toml
+sol-trade-sdk = { version = "11.0.1", features = ["parser-adapter"] }
 ```
 
-## ✨ Features
+To run the repository examples:
+
+```sh
+git clone https://github.com/0xfnzero/sol-trade-sdk
+cd sol-trade-sdk
+cargo run --features parser-adapter --example stock_conversion_replay
+```
+
+This example replays saved transactions offline; it needs no private key and broadcasts no transactions. See the [example index](examples/README.md) for trading, online subscription and simulation prerequisites.
+
+<a id="features"></a>
+
+## Features
 
 1. **PumpFun Trading**: Unified SDK-side `buy`, `sell`, and `buy_exact_quote_in` flow, preferring V1 for native SOL and selecting V2 for USDC/non-native quote mints or explicit WSOL settlement
 2. **PumpSwap Trading**: Support for PumpSwap pool trading operations
 3. **LaunchLab Trading**: First-class generic LaunchLab routing with Bonk compatibility names
 4. **StonkFun Trading**: First-class StonkFun routing over LaunchLab, plus graduated-pool swaps through CPMM, with arbitrary quote mints and Token-2022 support; when the wallet only holds **SOL/WSOL**, use `SimpleBuyParams::stonkfun_with_sol` / `SimpleSellParams::stonkfun_to_sol` for an atomic `SOL ↔ quote ↔ meme` two-hop without pre-holding stock quotes
-5. **Raydium CPMM Trading**: Support for Raydium CPMM (Concentrated Pool Market Maker) trading operations
+5. **Raydium CPMM Trading**: Support for Raydium constant-product pools
 6. **Raydium AMM V4 Trading**: Support for Raydium AMM V4 (Automated Market Maker) trading operations
 7. **Meteora DAMM V2 Trading**: Support for Meteora DAMM V2 (Dynamic AMM) trading operations
-8. **Multiple MEV Protection**: Support for Jito, Nextblock, ZeroSlot, Temporal, Bloxroute, FlashBlock, BlockRazor, Node1, Astralane, Glaive, LunarLander and other services
+8. **Multiple MEV Protection**: Support for Jito, Nextblock, ZeroSlot, Temporal, Bloxroute, FlashBlock, BlockRazor, Astralane, Glaive, LunarLander and other services
 9. **Concurrent Trading**: Submit through every configured SWQoS provider plus the default RPC lane; the first accepted result can return early while slower routes continue submitting
 10. **Unified Trading Interface**: Use unified trading protocol enums for trading operations
 11. **Middleware System**: Support for custom instruction middleware to modify, add, or remove instructions before transaction execution
@@ -153,45 +120,73 @@ RPC_URL=... cargo run -p stonkfun_via_sol_simulate -- --curve
 13. **Shared Infrastructure**: Share expensive RPC and SWQoS clients across multiple wallets for reduced resource usage
 14. **Hot-Path RPC Boundary**: Trade execution uses caller-supplied blockhash or durable nonce and never queries RPC for blockhash, account, or balance data
 
-## 📚 Documentation Guides
+<a id="routing"></a>
 
-| Guide | Purpose |
-|---|---|
-| [Pre-Buy Risk Gate](docs/PRE_BUY_RISK_GATE.md) | Reject risky buys from a local cache before transaction construction and submission |
-| [Low-Latency Bot Integration](docs/LOW_LATENCY_BOTS.md) | Structure event processing, state refresh, blockhash, account, and submit paths |
-| [Trading Parameters](docs/TRADING_PARAMETERS.md) | Choose buy/sell amount modes, account policies, ALTs, and nonce settings |
-| [Gas Fee Strategy](docs/GAS_FEE_STRATEGY.md) | Configure compute-unit prices, limits, relay tips, and per-lane fees |
-| [Address Lookup Tables](docs/ADDRESS_LOOKUP_TABLE.md) | Reduce versioned transaction size with one or more ALTs |
-| [Durable Nonce](docs/NONCE_CACHE.md) | Build and refresh durable-nonce transaction workflows |
+## Routing and cached quotes
 
-## 📦 Installation
+PumpSwap supports direct swaps using the pool’s actual quote mint, including TTWO / Token-2022. Use `DexParamEnum::PumpSwapQuoteRoute` for explicit funding conversion plus PumpSwap legs, with fresh pool state and quotes. Missing or mismatched creator vaults are rejected before instruction construction. See [quote tokens and conversion routes](docs/PUMPSWAP_QUOTE_ROUTING.md).
 
-### Direct Clone
+Pump.fun client trades default to V3. Set `TradeConfig::builder(...).pumpfun_version(PumpFunVersion::V2)` to select V2, or `Legacy` for native legacy curves. Explicit per-request versions override the client default. See [V3 direct trades and stock quote routes](docs/PUMPFUN_STOCK_ROUTES.md) for quote requirements and examples.
 
-Clone this project to your project directory:
+For official `multi_hop_swap` buys/sells through Pump.fun curves and migrated PumpSwap pools,
+use the [pump_multi_hop example](examples/SIMULATION.md#official-pump-multi-hop).
 
-```bash
-cd your_project_root_directory
-git clone https://github.com/0xfnzero/sol-trade-sdk
-```
+Explicit quote routes support `PumpRouteExecution::{Auto, Official, Sequential}`.
+Auto prefers an eligible official path when supplied with a fresh final minimum
+and current buyback recipient; cross-DEX routes retain sequential execution.
+See [selection and quote boundaries](docs/PUMPFUN_STOCK_ROUTES.md#official-or-sequential-execution).
 
-Add the dependency to your `Cargo.toml`:
 
-```toml
-# Add to your Cargo.toml
-sol-trade-sdk = { path = "./sol-trade-sdk", version = "5.0.6" }
-```
+Register bridge pools once with `TradeConfig::builder(...).pumpswap_routing(...)`, then use `PumpSwapAutoRoute(pool)` for cached automatic routing. Background snapshot publication keeps the hot path free of RPC reads; missing/expired state fails without fallback. Run `pumpswap_global_routing` offline or `pumpswap_global_routing_simulate` for live read-only mainnet simulation.
 
-### Use crates.io
+### Default bridge markets
 
-```toml
-# Add to your Cargo.toml
-sol-trade-sdk = "5.0.6"
-```
+Initialize `PumpSwapRoutingConfig::default()` once, then call
+`extend_pools(custom_pools)?` to merge user markets by address. Conflicting mint
+pairs fail; duplicates (including reversed SOL/WSOL pairs) are removed. Use
+`PumpSwapRoutingConfig::new(pools)` for custom-only markets. The screened mainnet
+catalog contains 58 stock pools covering 33 verified stock/ETF mints from Backpack
+and xStocks, plus WSOL/USDC (59 pools total). Historical preferences rank qualifying
+pools by snapshot-start fees, then reserve depth. Admission uses at least $500 liquid-side reserve
+and bidirectional depth quotes; configuration performs no RPC.
+The catalog is identical to sol-parser-sdk's price subscription catalog.
+Historical preferences are hints; live cached quotes select the best protected output.
+Historical pool fees and token transfer taxes are retained separately.
+For cross-DEX Stonk/Pump transaction captures, run
+`cargo run --features parser-adapter --example stock_conversion_replay`.
+It extracts approved conversion pools by each leg's identity, independently of
+the target's launch platform, without copying historical order amounts.
+[Depth criteria, sampling evidence and background subscription setup](docs/PUMPSWAP_BRIDGE_DEFAULTS.md).
 
-## 🛠️ Usage Examples
+Use `SubscriptionAccountCache::prepare_pumpswap_trade` to quote the whole explicit path, then `into_buy_params` / `into_sell_params` to construct high-level requests. Cache preparation checks freshness, vault authority and epoch-specific mint fees. Select conversion pools explicitly and prepare buy/sell separately; active transfer fees and cashback pools without an observed cashback rate are unsupported by this cached path. Offline example: `cargo run -p sol-trade-sdk --example pumpswap_cached_prepare --locked -- buy 10000`.
 
-### 📋 Example Usage
+`PreparedPumpSwapTrade::build_transaction` checks quote age and locally signs the complete transaction using the production size/version/ALT checks, with nonce, compute settings, tip and middleware included. It does not submit. PumpSwap quote routes use idempotent standard ATAs even with seed optimization enabled, so existing intermediate accounts can be reused.
+
+Given known candidate conversion pools, `prepare_best_pumpswap_trade` chooses their execution order and direction, ranking complete paths by protected output at the requested input amount. Candidate, hop and search-node limits bound the work; the result includes the selected path and rejection reasons. See the routing guide for an offline SOL↔TTWO↔target example.
+
+### Streaming signals and cached quote tools
+
+[Four transport examples and quote helpers](docs/STREAMING_QUOTES.md) cover
+parser/streamer × gRPC/shred. `PumpSwapRoutingFeed` publishes background account
+caches; `quote_pool_exact_in` and `quote_exact_in_with_impact` quote locally.
+Call `confirm_bootstrap` only after a coherent startup snapshot and catch-up;
+publish at verified complete batch boundaries. Unchanged accounts then remain
+fresh under continuous observation, while same-slot new writes can be published.
+The generic live example collects updates until you wire this provider contract.
+Bridge execution tolerance and size-impact limits are separately configurable,
+defaulting to 100 bps each per conversion hop, not 1% for the entire route.
+
+### Repeatable offline PumpSwap benchmark
+
+Run `cargo run --release --locked --example pumpswap_hotpath_benchmark` from this repository. The bundled JSON config defaults to 200 warmup calls, 1000 samples and one transaction per sample; pass a JSON config path as the final argument to change these counts. Buy and sell measurements separately report route search/preparation, three-hop instruction construction and V1 transaction construction/signing as p50/p95/p99 microseconds. The historical account fixture, signing key and blockhash are fixed. For this benchmark only, each protocol/buyback recipient array is restricted to its first captured nonzero recipient to remove production recipient-selection randomness; signatures are verified before timing and message hashes/signatures are included for reproducibility.
+
+Fixture loading and runtime setup happen outside timing. The measured loops perform no RPC and broadcast no transactions. These are local CPU measurements, not production latency or SBF execution. Repeat runs on an idle machine; compare warmed distributions using the same config and fixture. `cargo test --locked --lib mixed_venue_routes_match_independent_leg_builders_for_each_quote_policy` separately checks both route directions against independent venue builders for all exact-quote policies.
+
+<a id="usage"></a>
+
+## Usage examples
+
+### 📋 Trading workflow
 
 #### 1. Create TradingClient Instance
 
@@ -207,36 +202,36 @@ let commitment = CommitmentConfig::processed();
 // Multiple SWQoS services can be configured
 let swqos_configs: Vec<SwqosConfig> = vec![
     SwqosConfig::Default(rpc_url.clone()),
-    SwqosConfig::Jito("your uuid".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::Temporal("your api_token".to_string(), SwqosRegion::Frankfurt, None),
-    SwqosConfig::FlashBlock("your api_token".to_string(), SwqosRegion::Frankfurt, None),
+    SwqosConfig::Jito("your uuid".to_string(), SwqosRegion::Frankfurt, None, None),
+    SwqosConfig::Temporal("your api_token".to_string(), SwqosRegion::Frankfurt, None, None),
+    SwqosConfig::FlashBlock("your api_token".to_string(), SwqosRegion::Frankfurt, None, None),
     // None transport = gRPC first, JSON HTTP fallback
-    SwqosConfig::BlockRazor("your api_token".to_string(), SwqosRegion::Frankfurt, None, None),
+    SwqosConfig::BlockRazor("your api_token".to_string(), SwqosRegion::Frankfurt, None, None, None),
     // None mode = persistent QUIC first, Binary HTTP fallback
-    SwqosConfig::Astralane("your_astralane_api_key".to_string(), SwqosRegion::Frankfurt, None, None),
+    SwqosConfig::Astralane("your_astralane_api_key".to_string(), SwqosRegion::Frankfurt, None, None, None),
     SwqosConfig::SpeedLanding("your api_token".to_string(), SwqosRegion::Frankfurt, None),
     // Lunar Lander: 4th param None = QUIC (default); Some(SwqosTransport::Http) = binary HTTP
-    SwqosConfig::LunarLander("your_hellomoon_api_key".to_string(), SwqosRegion::Frankfurt, None, None),
+    SwqosConfig::LunarLander("your_hellomoon_api_key".to_string(), SwqosRegion::Frankfurt, None, None, None),
     SwqosConfig::LunarLander(
         "your_hellomoon_api_key".to_string(),
         SwqosRegion::Frankfurt,
         None,
         Some(SwqosTransport::Http),
-    ),
+    None, ),
     // Glaive: None = QUIC (default, UDP/4000); Some(Http) = binary HTTP
     SwqosConfig::Glaive(
         "your_glaive_uuid_v4_api_key".to_string(),
         SwqosRegion::Frankfurt,
         None,
         None,
-    ),
+    None, ),
 ];
 // Create TradeConfig instance
 let trade_config = TradeConfig::builder(rpc_url, swqos_configs, commitment)
     // .transaction_version(TradeTransactionVersion::V1) // default: V0-compatible mode
     // .create_wsol_ata_on_startup(true)  // default: true  - check & create WSOL ATA on init
     // .use_seed_optimize(true)            // default: true  - seed optimization for ATA ops
-    // .log_enabled(true)                  // default: true  - SDK timing / SWQOS logs
+    // .log_enabled(true)                  // default: false - opt in to synchronous SDK timing / SWQOS logs
     // .check_min_tip(false)               // default: false - filter SWQOS below min tip
     // .swqos_cores_from_end(false)        // default: false - bind SWQOS to last N CPU cores
     // .mev_protection(false)              // default: false - MEV protection for Astralane / BlockRazor / Glaive
@@ -317,7 +312,7 @@ let buy_params = SimpleBuyParams::new(
 
 #### 3b. StonkFun: buy meme with SOL / WSOL in one transaction
 
-Most StonkFun pools are priced in a stock quote (SPYx / NVDAx / STONK / CARDS, etc.). If the wallet only holds native SOL (or WSOL), you do **not** need to pre-buy the quote — use `SimpleBuyParams::stonkfun_with_sol` / `SimpleSellParams::stonkfun_to_sol` for an atomic `SOL ↔ quote ↔ meme` two-hop in one transaction:
+StonkFun pools may use stock/ETF tokens or other quote assets; a quote token is not necessarily a security. If the wallet only holds native SOL (or WSOL), you do **not** need to pre-buy the quote — use `SimpleBuyParams::stonkfun_with_sol` / `SimpleSellParams::stonkfun_to_sol` for an atomic `SOL ↔ quote ↔ meme` two-hop in one transaction:
 
 ```rust
 use sol_trade_sdk::{
@@ -412,32 +407,7 @@ Please ensure that the parameters your trading logic depends on are available in
 
 See the [low-latency bot integration checklist](docs/LOW_LATENCY_BOTS.md) for client warmup, blockhash/nonce handling, trade intent, event-state freshness, and bounded requoting.
 
-### 📊 Usage Examples Summary Table
-
-The complete bilingual index and safety classification are available in [`examples/README.md`](examples/README.md).
-
-| Description | Run Command | Guide |
-|-------------|-------------|-------------|
-| Simple buy/sell parameter API | `cargo run --package simple_trading` | [README](examples/simple_trading/README.md) |
-| Create and configure TradingClient | `cargo run --package trading_client` | [README](examples/trading_client/README.md) |
-| Share infrastructure across wallets | `cargo run --package shared_infrastructure` | [README](examples/shared_infrastructure/README.md) |
-| PumpFun sniper | `cargo run --package pumpfun_sniper_trading` | [README](examples/pumpfun_sniper_trading/README.md) |
-| PumpFun copy trading | `cargo run --package pumpfun_copy_trading` | [README](examples/pumpfun_copy_trading/README.md) |
-| StonkFun buy/sell with SOL (simulate) | `cargo run -p stonkfun_via_sol_simulate` | [source](examples/stonkfun_via_sol_simulate/src/main.rs) |
-| PumpSwap low-latency stream | `cargo run --package pumpswap_trading` | [README](examples/pumpswap_trading/README.md) |
-| PumpSwap direct RPC flow | `cargo run --package pumpswap_direct_trading` | [README](examples/pumpswap_direct_trading/README.md) |
-| Raydium CPMM | `cargo run --package raydium_cpmm_trading` | [README](examples/raydium_cpmm_trading/README.md) |
-| Raydium AMM V4 | `cargo run --package raydium_amm_v4_trading` | [README](examples/raydium_amm_v4_trading/README.md) |
-| Meteora DAMM V2 | `cargo run --package meteora_damm_v2_direct_trading` | [README](examples/meteora_damm_v2_direct_trading/README.md) |
-| Bonk sniper | `cargo run --package bonk_sniper_trading` | [README](examples/bonk_sniper_trading/README.md) |
-| Bonk copy trading | `cargo run --package bonk_copy_trading` | [README](examples/bonk_copy_trading/README.md) |
-| Instruction middleware | `cargo run --package middleware_system` | [README](examples/middleware_system/README.md) |
-| Address lookup tables | `cargo run --package address_lookup` | [README](examples/address_lookup/README.md) |
-| Durable nonce | `cargo run --package nonce_cache` | [README](examples/nonce_cache/README.md) |
-| Wrap/unwrap SOL and WSOL | `cargo run --package wsol_wrapper` | [README](examples/wsol_wrapper/README.md) |
-| Seed optimization | `cargo run --package seed_trading` | [README](examples/seed_trading/README.md) |
-| Gas fee strategy | `cargo run --package gas_fee_strategy` | [README](examples/gas_fee_strategy/README.md) |
-| Multi-DEX CLI template | `cargo run --package cli_trading` | [README](examples/cli_trading/README.md) |
+See the [example index](examples/README.md) for all examples and run commands.
 
 ### ⚙️ SWQoS Service Configuration
 
@@ -456,7 +426,7 @@ let jito_config = SwqosConfig::Jito(
     "your_uuid".to_string(),
     SwqosRegion::Frankfurt, // This parameter is still required but will be ignored
     Some("https://custom-jito-endpoint.com".to_string()) // Custom URL
-);
+, None);
 
 // Using default regional endpoint (third parameter is None)
 let temporal_config = SwqosConfig::Temporal(
@@ -513,7 +483,7 @@ let swqos_configs: Vec<SwqosConfig> = vec![
         SwqosRegion::Frankfurt,
         None,
         Some(AstralaneTransport::Quic),
-    ),
+    None, ),
 ];
 // Then create TradeConfig / TradingClient as usual with swqos_configs
 ```
@@ -545,7 +515,7 @@ let glaive_http = SwqosConfig::Glaive(
     SwqosRegion::Frankfurt,
     None, // http://fra.glaive.trade/binary?api-key=...
     Some(SwqosTransport::Http),
-);
+None, );
 ```
 
 - **QUIC** (default): `None` or `Some(SwqosTransport::Quic)`. Uses UDP port `4000`, ALPN `solana-tpu`, SNI `glaive-intake`, one persistent authenticated connection, and one unidirectional stream per transaction.
@@ -560,6 +530,20 @@ let glaive_http = SwqosConfig::Glaive(
 See the [official Glaive documentation](https://glaive.trade/docs) for credentials, rate limits, and protocol details.
 
 ---
+
+### Optional per-route minimum tip
+
+Each SWQOS route can optionally set a minimum tip in SOL, accepting decimals such as `0.0001` (internally rounded to whole lamports). Buy/sell fee lanes below this threshold are skipped before building the route tip instruction, signing or submitting its transaction. Equality is accepted. Omitting the option preserves existing behavior; zero accepts non-negative tips. This limit applies independently of the existing `check_min_tip` / `checkMinTip` option, whose behavior is preserved. Other eligible routes, including default RPC, still participate.
+
+```rust
+let provider = SwqosConfig::Jito(
+    "your_uuid".to_string(), SwqosRegion::Frankfurt, None, Some(0.0001),
+); // Minimum tip: 0.0001 SOL; use None to omit the limit.
+```
+
+### SpeedLanding regional endpoints
+
+[Official region list](https://speedlanding.trade/docs.html): New York `ny.speedlanding.trade:17778`, Frankfurt `fra.speedlanding.trade:17778`, Amsterdam `ams.speedlanding.trade:17778`, Tokyo `tyo.speedlanding.trade:17778`, London `lon.speedlanding.trade:17778`, Singapore `sgp.speedlanding.trade:17778`. Use the matching `SwqosRegion`; custom endpoints take precedence. Dublin falls back to London, SLC/LosAngeles to New York, and Default to Frankfurt.
 
 ### 🔧 Middleware System
 
@@ -580,7 +564,11 @@ Address Lookup Tables (ALT) allow you to optimize transaction size and reduce fe
 
 Use Durable Nonce to implement transaction replay protection and optimize transaction processing. For detailed information, see the [Durable Nonce Guide](docs/NONCE_CACHE.md).
 
-## 💰 Cashback Support (PumpFun / PumpSwap)
+<a id="protocols"></a>
+
+## Protocol notes
+
+### 💰 Cashback Support (PumpFun / PumpSwap)
 
 PumpFun and PumpSwap support **cashback** for eligible tokens: part of the trading fee can be returned to the user. The SDK **must know** whether the token has cashback enabled so that buy/sell instructions include the correct accounts (e.g. `UserVolumeAccumulator` as remaining account for cashback coins).
 
@@ -664,10 +652,12 @@ For legacy SOL events where `quote_mint` is `Pubkey::default()` or Solscan SOL, 
 
 #### PumpSwap: coin_creator_vault from events (no RPC)
 
-For **PumpSwap** (Pump AMM), `coin_creator_vault_ata` and `coin_creator_vault_authority` are required in buy/sell instructions. Both are available from parsed events without RPC:
+For **PumpSwap** (Pump AMM), `coin_creator_vault_ata` and `coin_creator_vault_authority` are required in buy/sell instructions. Complete legacy instruction events can provide them without hot-path RPC:
 
 - **sol-parser-sdk**: Instruction parser sets them from accounts 17 and 18; the account filler also fills them when the event comes from logs. Use `PumpSwapParams::from_trade(..., e.coin_creator_vault_ata, e.coin_creator_vault_authority, ...)` with the buy/sell event `e`.
 - **solana-streamer**: Instruction parser sets them from `accounts.get(17)` and `accounts.get(18)`. Use the same `from_trade` with the event's `coin_creator_vault_ata` and `coin_creator_vault_authority`.
+
+Those fixed indexes do not apply to V2 or multi-hop instructions. Log-only events may still contain default execution accounts. Enrich them from a verified pool cache or RPC snapshot before calling `from_trade`; the builder validates the creator authority and the ATA for the actual quote mint and token program.
 
 #### PumpSwap: virtual quote reserves
 
@@ -676,6 +666,16 @@ PumpSwap quotes must use `effective_quote_reserves = pool_quote_token_account.am
 - RPC constructors such as `PumpSwapParams::from_pool_address_by_rpc` read and apply the Pool field automatically.
 - Event fast paths must pass the event's raw `pool_quote_token_reserves` and `virtual_quote_reserves` separately to `PumpSwapParams::from_trade(...)` or `from_trade_with_fee_basis_points(...)`. Do not add them before calling the constructor.
 - The SDK uses effective reserves for buys, sells, prices, and dynamic fee-tier selection. Invalid signed sums return an error instead of wrapping.
+
+### Pump depth-2 token creation
+
+The [create_v2 depth update](https://github.com/pump-fun/pump-public-docs/blob/main/docs/instructions/CREATE_WITH_PUMP_COIN_QUOTE.md#depth) is supported by `instruction::pump_compact_accounts::derive_pump_coin_quote_create_accounts_with_chain(new_mint, quote, &chain, depth, max_depth, &listed_quote_mints)`. Pass Q's decoded venue and ancestors nearest first; `chain.len()` must equal Q's depth. A depth-1 Q creates a depth-2 child. The original helper remains available for depth-0 Q.
+
+Pass the resulting remaining accounts to `build_pump_create_v2_instruction`. The fixed 16 accounts and instruction arguments are unchanged. Depth-2 creates use 6, 9 or 12 remaining accounts depending on migration: four prefix roles, then each bonding curve and its pool/vault triple when migrated. Only the new curve's quote ATA is writable among the remaining roles. Supply the current Global depth cap and supported quote mints; account construction performs no RPC. Use v0 with ALT when required to fit transaction size.
+
+Missing chains, cycles, discontinuities, unsupported bottom currencies, Q mayhem, pending migrations and depth-limit violations are rejected locally. Trading interfaces and quote math are unchanged; the scalar initial-reserve helper does not price a full nested chain.
+
+Tests compare 12 signed instructions against official Pump SDK 4.1.0. Local LiteSVM simulations execute captured deployed bytecode using synthetic quote state and local whitelist/depth configuration: 12 positive cases and six expected failures with rollback verification. No transactions were broadcast and production latency was not measured.
 
 ## 🛡️ MEV Protection Services
 
@@ -688,10 +688,35 @@ You can apply for a key through the official website: [Community Website](https:
 - **Astralane**: Blockchain network acceleration (Binary/Plain HTTP and QUIC)
 - **Glaive**: Persistent QUIC and binary HTTP transaction delivery (minimum tip: 0.0001 SOL)
 - **SpeedLanding**: High-speed transaction execution with API key authentication
-- **Node1**: High-speed transaction execution with API key authentication
 - **LunarLander**: HelloMoon transaction landing service (minimum tip: 0.001 SOL)
 
-## 📁 Project Structure
+<a id="documentation"></a>
+
+## Documentation
+
+- [Trading parameters](docs/TRADING_PARAMETERS.md)
+- [Fee strategies](docs/GAS_FEE_STRATEGY.md)
+- [Durable nonce](docs/NONCE_CACHE.md)
+- [Address lookup tables](docs/ADDRESS_LOOKUP_TABLE.md)
+- [Low-latency integration](docs/LOW_LATENCY_BOTS.md)
+- [Pre-buy risk gate](docs/PRE_BUY_RISK_GATE.md)
+- [Pump cashback](docs/PUMP_CASHBACK_README.md)
+- [Pump 错误排查](docs/PUMP_ERRORS_AND_TROUBLESHOOTING_CN.md)
+- [StonkFun routes](docs/STONKFUN_ROUTES.md)
+- [gRPC cache and simulation](docs/STONKFUN_GRPC_EXAMPLES.md)
+- [CPMM creator-fee](docs/cpmm-creator-fee-share.md)
+- [Full documentation index](docs/README.md)
+- [Cache architecture](docs/ARCHITECTURE.md)
+- [PumpSwap routing](docs/PUMPSWAP_QUOTE_ROUTING.md)
+- [Pump.fun bonding-curve stock routes](docs/PUMPFUN_STOCK_ROUTES.md) — `pumpfun_stock_route` buy/sell example.
+- [Default bridge pools and screening](docs/PUMPSWAP_BRIDGE_DEFAULTS.md)
+- [Streaming and cached quotes](docs/STREAMING_QUOTES.md)
+- [Simulation and replay](examples/SIMULATION.md)
+
+
+<a id="project-structure"></a>
+
+## Project structure
 
 ```
 src/
@@ -711,6 +736,18 @@ src/
 └── lib.rs            # Main library file
 ```
 
+## ⏱️ Timing metrics (v3.5.0+)
+
+When `log_enabled` and SDK log are on, the executor prints `[SDK] Buy/Sell timing(...)`. **Semantics changed in v3.5.0**: `submit` is now only the send to SWQOS/RPC; `confirm` is separate; `start_to_submit` (when `grpc_recv_us` is set) is **end-to-end from gRPC event to submit**, so it is larger than in-process timings. See [submit and confirmation timing](docs/LOW_LATENCY_BOTS.md#submit-and-confirmation-latency) for definitions and how to compare with older versions.
+
+## ⚠️ Important Notes
+
+1. Test thoroughly before using on mainnet
+2. Properly configure private keys and API tokens
+3. Pay attention to slippage settings to avoid transaction failures
+4. Monitor balances and transaction fees
+5. Comply with relevant laws and regulations
+
 ## 📄 License
 
 MIT License
@@ -722,14 +759,5 @@ MIT License
 - Telegram Group: https://t.me/fnzero_group
 - Discord: https://discord.gg/vuazbGkqQE
 
-## ⏱️ Timing metrics (v3.5.0+)
 
-When `log_enabled` and SDK log are on, the executor prints `[SDK] Buy/Sell timing(...)`. **Semantics changed in v3.5.0**: `submit` is now only the send to SWQOS/RPC; `confirm` is separate; `start_to_submit` (when `grpc_recv_us` is set) is **end-to-end from gRPC event to submit**, so it is larger than in-process timings. See [docs/TIMING_METRICS.md](docs/TIMING_METRICS.md) for definitions and how to compare with older versions.
-
-## ⚠️ Important Notes
-
-1. Test thoroughly before using on mainnet
-2. Properly configure private keys and API tokens
-3. Pay attention to slippage settings to avoid transaction failures
-4. Monitor balances and transaction fees
-5. Comply with relevant laws and regulations
+Shared stock bridges: 33 official stock/ETF mints and 58 pools. See [eleven-SDK catalog and routing alignment](docs/STOCK_BRIDGE_SYNC.md) for configuration, USDC routing and cache-only boundaries.

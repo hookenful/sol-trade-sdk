@@ -41,6 +41,31 @@ fn request_mint_matches_pool(actual: Pubkey, expected: Pubkey) -> bool {
             && actual == crate::constants::SOL_TOKEN_ACCOUNT)
 }
 
+/// Returns true for quote -> base, regardless of the high-level buy/sell label.
+fn validate_request(params: &SwapParams, pool: &PumpSwapParams) -> Result<bool> {
+    pool.validate_accounts()?;
+    let quote_is_input = request_mint_matches_pool(params.input_mint, pool.quote_mint)
+        && request_mint_matches_pool(params.output_mint, pool.base_mint);
+    let base_is_input = request_mint_matches_pool(params.input_mint, pool.base_mint)
+        && request_mint_matches_pool(params.output_mint, pool.quote_mint);
+    if !quote_is_input && !base_is_input {
+        return Err(anyhow!(
+            "PumpSwap request mints do not match the supplied pool; supply a quote conversion route when the funding mint differs"
+        ));
+    }
+    let (input_program, output_program) = if quote_is_input {
+        (pool.quote_token_program, pool.base_token_program)
+    } else {
+        (pool.base_token_program, pool.quote_token_program)
+    };
+    if params.input_token_program.is_some_and(|p| p != input_program)
+        || params.output_token_program.is_some_and(|p| p != output_program)
+    {
+        return Err(anyhow!("PumpSwap request token programs do not match the supplied pool"));
+    }
+    Ok(quote_is_input)
+}
+
 fn push_cashback_remaining_accounts(
     accounts: &mut Vec<AccountMeta>,
     user: &Pubkey,
@@ -69,6 +94,11 @@ fn push_cashback_remaining_accounts(
 #[async_trait::async_trait]
 impl InstructionBuilder for PumpSwapInstructionBuilder {
     async fn build_buy_instructions(&self, params: &SwapParams) -> Result<Vec<Instruction>> {
+        if let crate::trading::core::params::DexParamEnum::PumpSwapQuoteRoute(route) =
+            &params.protocol_params
+        {
+            return super::stonkfun_quote_route::build_quote_route(params, route, true).await;
+        }
         // ========================================
         // Parameter validation and basic data preparation
         // ========================================
@@ -101,47 +131,29 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         let pool_base_token_account = protocol_params.pool_base_token_account;
         let pool_quote_token_account = protocol_params.pool_quote_token_account;
 
-        let is_wsol = (base_mint == crate::constants::WSOL_TOKEN_ACCOUNT
-            && quote_mint != crate::constants::USDC_TOKEN_ACCOUNT)
-            || (quote_mint == crate::constants::WSOL_TOKEN_ACCOUNT
-                && base_mint != crate::constants::USDC_TOKEN_ACCOUNT);
-        let is_usdc = (base_mint == crate::constants::USDC_TOKEN_ACCOUNT
-            && quote_mint != crate::constants::WSOL_TOKEN_ACCOUNT)
-            || (quote_mint == crate::constants::USDC_TOKEN_ACCOUNT
-                && base_mint != crate::constants::WSOL_TOKEN_ACCOUNT);
-        if !is_wsol && !is_usdc {
-            return Err(anyhow!("Pool must contain WSOL or USDC"));
-        }
-
         // ========================================
         // Trade calculation and account address preparation
         // ========================================
-        let quote_is_wsol_or_usdc = quote_mint == crate::constants::WSOL_TOKEN_ACCOUNT
-            || quote_mint == crate::constants::USDC_TOKEN_ACCOUNT;
-        if params.fixed_output_amount.is_some() && !quote_is_wsol_or_usdc {
+        let quote_is_input = validate_request(params, protocol_params)?;
+        if params.fixed_output_amount.is_some() && !quote_is_input {
             return Err(anyhow!(
                 "PumpSwap exact-output buy is unsupported when the pool requires a sell instruction"
             ));
         }
-        let input_stable_mint = if quote_is_wsol_or_usdc { quote_mint } else { base_mint };
-        let input_stable_token_program =
-            if quote_is_wsol_or_usdc { quote_token_program } else { base_token_program };
-        let output_trade_mint = if quote_is_wsol_or_usdc { base_mint } else { quote_mint };
-        let output_trade_token_program =
-            if quote_is_wsol_or_usdc { base_token_program } else { quote_token_program };
-        if !request_mint_matches_pool(params.input_mint, input_stable_mint)
-            || !request_mint_matches_pool(params.output_mint, output_trade_mint)
-        {
-            return Err(anyhow!("PumpSwap buy request mints do not match the supplied pool"));
-        }
+        let input_mint = if quote_is_input { quote_mint } else { base_mint };
+        let input_token_program =
+            if quote_is_input { quote_token_program } else { base_token_program };
+        let output_mint = if quote_is_input { base_mint } else { quote_mint };
+        let output_token_program =
+            if quote_is_input { base_token_program } else { quote_token_program };
         let fee_basis_points = protocol_params.fee_basis_points;
 
-        let (token_amount, sol_amount) = if let Some(output_amount) = params.fixed_output_amount {
+        let (output_amount, input_amount) = if let Some(output_amount) = params.fixed_output_amount {
             if output_amount >= pool_base_token_reserves {
                 return Err(anyhow!("Exact base output must be below the pool base reserve"));
             }
             (output_amount, params.input_amount.unwrap_or(0))
-        } else if quote_is_wsol_or_usdc {
+        } else if quote_is_input {
             let result = buy_quote_input_internal_with_fees(
                 params.input_amount.unwrap_or(0),
                 params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
@@ -184,10 +196,15 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
 
         // Determine fee recipient based on mayhem mode (pump-public-docs: 10th = Mayhem fee recipient, 11th = WSOL ATA of Mayhem; use any one randomly)
         let is_mayhem_mode = protocol_params.is_mayhem_mode;
-        let (fee_recipient, fee_recipient_meta) = if is_mayhem_mode {
-            get_mayhem_fee_recipient_random()
-        } else if let Some(recipient) = protocol_params.protocol_fee_recipient_override {
+        let (fee_recipient, fee_recipient_meta) = if let Some(recipient) = protocol_params.protocol_fee_recipient_override {
+            let recipient = if is_mayhem_mode {
+                recipient
+            } else {
+                crate::instruction::utils::pumpfun::current_normal_fee_recipient(recipient)
+            };
             (recipient, AccountMeta::new_readonly(recipient, false))
+        } else if is_mayhem_mode {
+            get_mayhem_fee_recipient_random()
         } else {
             let recipient = get_protocol_fee_recipient_random();
             (recipient, AccountMeta::new_readonly(recipient, false))
@@ -204,16 +221,16 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             // - buy_exact_quote_in: program spends exactly input_amount, wrap input_amount
             // - buy: program may spend up to max_quote, wrap max_quote
             let wrap_amount =
-                if quote_is_wsol_or_usdc && params.use_exact_sol_amount.unwrap_or(true) {
+                if quote_is_input && params.use_exact_sol_amount.unwrap_or(true) {
                     params.input_amount.unwrap_or(0)
                 } else {
-                    sol_amount
+                    input_amount
                 };
             push_create_or_wrap_user_token_account(
                 &mut instructions,
                 &params.payer.pubkey(),
-                &input_stable_mint,
-                &input_stable_token_program,
+                &input_mint,
+                &input_token_program,
                 wrap_amount,
                 params.open_seed_optimize,
             );
@@ -223,8 +240,8 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             push_create_user_token_account(
                 &mut instructions,
                 &params.payer.pubkey(),
-                &output_trade_mint,
-                &output_trade_token_program,
+                &output_mint,
+                &output_token_program,
                 params.open_seed_optimize,
             );
         }
@@ -252,7 +269,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             AccountMeta::new(params_coin_creator_vault_ata, false), // coin_creator_vault_ata
             AccountMeta::new_readonly(params_coin_creator_vault_authority, false), // coin_creator_vault_authority (readonly)
         ]);
-        if quote_is_wsol_or_usdc {
+        if quote_is_input {
             accounts.push(accounts::GLOBAL_VOLUME_ACCUMULATOR_META);
             let uva = get_user_volume_accumulator_pda(&params.payer.pubkey())
                 .ok_or_else(|| anyhow!("user_volume_accumulator PDA derivation failed"))?;
@@ -266,7 +283,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             &quote_mint,
             &quote_token_program,
             protocol_params.is_cashback_coin,
-            quote_is_wsol_or_usdc,
+            quote_is_input,
         )?;
         // `pool-v2` only when coin_creator ≠ default (@pump-fun/pump-swap-sdk remainingAccounts)；
         // 否则多出的一格会把 buyback pubkey 错位，触发 BuybackFeeRecipientNotAuthorized（6053）。
@@ -292,12 +309,12 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
 
         // buy / buy_exact_quote_in：栈上 `[u8;25]` + `new_with_bytes`，避免每笔 `Vec` 堆分配。
         let track_volume = 1_u8;
-        if quote_is_wsol_or_usdc {
+        if quote_is_input {
             let ix_data = if params.fixed_output_amount.is_some() {
-                encode_pumpswap_buy_ix_data(token_amount, sol_amount, track_volume)
+                encode_pumpswap_buy_ix_data(output_amount, input_amount, track_volume)
             } else if params.use_exact_sol_amount.unwrap_or(true) {
-                let min_base_amount_out = crate::utils::calc::common::calculate_with_slippage_sell(
-                    token_amount,
+                let min_base_amount_out = crate::utils::calc::pumpswap::minimum_output_with_slippage(
+                    output_amount,
                     params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
                 );
                 encode_pumpswap_buy_exact_quote_in_ix_data(
@@ -306,7 +323,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
                     track_volume,
                 )
             } else {
-                encode_pumpswap_buy_ix_data(token_amount, sol_amount, track_volume)
+                encode_pumpswap_buy_ix_data(output_amount, input_amount, track_volume)
             };
             instructions.push(Instruction::new_with_bytes(
                 accounts::AMM_PROGRAM,
@@ -314,7 +331,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
                 accounts,
             ));
         } else {
-            let ix_data = encode_pumpswap_sell_ix_data(sol_amount, token_amount);
+            let ix_data = encode_pumpswap_sell_ix_data(input_amount, output_amount);
             instructions.push(Instruction::new_with_bytes(
                 accounts::AMM_PROGRAM,
                 &ix_data,
@@ -325,13 +342,18 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             push_close_wsol_if_needed(
                 &mut instructions,
                 &params.payer.pubkey(),
-                &input_stable_mint,
+                &input_mint,
             );
         }
         Ok(instructions)
     }
 
     async fn build_sell_instructions(&self, params: &SwapParams) -> Result<Vec<Instruction>> {
+        if let crate::trading::core::params::DexParamEnum::PumpSwapQuoteRoute(route) =
+            &params.protocol_params
+        {
+            return super::stonkfun_quote_route::build_quote_route(params, route, false).await;
+        }
         // ========================================
         // Parameter validation and basic data preparation
         // ========================================
@@ -357,18 +379,6 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         let base_token_program = protocol_params.base_token_program;
         let quote_token_program = protocol_params.quote_token_program;
 
-        let is_wsol = (base_mint == crate::constants::WSOL_TOKEN_ACCOUNT
-            && quote_mint != crate::constants::USDC_TOKEN_ACCOUNT)
-            || (quote_mint == crate::constants::WSOL_TOKEN_ACCOUNT
-                && base_mint != crate::constants::USDC_TOKEN_ACCOUNT);
-        let is_usdc = (base_mint == crate::constants::USDC_TOKEN_ACCOUNT
-            && quote_mint != crate::constants::WSOL_TOKEN_ACCOUNT)
-            || (quote_mint == crate::constants::USDC_TOKEN_ACCOUNT
-                && base_mint != crate::constants::WSOL_TOKEN_ACCOUNT);
-        if !is_wsol && !is_usdc {
-            return Err(anyhow!("Pool must contain WSOL or USDC"));
-        }
-
         if params.input_amount.unwrap_or_default() == 0 {
             return Err(anyhow!("Token amount must be greater than zero"));
         }
@@ -379,30 +389,23 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
         // ========================================
         // Trade calculation and account address preparation
         // ========================================
-        let quote_is_wsol_or_usdc = quote_mint == crate::constants::WSOL_TOKEN_ACCOUNT
-            || quote_mint == crate::constants::USDC_TOKEN_ACCOUNT;
-        if params.fixed_output_amount.is_some() && quote_is_wsol_or_usdc {
+        let base_is_input = !validate_request(params, protocol_params)?;
+        if params.fixed_output_amount.is_some() && base_is_input {
             return Err(anyhow!(
                 "PumpSwap exact-output sell is unsupported when the pool requires a sell instruction"
             ));
         }
-        let output_stable_mint = if quote_is_wsol_or_usdc { quote_mint } else { base_mint };
-        let output_stable_token_program =
-            if quote_is_wsol_or_usdc { quote_token_program } else { base_token_program };
-        let input_trade_mint = if quote_is_wsol_or_usdc { base_mint } else { quote_mint };
-        if !request_mint_matches_pool(params.input_mint, input_trade_mint)
-            || !request_mint_matches_pool(params.output_mint, output_stable_mint)
-        {
-            return Err(anyhow!("PumpSwap sell request mints do not match the supplied pool"));
-        }
+        let output_mint = if base_is_input { quote_mint } else { base_mint };
+        let output_token_program =
+            if base_is_input { quote_token_program } else { base_token_program };
         let fee_basis_points = protocol_params.fee_basis_points;
 
-        let (token_amount, sol_amount) = if let Some(output_amount) = params.fixed_output_amount {
+        let (input_amount, output_amount) = if let Some(output_amount) = params.fixed_output_amount {
             if output_amount >= pool_base_token_reserves {
                 return Err(anyhow!("Exact base output must be below the pool base reserve"));
             }
             (params.input_amount.unwrap(), output_amount)
-        } else if quote_is_wsol_or_usdc {
+        } else if base_is_input {
             let result = sell_base_input_internal_with_fees(
                 params.input_amount.unwrap(),
                 params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
@@ -430,10 +433,15 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
 
         // Determine fee recipient based on mayhem mode (pump-public-docs: 10th = Mayhem fee recipient, 11th = WSOL ATA of Mayhem; use any one randomly)
         let is_mayhem_mode = protocol_params.is_mayhem_mode;
-        let (fee_recipient, fee_recipient_meta) = if is_mayhem_mode {
-            get_mayhem_fee_recipient_random()
-        } else if let Some(recipient) = protocol_params.protocol_fee_recipient_override {
+        let (fee_recipient, fee_recipient_meta) = if let Some(recipient) = protocol_params.protocol_fee_recipient_override {
+            let recipient = if is_mayhem_mode {
+                recipient
+            } else {
+                crate::instruction::utils::pumpfun::current_normal_fee_recipient(recipient)
+            };
             (recipient, AccountMeta::new_readonly(recipient, false))
+        } else if is_mayhem_mode {
+            get_mayhem_fee_recipient_random()
         } else {
             let recipient = get_protocol_fee_recipient_random();
             (recipient, AccountMeta::new_readonly(recipient, false))
@@ -464,8 +472,8 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             push_create_user_token_account(
                 &mut instructions,
                 &params.payer.pubkey(),
-                &output_stable_mint,
-                &output_stable_token_program,
+                &output_mint,
+                &output_token_program,
                 params.open_seed_optimize,
             );
         }
@@ -493,7 +501,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             AccountMeta::new(params_coin_creator_vault_ata, false), // coin_creator_vault_ata
             AccountMeta::new_readonly(params_coin_creator_vault_authority, false), // coin_creator_vault_authority (readonly)
         ]);
-        if !quote_is_wsol_or_usdc {
+        if !base_is_input {
             accounts.push(accounts::GLOBAL_VOLUME_ACCUMULATOR_META);
             let uva = get_user_volume_accumulator_pda(&params.payer.pubkey())
                 .ok_or_else(|| anyhow!("user_volume_accumulator PDA derivation failed"))?;
@@ -507,7 +515,7 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             &quote_mint,
             &quote_token_program,
             protocol_params.is_cashback_coin,
-            !quote_is_wsol_or_usdc,
+            !base_is_input,
         )?;
         if protocol_params.coin_creator != Pubkey::default() {
             let pool_v2 = get_pool_v2_pda(&base_mint).ok_or_else(|| {
@@ -530,23 +538,23 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
 
         // 栈数组 + `new_with_bytes`，避免 `data.to_vec()`。
         let track_volume = 1_u8;
-        if quote_is_wsol_or_usdc {
-            let ix_data = encode_pumpswap_sell_ix_data(token_amount, sol_amount);
+        if base_is_input {
+            let ix_data = encode_pumpswap_sell_ix_data(input_amount, output_amount);
             instructions.push(Instruction::new_with_bytes(
                 accounts::AMM_PROGRAM,
                 &ix_data,
                 accounts,
             ));
         } else if params.fixed_output_amount.is_some() {
-            let ix_data = encode_pumpswap_buy_ix_data(sol_amount, token_amount, track_volume);
+            let ix_data = encode_pumpswap_buy_ix_data(output_amount, input_amount, track_volume);
             instructions.push(Instruction::new_with_bytes(
                 accounts::AMM_PROGRAM,
                 &ix_data,
                 accounts,
             ));
         } else {
-            let min_base_amount_out = crate::utils::calc::common::calculate_with_slippage_sell(
-                sol_amount,
+            let min_base_amount_out = crate::utils::calc::pumpswap::minimum_output_with_slippage(
+                output_amount,
                 params.slippage_basis_points.unwrap_or(DEFAULT_SLIPPAGE),
             );
             let ix_data = encode_pumpswap_buy_exact_quote_in_ix_data(
@@ -565,13 +573,13 @@ impl InstructionBuilder for PumpSwapInstructionBuilder {
             push_close_wsol_if_needed(
                 &mut instructions,
                 &params.payer.pubkey(),
-                &output_stable_mint,
+                &output_mint,
             );
         }
         if params.close_input_mint_ata {
             instructions.push(crate::common::spl_token::close_account(
-                if quote_is_wsol_or_usdc { &base_token_program } else { &quote_token_program },
-                if quote_is_wsol_or_usdc {
+                if base_is_input { &base_token_program } else { &quote_token_program },
+                if base_is_input {
                     &user_base_token_account
                 } else {
                     &user_quote_token_account
@@ -635,7 +643,7 @@ mod tests {
         Pubkey::new_from_array([seed; 32])
     }
 
-    fn pumpswap_params() -> PumpSwapParams {
+    pub(super) fn pumpswap_params() -> PumpSwapParams {
         PumpSwapParams::new(
             pk(1),
             pk(2),
@@ -645,7 +653,8 @@ mod tests {
             1_000_000_000,
             2_000_000_000,
             0,
-            pk(5),
+            crate::instruction::utils::pumpswap::coin_creator_vault_ata(
+                Pubkey::default(), crate::constants::WSOL_TOKEN_ACCOUNT, crate::constants::TOKEN_PROGRAM),
             accounts::DEFAULT_COIN_CREATOR_VAULT_AUTHORITY,
             crate::constants::TOKEN_PROGRAM,
             crate::constants::TOKEN_PROGRAM,
@@ -666,7 +675,8 @@ mod tests {
             1_000_000_000,
             2_000_000_000,
             0,
-            pk(5),
+            crate::instruction::utils::pumpswap::coin_creator_vault_ata(
+                Pubkey::default(), pk(2), crate::constants::TOKEN_PROGRAM),
             accounts::DEFAULT_COIN_CREATOR_VAULT_AUTHORITY,
             crate::constants::TOKEN_PROGRAM,
             crate::constants::TOKEN_PROGRAM,
@@ -677,7 +687,7 @@ mod tests {
         )
     }
 
-    fn swap_params(trade_type: TradeType, fixed_output_amount: Option<u64>) -> SwapParams {
+    pub(super) fn swap_params(trade_type: TradeType, fixed_output_amount: Option<u64>) -> SwapParams {
         let (input_mint, output_mint) = if trade_type == TradeType::Sell {
             (pk(2), crate::constants::WSOL_TOKEN_ACCOUNT)
         } else {
@@ -792,8 +802,7 @@ mod tests {
             &crate::instruction::utils::pumpswap::PumpSwapFeeBasisPoints::new(25, 5, 0),
         )
         .unwrap();
-        let expected_min =
-            crate::utils::calc::common::calculate_with_slippage_sell(quote.base, 100);
+        let expected_min = ((quote.base as u128 * 9_900) / 10_000) as u64;
         assert_eq!(u64::from_le_bytes(ix.data[16..24].try_into().unwrap()), expected_min);
         assert_eq!(ix.data[24], 1);
     }
@@ -849,10 +858,12 @@ mod tests {
 
     #[tokio::test]
     async fn pumpswap_fee_atas_use_the_quote_token_program() {
-        let quote_token_program = pk(99);
+        let quote_token_program = crate::constants::TOKEN_PROGRAM_2022;
         let mut params = swap_params(TradeType::Sell, None);
         let mut protocol_params = reverse_pumpswap_params();
         protocol_params.quote_token_program = quote_token_program;
+        protocol_params.coin_creator_vault_ata = crate::instruction::utils::pumpswap::coin_creator_vault_ata(
+            protocol_params.coin_creator, protocol_params.quote_mint, quote_token_program);
         params.protocol_params = DexParamEnum::PumpSwap(protocol_params);
         params.output_mint = crate::constants::USDC_TOKEN_ACCOUNT;
 
@@ -884,7 +895,7 @@ mod tests {
 
         let error = PumpSwapInstructionBuilder.build_buy_instructions(&params).await.unwrap_err();
 
-        assert_eq!(error.to_string(), "PumpSwap buy request mints do not match the supplied pool");
+        assert!(error.to_string().contains("request mints do not match"));
     }
 
     #[tokio::test]
@@ -909,7 +920,8 @@ mod tests {
             1_000_000_000,
             2_000_000_000,
             0,
-            pk(5),
+            crate::instruction::utils::pumpswap::coin_creator_vault_ata(
+                Pubkey::default(), crate::constants::USDC_TOKEN_ACCOUNT, crate::constants::TOKEN_PROGRAM),
             accounts::DEFAULT_COIN_CREATOR_VAULT_AUTHORITY,
             crate::constants::TOKEN_PROGRAM,
             crate::constants::TOKEN_PROGRAM,
@@ -931,54 +943,129 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pumpswap_buy_uses_fee_basis_points_from_params_without_rpc() {
-        let mut params = swap_params(TradeType::Buy, None);
-        params.input_amount = Some(1_000_000);
-        params.use_exact_sol_amount = Some(false);
-        let mut protocol_params = pumpswap_params().with_fee_basis_points(20, 5, 75);
-        protocol_params.virtual_quote_reserves = 500_000_000;
-        params.protocol_params = DexParamEnum::PumpSwap(protocol_params);
+    async fn pumpswap_fee_rotation_updates_buy_sell_recipient_and_ata() {
+        use crate::instruction::utils::pumpfun::global_constants::{
+            NORMAL_FEE_RECIPIENTS, RETIRED_NORMAL_FEE_RECIPIENTS,
+        };
+        for (old, new) in RETIRED_NORMAL_FEE_RECIPIENTS.iter().zip(NORMAL_FEE_RECIPIENTS) {
+            for direction in [TradeType::Buy, TradeType::Sell] {
+                let mut params = swap_params(direction, None);
+                let buyback = pk(91);
+                params.protocol_params = DexParamEnum::PumpSwap(
+                    pumpswap_params().with_fee_recipients(*old, buyback),
+                );
+                let instructions = match direction {
+                    TradeType::Buy => PumpSwapInstructionBuilder.build_buy_instructions(&params).await,
+                    TradeType::Sell => PumpSwapInstructionBuilder.build_sell_instructions(&params).await,
+                    _ => unreachable!(),
+                }.unwrap();
+                let ix = instructions.last().unwrap();
+                assert_eq!(ix.accounts[9].pubkey, new);
+                assert_eq!(
+                    ix.accounts[10].pubkey,
+                    fee_recipient_ata(new, ix.accounts[4].pubkey, ix.accounts[12].pubkey),
+                );
+                assert_eq!(ix.accounts[ix.accounts.len() - 2].pubkey, buyback);
+            }
+        }
+    }
 
-        let instructions =
-            PumpSwapInstructionBuilder.build_buy_instructions(&params).await.unwrap();
+    #[tokio::test]
+    async fn pumpswap_mayhem_builders_preserve_cached_fee_recipients_without_rpc() {
+        let recipient = pk(90);
+        let buyback = pk(91);
+        for direction in [TradeType::Buy, TradeType::Sell] {
+            let mut params = swap_params(direction, None);
+            let mut pool_params = pumpswap_params().with_fee_recipients(recipient, buyback);
+            pool_params.is_mayhem_mode = true;
+            params.protocol_params = DexParamEnum::PumpSwap(pool_params);
+            let instructions = match direction {
+                TradeType::Buy => PumpSwapInstructionBuilder.build_buy_instructions(&params).await,
+                TradeType::Sell => PumpSwapInstructionBuilder.build_sell_instructions(&params).await,
+                _ => unreachable!(),
+            }.unwrap();
+            let ix = instructions.last().unwrap();
+            assert_eq!(ix.accounts[9].pubkey, recipient);
+            assert_eq!(ix.accounts[ix.accounts.len() - 2].pubkey, buyback);
+        }
+    }
+
+    #[tokio::test]
+    async fn pumpswap_exact_quote_buy_rounds_minimum_base_output_down() {
+        let params = swap_params(TradeType::Buy, None);
+        let instructions = PumpSwapInstructionBuilder.build_buy_instructions(&params).await.unwrap();
         let ix = instructions.last().unwrap();
+        let quoted = crate::utils::calc::pumpswap::buy_quote_input_internal_with_fees(
+            100_000, 100, 1_000_000_000, 2_000_000_000, 0,
+            &crate::instruction::utils::pumpswap::PumpSwapFeeBasisPoints::new(25, 5, 0),
+        ).unwrap();
+        let expected = ((quoted.base as u128 * 9_900) / 10_000) as u64;
+        assert_ne!(quoted.base % 100, 0, "fixture must exercise fractional slippage");
+        assert_eq!(&ix.data[..8], crate::instruction::utils::pumpswap::BUY_EXACT_QUOTE_IN_DISCRIMINATOR);
+        assert_eq!(u64::from_le_bytes(ix.data[16..24].try_into().unwrap()), expected);
+    }
 
-        assert_eq!(&ix.data[..8], crate::instruction::utils::pumpswap::BUY_DISCRIMINATOR);
-        let base_amount_out = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
+    #[tokio::test]
+    async fn pumpswap_buy_uses_fee_basis_points_from_params_without_rpc() {
+        for virtual_reserve in [-500_000_000, 0, 500_000_000] {
+            let mut params = swap_params(TradeType::Buy, None);
+            params.input_amount = Some(1_000_000);
+            params.use_exact_sol_amount = Some(false);
+            let mut protocol_params = pumpswap_params().with_fee_basis_points(20, 5, 75);
+            protocol_params.virtual_quote_reserves = virtual_reserve;
+            params.protocol_params = DexParamEnum::PumpSwap(protocol_params);
 
-        let expected = crate::utils::calc::pumpswap::buy_quote_input_internal_with_fees(
-            1_000_000,
-            100,
-            1_000_000_000,
-            2_000_000_000,
-            500_000_000,
-            &crate::instruction::utils::pumpswap::PumpSwapFeeBasisPoints::new(20, 5, 0),
-        )
-        .unwrap();
-        assert_eq!(base_amount_out, expected.base);
+            let instructions =
+                PumpSwapInstructionBuilder.build_buy_instructions(&params).await.unwrap();
+            let ix = instructions.last().unwrap();
+
+            assert_eq!(&ix.data[..8], crate::instruction::utils::pumpswap::BUY_DISCRIMINATOR);
+            let base_amount_out = u64::from_le_bytes(ix.data[8..16].try_into().unwrap());
+
+            let expected = crate::utils::calc::pumpswap::buy_quote_input_internal_with_fees(
+                1_000_000,
+                100,
+                1_000_000_000,
+                2_000_000_000,
+                virtual_reserve,
+                &crate::instruction::utils::pumpswap::PumpSwapFeeBasisPoints::new(20, 5, 0),
+            )
+            .unwrap();
+            assert_eq!(base_amount_out, expected.base);
+        }
     }
 
     #[tokio::test]
     async fn pumpswap_sell_prices_with_effective_quote_reserves() {
-        let mut params = swap_params(TradeType::Sell, None);
-        let mut protocol_params = pumpswap_params().with_fee_basis_points(20, 5, 0);
-        protocol_params.virtual_quote_reserves = 500_000_000;
-        params.protocol_params = DexParamEnum::PumpSwap(protocol_params);
+        for virtual_reserve in [-500_000_000, 0, 500_000_000] {
+            let mut params = swap_params(TradeType::Sell, None);
+            let mut protocol_params = pumpswap_params().with_fee_basis_points(20, 5, 0);
+            protocol_params.virtual_quote_reserves = virtual_reserve;
+            params.protocol_params = DexParamEnum::PumpSwap(protocol_params);
 
-        let instructions =
-            PumpSwapInstructionBuilder.build_sell_instructions(&params).await.unwrap();
-        let ix = instructions.last().unwrap();
-        let min_quote_amount_out = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
+            let instructions =
+                PumpSwapInstructionBuilder.build_sell_instructions(&params).await.unwrap();
+            let ix = instructions.last().unwrap();
+            let min_quote_amount_out = u64::from_le_bytes(ix.data[16..24].try_into().unwrap());
 
-        let expected = crate::utils::calc::pumpswap::sell_base_input_internal_with_fees(
-            100_000,
-            100,
-            1_000_000_000,
-            2_000_000_000,
-            500_000_000,
-            &crate::instruction::utils::pumpswap::PumpSwapFeeBasisPoints::new(20, 5, 0),
-        )
-        .unwrap();
-        assert_eq!(min_quote_amount_out, expected.min_quote);
+            let expected = crate::utils::calc::pumpswap::sell_base_input_internal_with_fees(
+                100_000,
+                100,
+                1_000_000_000,
+                2_000_000_000,
+                virtual_reserve,
+                &crate::instruction::utils::pumpswap::PumpSwapFeeBasisPoints::new(20, 5, 0),
+            )
+            .unwrap();
+            assert_eq!(min_quote_amount_out, expected.min_quote);
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "pumpswap_quote_tests.rs"]
+mod quote_tests;
+
+#[cfg(test)]
+#[path = "pumpswap_reported_failure_tests.rs"]
+mod reported_failure_tests;

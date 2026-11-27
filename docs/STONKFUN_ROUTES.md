@@ -158,8 +158,7 @@ subscribed state. Low-level explicit-hop callers still supply fresh quotes. A
 historical transaction can contain unrelated swaps; do not copy every observed
 leg into a new trade without establishing its account and mint flow.
 
-See the [capture audit](../../sol-parser-sdk/docs/STONKFUN_AUDIT.md) for actual
-transaction signatures, sampling limits and parser capabilities.
+See [parser route analysis](https://github.com/0xfnzero/sol-parser-sdk/blob/main/docs/ROUTE_ANALYSIS.md) for execution evidence, pool provenance and parser capabilities.
 
 Re-run the gated simulations without submitting transactions:
 
@@ -268,7 +267,7 @@ cargo check --workspace --examples --features parser-adapter
 ```
 
 Math dependencies are pinned to `orca_whirlpools_core` 2.1.1 (Orca license),
-`solana-clmm-raydium` 0.3.0 (MIT/Apache-2.0), and `meteora-dlmm` 0.2.0 (MIT).
+`solana-clmm-raydium` 0.4.0 (MIT/Apache-2.0), and `meteora-dlmm` 0.2.0 (MIT).
 Local orchestration validates subscription layouts and bounded traversal around
 these pure math dependencies. No router contract is involved.
 

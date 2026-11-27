@@ -16,6 +16,17 @@ pub struct TokenTransferFee {
 }
 
 impl TokenTransferFee {
+    /// Cold-path mint validation and active fee snapshot. Do not call while
+    /// assembling a route; subscriptions should refresh this outside the hot path.
+    pub async fn from_mint_by_rpc(
+        rpc: &SolanaRpcClient,
+        mint: &Pubkey,
+    ) -> anyhow::Result<(Pubkey, Self)> {
+        let account = rpc.get_account(mint).await?;
+        let epoch = rpc.get_epoch_info().await?.epoch;
+        Ok((account.owner, token_transfer_fee_for_epoch(&account.data, account.owner, epoch)?))
+    }
+
     #[inline]
     pub fn calculate(&self, amount: u64) -> u64 {
         if self.basis_points == 0 || amount == 0 {
@@ -85,6 +96,12 @@ pub fn token_transfer_fee_for_epoch(
 
     let mint = StateWithExtensions::<Mint>::unpack(data)
         .map_err(|error| anyhow::anyhow!("Failed to decode Token-2022 mint: {}", error))?;
+    // RPC-backed parameter constructors need the same Hook guard as the
+    // subscription cache: stock swaps do not resolve callback accounts.
+    anyhow::ensure!(
+        spl_token_2022_interface::extension::transfer_hook::get_program_id(&mint).is_none(),
+        "Active transfer hook requires unsupported extra accounts"
+    );
     if !mint
         .get_extension_types()
         .map_err(|error| anyhow::anyhow!("Failed to inspect Token-2022 mint: {}", error))?
@@ -95,11 +112,18 @@ pub fn token_transfer_fee_for_epoch(
     let config = mint
         .get_extension::<TransferFeeConfig>()
         .map_err(|error| anyhow::anyhow!("Failed to decode Token-2022 transfer fee: {}", error))?;
+    token_transfer_fee_from_config(config, epoch)
+}
+
+/// Reuse an already decoded extension on subscription preparation paths.
+pub(crate) fn token_transfer_fee_from_config(
+    config: &TransferFeeConfig,
+    epoch: u64,
+) -> Result<TokenTransferFee, anyhow::Error> {
     let fee = config.get_epoch_fee(epoch);
-    Ok(TokenTransferFee {
-        basis_points: fee.transfer_fee_basis_points.into(),
-        maximum_fee: fee.maximum_fee.into(),
-    })
+    let basis_points = u16::from(fee.transfer_fee_basis_points);
+    anyhow::ensure!(basis_points <= 10_000, "Invalid Token-2022 transfer fee basis points");
+    Ok(TokenTransferFee { basis_points, maximum_fee: fee.maximum_fee.into() })
 }
 
 /// Raw accounts a CPMM quote reads; `RaydiumCpmmParams::quote_account_keys`
