@@ -153,40 +153,48 @@ impl SwqosClientTrait for SpeedlandingClient {
             Ok(Err(_)) | Err(_) => true,
         };
         if need_retry {
-            eprintln!(
-                " [Speedlanding] {} QUIC 首次发送失败 {:?}，正在重试",
-                trade_type,
-                start_time.elapsed()
-            );
+            if crate::common::sdk_log::sdk_log_enabled() {
+                tracing::warn!(
+                    target: "sol_trade_sdk",
+                    trade_type = %trade_type,
+                    elapsed = ?start_time.elapsed(),
+                    "Speedlanding QUIC initial send failed; retrying"
+                );
+            }
             let connection = self.ensure_connected().await?;
             send_result =
                 timeout(SEND_TIMEOUT, Self::try_send_bytes(&connection, &*buf_guard)).await;
         }
         match send_result.context("Speedlanding QUIC send timeout") {
             Ok(Ok(())) => {
-                // 提交结果与「详细耗时/SDK 开关」无关，便于确认当前通道确实在执行
-                crate::common::sdk_log::log_swqos_submitted(
-                    "Speedlanding",
-                    trade_type,
-                    start_time.elapsed(),
-                );
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    crate::common::sdk_log::log_swqos_submitted(
+                        "Speedlanding",
+                        trade_type,
+                        start_time.elapsed(),
+                    );
+                }
             }
             Ok(Err(e)) => {
-                crate::common::sdk_log::log_swqos_submission_failed(
-                    "Speedlanding",
-                    trade_type,
-                    start_time.elapsed(),
-                    &e,
-                );
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "Speedlanding",
+                        trade_type,
+                        start_time.elapsed(),
+                        &e,
+                    );
+                }
                 return Err(e.into());
             }
             Err(e) => {
-                crate::common::sdk_log::log_swqos_submission_failed(
-                    "Speedlanding",
-                    trade_type,
-                    start_time.elapsed(),
-                    "timeout",
-                );
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "Speedlanding",
+                        trade_type,
+                        start_time.elapsed(),
+                        "timeout",
+                    );
+                }
                 return Err(e.into());
             }
         }
@@ -194,17 +202,19 @@ impl SwqosClientTrait for SpeedlandingClient {
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                crate::common::sdk_log::log_swqos_submission_failed(
-                    "Speedlanding",
-                    trade_type,
-                    start_time.elapsed(),
-                    &e,
-                );
+                if crate::common::sdk_log::sdk_log_enabled() {
+                    println!(" signature: {:?}", signature);
+                    crate::common::sdk_log::log_swqos_submission_failed(
+                        "Speedlanding",
+                        trade_type,
+                        start_time.elapsed(),
+                        &e,
+                    );
+                }
                 return Err(e);
             }
         }
-        if wait_confirmation {
+        if wait_confirmation && crate::common::sdk_log::sdk_log_enabled() {
             println!(" signature: {:?}", signature);
             println!(
                 " [{:width$}] {} confirmed: {:?}",

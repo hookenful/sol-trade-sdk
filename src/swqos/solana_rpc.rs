@@ -45,18 +45,26 @@ impl SwqosClientTrait for SolRpcClient {
             )
             .await?;
 
-        sdk_log::log_swqos_submitted("Default", trade_type, submit_start.elapsed());
+        if sdk_log::sdk_log_enabled() {
+            sdk_log::log_swqos_submitted("Default", trade_type, submit_start.elapsed());
+        }
 
         let start_time = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
             Ok(_) => (),
             Err(e) => {
-                println!(" signature: {:?}", signature);
-                println!(" [rpc] {} confirmation failed: {:?}", trade_type, start_time.elapsed());
+                if sdk_log::sdk_log_enabled() {
+                    println!(" signature: {:?}", signature);
+                    println!(
+                        " [rpc] {} confirmation failed: {:?}",
+                        trade_type,
+                        start_time.elapsed()
+                    );
+                }
                 return Err(e);
             }
         }
-        if wait_confirmation {
+        if wait_confirmation && sdk_log::sdk_log_enabled() {
             println!(" signature: {:?}", signature);
             println!(" [rpc] {} confirmed: {:?}", trade_type, start_time.elapsed());
         }

@@ -1,8 +1,12 @@
 //! Parallel executor for multi-SWQOS submit.
 //!
-//! **Hot path (submit):** no lock (OnceCell + lock-free ArrayQueue), no `get_core_ids()`, only Arc clones and queue push.
-//! - **Pool**: Pre-spawned workers (default 18); hot path only enqueues jobs (no per-call tokio::spawn).
-//! - **Dedicated threads** (opt-in via `with_dedicated_sender_threads`): N OS threads run sender work only, optionally pinned to cores.
+//! **Hot path (submit):**
+//! - **Default pool**: Process-owned multi-threaded Tokio runtime (`SWQOS_RUNTIME`). Each lane
+//!   spawns its own async task directly so all lanes build, sign, and await network I/O
+//!   concurrently without holding a fixed `cores * 2 / 3` worker slot across network RTT.
+//! - **Dedicated threads** (opt-in via `with_dedicated_sender_threads`): N OS threads build and
+//!   sign transactions on the dedicated thread, then spawn network `send_transaction().await`
+//!   asynchronously so slow relays never stall subsequent lanes or trades.
 //! - **Arc**: Shared data behind `Arc` → clone = refcount increment (no data copy).
 //! - **Refs**: `build_transaction` takes refs only; worker path avoids extra clones.
 //!
@@ -20,6 +24,7 @@ use solana_hash::Hash;
 use solana_message::AddressLookupTableAccount;
 use solana_sdk::{
     instruction::Instruction, pubkey::Pubkey, signature::Keypair, signature::Signature,
+    transaction::VersionedTransaction,
 };
 use std::collections::HashMap;
 use std::hash::BuildHasherDefault;
@@ -36,11 +41,9 @@ use crate::{
     common::{nonce_cache::DurableNonceInfo, GasFeeStrategy, SwqosSubmitTiming},
     swqos::{SwqosClient, SwqosType, TradeType},
     trading::core::params::SenderConcurrencyConfig,
-    trading::{common::build_transaction_with_version, MiddlewareManager},
+    trading::{common::build_transaction_with_v1_loaded_accounts_limit, MiddlewareManager},
 };
 
-/// 与 transaction_pool::PARALLEL_SENDER_COUNT 一致，保证多路 build 不串行
-const SWQOS_POOL_WORKERS: usize = 18;
 const SWQOS_QUEUE_CAP: usize = 128;
 const SWQOS_DEDICATED_DEFAULT_THREADS: usize = 18;
 const FAST_SUBMIT_RESULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,6 +63,7 @@ struct SwqosSharedContext {
     with_tip: bool,
     collector: Arc<ResultCollector>,
     transaction_version: crate::common::TradeTransactionVersion,
+    v1_loaded_accounts_data_size_limit: Option<u32>,
 }
 
 /// One SWQOS submit task; only per-task data + one Arc to shared (reduces hot-path clones).
@@ -76,52 +80,93 @@ struct SwqosJob {
     use_affinity: bool,
 }
 
-async fn run_one_swqos_job(job: SwqosJob) {
-    let s = &job.shared;
-    if job.use_affinity {
-        if let Some(cid) = job.core_id {
-            core_affinity::set_for_current(cid);
+/// Built & signed transaction ready for non-blocking network submission.
+struct PreparedSwqosJob {
+    shared: Arc<SwqosSharedContext>,
+    transaction: VersionedTransaction,
+    swqos_client: Arc<SwqosClient>,
+    swqos_type: SwqosType,
+    strategy_type: GasFeeStrategyType,
+}
+
+fn build_swqos_job_guarded(
+    job: SwqosJob,
+) -> std::result::Result<PreparedSwqosJob, Box<(Arc<ResultCollector>, TaskResult)>> {
+    let collector = job.shared.collector.clone();
+    let swqos_type = job.swqos_type;
+    let strategy_type = job.strategy_type;
+
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let s = &job.shared;
+        if job.use_affinity {
+            if let Some(cid) = job.core_id {
+                core_affinity::set_for_current(cid);
+            }
         }
-    }
 
-    let tip_amount = if s.with_tip { job.tip } else { 0.0 };
+        let tip_amount = if s.with_tip { job.tip } else { 0.0 };
+        let transaction = build_transaction_with_v1_loaded_accounts_limit(
+            &s.payer,
+            job.unit_limit,
+            job.unit_price,
+            s.transaction_version,
+            s.instructions.as_ref(),
+            s.address_lookup_table_accounts.as_slice(),
+            s.recent_blockhash,
+            s.middleware_manager.as_ref(),
+            s.protocol_name,
+            s.is_buy,
+            job.swqos_type != SwqosType::Default,
+            &job.tip_account,
+            tip_amount,
+            s.durable_nonce.as_ref(),
+            s.v1_loaded_accounts_data_size_limit,
+        )?;
+        Ok::<PreparedSwqosJob, anyhow::Error>(PreparedSwqosJob {
+            shared: job.shared,
+            transaction,
+            swqos_client: job.swqos_client,
+            swqos_type: job.swqos_type,
+            strategy_type: job.strategy_type,
+        })
+    }));
 
-    let transaction = match build_transaction_with_version(
-        &s.payer,
-        job.unit_limit,
-        job.unit_price,
-        s.transaction_version,
-        s.instructions.as_ref(),
-        s.address_lookup_table_accounts.as_slice(),
-        s.recent_blockhash,
-        s.middleware_manager.as_ref(),
-        s.protocol_name,
-        s.is_buy,
-        job.swqos_type != SwqosType::Default,
-        &job.tip_account,
-        tip_amount,
-        s.durable_nonce.as_ref(),
-    ) {
-        Ok(tx) => tx,
-        Err(e) => {
-            s.collector.submit(TaskResult {
+    match built {
+        Ok(Ok(prepared)) => Ok(prepared),
+        Ok(Err(e)) => Err(Box::new((
+            collector,
+            TaskResult {
                 success: false,
                 signature: Signature::default(),
                 error: Some(e),
-                swqos_type: job.swqos_type,
-                strategy_type: job.strategy_type,
+                swqos_type,
+                strategy_type,
                 landed_on_chain: false,
                 submit_done_us: crate::common::clock::now_micros(),
-            });
-            return;
-        }
-    };
+            },
+        ))),
+        Err(_) => Err(Box::new((
+            collector,
+            TaskResult {
+                success: false,
+                signature: Signature::default(),
+                error: Some(anyhow!("SWQOS sender task panicked")),
+                swqos_type,
+                strategy_type,
+                landed_on_chain: false,
+                submit_done_us: crate::common::clock::now_micros(),
+            },
+        ))),
+    }
+}
 
-    let (success, err, landed_on_chain) = match job
+async fn send_prepared_swqos_job(prepared: PreparedSwqosJob) {
+    let s = &prepared.shared;
+    let (success, err, landed_on_chain) = match prepared
         .swqos_client
         .send_transaction(
             if s.is_buy { TradeType::Buy } else { TradeType::Sell },
-            &transaction,
+            &prepared.transaction,
             s.wait_transaction_confirmed,
         )
         .await
@@ -133,16 +178,45 @@ async fn run_one_swqos_job(job: SwqosJob) {
         }
     };
 
-    let sig = transaction.signatures.first().copied().unwrap_or_default();
+    let sig = prepared.transaction.signatures.first().copied().unwrap_or_default();
     s.collector.submit(TaskResult {
         success,
         signature: sig,
         error: err,
-        swqos_type: job.swqos_type,
-        strategy_type: job.strategy_type,
+        swqos_type: prepared.swqos_type,
+        strategy_type: prepared.strategy_type,
         landed_on_chain,
         submit_done_us: crate::common::clock::now_micros(),
     });
+}
+
+async fn send_prepared_swqos_job_guarded(prepared: PreparedSwqosJob) {
+    // User-supplied transports may panic. Complete this lane rather than stranding batches.
+    let collector = prepared.shared.collector.clone();
+    let swqos_type = prepared.swqos_type;
+    let strategy_type = prepared.strategy_type;
+    if std::panic::AssertUnwindSafe(send_prepared_swqos_job(prepared))
+        .catch_unwind()
+        .await
+        .is_err()
+    {
+        collector.submit(TaskResult {
+            success: false,
+            signature: Signature::default(),
+            error: Some(anyhow!("SWQOS sender task panicked")),
+            swqos_type,
+            strategy_type,
+            landed_on_chain: false,
+            submit_done_us: crate::common::clock::now_micros(),
+        });
+    }
+}
+
+async fn run_one_swqos_job_guarded(job: SwqosJob) {
+    match build_swqos_job_guarded(job) {
+        Ok(prepared) => send_prepared_swqos_job_guarded(prepared).await,
+        Err(failure) => failure.0.submit(failure.1),
+    }
 }
 
 async fn swqos_worker_loop(queue: Arc<ArrayQueue<SwqosJob>>, notify: Arc<Notify>) {
@@ -161,31 +235,23 @@ async fn swqos_worker_loop(queue: Arc<ArrayQueue<SwqosJob>>, notify: Arc<Notify>
         };
 
         if let Some(job) = job {
-            // User-supplied transports/middleware may panic. Keep this worker
-            // alive and complete its lane rather than stranding later batches.
-            let collector = job.shared.collector.clone();
-            let swqos_type = job.swqos_type;
-            let strategy_type = job.strategy_type;
-            if std::panic::AssertUnwindSafe(run_one_swqos_job(job)).catch_unwind().await.is_err() {
-                collector.submit(TaskResult {
-                    success: false,
-                    signature: Signature::default(),
-                    error: Some(anyhow!("SWQOS sender task panicked")),
-                    swqos_type,
-                    strategy_type,
-                    landed_on_chain: false,
-                    submit_done_us: crate::common::clock::now_micros(),
-                });
+            // Separate CPU transaction build/signing from network RTT so a slow
+            // SWQOS endpoint never holds a dedicated worker slot across `.await`.
+            match build_swqos_job_guarded(job) {
+                Ok(prepared) => {
+                    tokio::spawn(send_prepared_swqos_job_guarded(prepared));
+                    if !queue.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                }
+                Err(failure) => failure.0.submit(failure.1),
             }
         }
     }
 }
 
-static SWQOS_QUEUE: OnceCell<Arc<ArrayQueue<SwqosJob>>> = OnceCell::new();
-static SWQOS_NOTIFY: OnceCell<Arc<Notify>> = OnceCell::new();
-static SWQOS_WORKER_COUNT: AtomicUsize = AtomicUsize::new(0);
-// The process-wide queue must have a process-wide runtime owner. Workers must
-// not be cancelled when the runtime of an individual caller is dropped.
+// The process-wide sender runtime owns per-lane async tasks so in-flight sends
+// are not cancelled when the runtime of an individual caller is dropped.
 static SWQOS_RUNTIME: OnceCell<tokio::runtime::Runtime> = OnceCell::new();
 
 /// Dedicated OS-thread sender pool. Queue and notify are in OnceCell so hot path never takes a lock after init.
@@ -323,36 +389,22 @@ fn ensure_dedicated_worker_count_locked(
     DEDICATED_WORKER_COUNT.store(target_workers, Ordering::Release);
 }
 
-fn ensure_swqos_pool(queue: Arc<ArrayQueue<SwqosJob>>, max_sender_concurrency: usize) -> Result<()> {
-    let runtime = SWQOS_RUNTIME.get_or_try_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .thread_name("sol-trade-swqos")
-            .enable_all()
-            .build()
-    })?;
-    let n = SWQOS_POOL_WORKERS.min(max_sender_concurrency).max(1);
-    let mut current = SWQOS_WORKER_COUNT.load(Ordering::Acquire);
-    while current < n {
-        match SWQOS_WORKER_COUNT.compare_exchange(current, n, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => break,
-            Err(actual) => current = actual,
-        }
-    }
-    if current >= n {
-        return Ok(());
-    }
-    let notify = SWQOS_NOTIFY.get_or_init(|| Arc::new(Notify::new())).clone();
-    for _ in current..n {
-        runtime.spawn(swqos_worker_loop(queue.clone(), notify.clone()));
-    }
-    Ok(())
+fn ensure_swqos_runtime() -> Result<&'static tokio::runtime::Runtime> {
+    SWQOS_RUNTIME
+        .get_or_try_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .thread_name("sol-trade-swqos")
+                .enable_all()
+                .build()
+        })
+        .map_err(Into::into)
 }
 
 /// Cold-path initialization for the default process-owned sender runtime.
 /// Call before trade triggers to avoid first-submit runtime/thread startup.
-pub fn warm_swqos_sender_pool(max_sender_concurrency: usize) -> Result<()> {
-    let queue = SWQOS_QUEUE.get_or_init(|| Arc::new(ArrayQueue::new(SWQOS_QUEUE_CAP)));
-    ensure_swqos_pool(queue.clone(), max_sender_concurrency)
+pub fn warm_swqos_sender_pool(_max_sender_concurrency: usize) -> Result<()> {
+    let _ = ensure_swqos_runtime()?;
+    Ok(())
 }
 
 #[repr(align(64))]
@@ -659,9 +711,12 @@ fn select_swqos_task_configs(
             }
             if check_tip && config.2.tip < min_tip {
                 if crate::common::sdk_log::sdk_log_enabled() {
-                    println!(
-                        "⚠️ Config filtered: {:?} tip {} is below minimum required {}",
-                        config.0, config.2.tip, min_tip
+                    tracing::debug!(
+                        target: "sol_trade_sdk",
+                        swqos = ?config.0,
+                        tip = config.2.tip,
+                        min_tip,
+                        "config filtered: tip below minimum required"
                     );
                 }
                 continue;
@@ -741,6 +796,52 @@ pub async fn execute_parallel_with_version(
     check_min_tip: bool,
     transaction_version: crate::common::TradeTransactionVersion,
 ) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
+    execute_parallel_with_v1_loaded_accounts_limit(
+        swqos_clients,
+        payer,
+        instructions,
+        address_lookup_table_accounts,
+        recent_blockhash,
+        durable_nonce,
+        middleware_manager,
+        protocol_name,
+        is_buy,
+        wait_transaction_confirmed,
+        wait_for_all_submits,
+        with_tip,
+        gas_fee_strategy,
+        use_dedicated_sender_threads,
+        sender_config,
+        check_min_tip,
+        transaction_version,
+        None,
+    )
+    .await
+}
+
+/// Execute a trade batch using an explicitly selected transaction message version
+/// and optional V1 `loaded_accounts_data_size_limit` override in bytes.
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_parallel_with_v1_loaded_accounts_limit(
+    swqos_clients: &[Arc<SwqosClient>],
+    payer: Arc<Keypair>,
+    instructions: Vec<Instruction>,
+    address_lookup_table_accounts: Vec<AddressLookupTableAccount>,
+    recent_blockhash: Option<Hash>,
+    durable_nonce: Option<DurableNonceInfo>,
+    middleware_manager: Option<Arc<MiddlewareManager>>,
+    protocol_name: &'static str,
+    is_buy: bool,
+    wait_transaction_confirmed: bool,
+    wait_for_all_submits: bool,
+    with_tip: bool,
+    gas_fee_strategy: GasFeeStrategy,
+    use_dedicated_sender_threads: bool,
+    sender_config: SenderConcurrencyConfig,
+    check_min_tip: bool,
+    transaction_version: crate::common::TradeTransactionVersion,
+    v1_loaded_accounts_data_size_limit: Option<u32>,
+) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
     if swqos_clients.is_empty() {
         return Err(anyhow!("swqos_clients is empty"));
     }
@@ -790,6 +891,7 @@ pub async fn execute_parallel_with_version(
         with_tip,
         collector: collector.clone(),
         transaction_version,
+        v1_loaded_accounts_data_size_limit,
     });
 
     // Resolve every fallible provider input before making any lane visible to
@@ -845,34 +947,31 @@ pub async fn execute_parallel_with_version(
         }
     }
 
-    let (queue, notify) = if use_dedicated_sender_threads {
-        ensure_dedicated_pool(
+    if use_dedicated_sender_threads {
+        let (queue, notify) = ensure_dedicated_pool(
             sender_config.sender_thread_cores.as_ref().map(|a| a.as_slice()),
             sender_config.max_sender_concurrency,
-        )
+        );
+        for job in jobs {
+            if let Err(job) = queue.push(job) {
+                shared.collector.submit(TaskResult {
+                    success: false,
+                    signature: Signature::default(),
+                    error: Some(anyhow!("SWQOS sender queue is full")),
+                    swqos_type: job.swqos_type,
+                    strategy_type: job.strategy_type,
+                    landed_on_chain: false,
+                    submit_done_us: crate::common::clock::now_micros(),
+                });
+            }
+        }
+        notify.notify_waiters();
     } else {
-        let q = SWQOS_QUEUE.get_or_init(|| Arc::new(ArrayQueue::new(SWQOS_QUEUE_CAP)));
-        ensure_swqos_pool(q.clone(), sender_config.max_sender_concurrency)?;
-        (q.clone(), SWQOS_NOTIFY.get_or_init(|| Arc::new(Notify::new())).clone())
-    };
-
-    for job in jobs {
-        if let Err(job) = queue.push(job) {
-            shared.collector.submit(TaskResult {
-                success: false,
-                signature: Signature::default(),
-                error: Some(anyhow!("SWQOS sender queue is full")),
-                swqos_type: job.swqos_type,
-                strategy_type: job.strategy_type,
-                landed_on_chain: false,
-                submit_done_us: crate::common::clock::now_micros(),
-            });
+        let runtime = ensure_swqos_runtime()?;
+        for job in jobs {
+            runtime.spawn(run_one_swqos_job_guarded(job));
         }
     }
-
-    notify.notify_waiters();
-
-    // All jobs enqueued (no spawn on hot path)
 
     if !wait_transaction_confirmed {
         let ret = if wait_for_all_submits {
@@ -1276,5 +1375,257 @@ mod tests {
                 .expect("completed results should be returned");
         assert!(result.0);
         assert_eq!(result.1.len(), 2);
+    }
+
+    struct BarrierTransport {
+        swqos_type: SwqosType,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::swqos::SwqosClientTrait for BarrierTransport {
+        async fn send_transaction(
+            &self,
+            _: TradeType,
+            _: &VersionedTransaction,
+            _: bool,
+        ) -> Result<()> {
+            self.barrier.wait().await;
+            Ok(())
+        }
+        async fn send_transactions(
+            &self,
+            _: TradeType,
+            _: &Vec<VersionedTransaction>,
+            _: bool,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn get_tip_account(&self) -> Result<String> {
+            Ok(Pubkey::new_unique().to_string())
+        }
+        fn get_swqos_type(&self) -> SwqosType {
+            self.swqos_type
+        }
+    }
+
+    struct DelayedTransport {
+        swqos_type: SwqosType,
+        delay: Duration,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::swqos::SwqosClientTrait for DelayedTransport {
+        async fn send_transaction(
+            &self,
+            _: TradeType,
+            _: &VersionedTransaction,
+            _: bool,
+        ) -> Result<()> {
+            if !self.delay.is_zero() {
+                tokio::time::sleep(self.delay).await;
+            }
+            Ok(())
+        }
+        async fn send_transactions(
+            &self,
+            _: TradeType,
+            _: &Vec<VersionedTransaction>,
+            _: bool,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn get_tip_account(&self) -> Result<String> {
+            Ok(Pubkey::new_unique().to_string())
+        }
+        fn get_swqos_type(&self) -> SwqosType {
+            self.swqos_type
+        }
+    }
+
+    struct CapturingTransport {
+        captured: Arc<Mutex<Option<VersionedTransaction>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::swqos::SwqosClientTrait for CapturingTransport {
+        async fn send_transaction(
+            &self,
+            _: TradeType,
+            tx: &VersionedTransaction,
+            _: bool,
+        ) -> Result<()> {
+            *self.captured.lock() = Some(tx.clone());
+            Ok(())
+        }
+        async fn send_transactions(
+            &self,
+            _: TradeType,
+            _: &Vec<VersionedTransaction>,
+            _: bool,
+        ) -> Result<()> {
+            unreachable!()
+        }
+        fn get_tip_account(&self) -> Result<String> {
+            Ok(String::new())
+        }
+        fn get_swqos_type(&self) -> SwqosType {
+            SwqosType::Default
+        }
+    }
+
+    #[tokio::test]
+    async fn all_ten_lanes_enter_send_concurrently_without_five_worker_limit() {
+        const LANES: usize = 10;
+        for dedicated in [false, true] {
+            let barrier = Arc::new(tokio::sync::Barrier::new(LANES));
+            let clients: Vec<Arc<SwqosClient>> = (0..LANES)
+                .map(|_| {
+                    Arc::new(BarrierTransport {
+                        swqos_type: SwqosType::Jito,
+                        barrier: barrier.clone(),
+                    }) as Arc<SwqosClient>
+                })
+                .collect();
+            let strategy = GasFeeStrategy::new();
+            strategy.set_global_fee_strategy(200_000, 200_000, 1_000, 1_000, 0.001, 0.001);
+
+            // Even with max_sender_concurrency=5 (8 cores * 2 / 3), all 10 lanes must
+            // reach send_transaction().await simultaneously without blocking on the first 5.
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                execute_parallel(
+                    &clients,
+                    Arc::new(Keypair::new()),
+                    vec![],
+                    vec![],
+                    Some(Hash::new_unique()),
+                    None,
+                    None,
+                    "parallel-barrier",
+                    true,
+                    false,
+                    true,
+                    true,
+                    strategy,
+                    dedicated,
+                    SenderConcurrencyConfig {
+                        sender_thread_cores: None,
+                        effective_core_ids: Arc::new(vec![]),
+                        max_sender_concurrency: 5,
+                    },
+                    false,
+                ),
+            )
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "all 10 lanes must enter send_transaction concurrently (dedicated={dedicated})"
+                )
+            })
+            .unwrap();
+            assert!(result.0);
+            assert_eq!(result.1.len(), LANES);
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_tenth_lane_finishes_while_first_five_lanes_hold_network_await() {
+        let mut clients: Vec<Arc<SwqosClient>> = (0..9)
+            .map(|_| {
+                Arc::new(DelayedTransport {
+                    swqos_type: SwqosType::Jito,
+                    delay: Duration::from_millis(500),
+                }) as Arc<SwqosClient>
+            })
+            .collect();
+        clients.push(Arc::new(DelayedTransport {
+            swqos_type: SwqosType::Speedlanding,
+            delay: Duration::ZERO,
+        }));
+        let strategy = GasFeeStrategy::new();
+        strategy.set_global_fee_strategy(200_000, 200_000, 1_000, 1_000, 0.001, 0.001);
+
+        let started = Instant::now();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            execute_parallel(
+                &clients,
+                Arc::new(Keypair::new()),
+                vec![],
+                vec![],
+                Some(Hash::new_unique()),
+                None,
+                None,
+                "fast-lane-not-blocked",
+                true,
+                false,
+                false,
+                true,
+                strategy,
+                false,
+                SenderConcurrencyConfig {
+                    sender_thread_cores: None,
+                    effective_core_ids: Arc::new(vec![]),
+                    max_sender_concurrency: 5,
+                },
+                false,
+            ),
+        )
+        .await
+        .expect("fast lane must not wait for stalled lanes")
+        .unwrap();
+        assert!(result.0);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "Speedlanding lane took {:?}, expected it not to wait for 500ms stalled lanes",
+            started.elapsed()
+        );
+        assert!(
+            result.3.iter().any(|t| t.swqos_type == SwqosType::Speedlanding),
+            "expected Speedlanding to complete first"
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_loaded_accounts_data_size_limit_propagates_to_built_transaction() {
+        const SIXTEEN_MIB: u32 = 16 * 1024 * 1024;
+        let captured = Arc::new(Mutex::new(None));
+        let client: Arc<SwqosClient> = Arc::new(CapturingTransport { captured: captured.clone() });
+        let strategy = GasFeeStrategy::new();
+        strategy.set_default_rpc_fee_strategy(200_000, 200_000, 1_000, 1_000);
+
+        let result = execute_parallel_with_v1_loaded_accounts_limit(
+            &[client],
+            Arc::new(Keypair::new()),
+            vec![],
+            vec![],
+            Some(Hash::new_unique()),
+            None,
+            None,
+            "v1-loaded-limit",
+            true,
+            false,
+            true,
+            false,
+            strategy,
+            false,
+            SenderConcurrencyConfig {
+                sender_thread_cores: None,
+                effective_core_ids: Arc::new(vec![]),
+                max_sender_concurrency: 1,
+            },
+            false,
+            crate::common::TradeTransactionVersion::V1,
+            Some(SIXTEEN_MIB),
+        )
+        .await
+        .unwrap();
+        assert!(result.0);
+        let tx = captured.lock().take().expect("transaction captured");
+        let solana_sdk::message::VersionedMessage::V1(msg) = tx.message else {
+            panic!("expected V1 transaction");
+        };
+        assert_eq!(msg.config.loaded_accounts_data_size_limit, Some(SIXTEEN_MIB));
     }
 }

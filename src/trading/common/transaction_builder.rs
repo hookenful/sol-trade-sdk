@@ -21,7 +21,8 @@ const V0_MAX_TRANSACTION_SIZE: usize = 1232;
 const V1_MAX_TRANSACTION_SIZE: usize = solana_message::v1::MAX_TRANSACTION_SIZE;
 const DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT: u32 = 200_000;
 const MAX_COMPUTE_UNIT_LIMIT: u32 = 1_400_000;
-const DEFAULT_LOADED_ACCOUNTS_DATA_SIZE_LIMIT: u32 = 64 * 1024 * 1024;
+pub const DEFAULT_LOADED_ACCOUNTS_DATA_SIZE_LIMIT: u32 = 64 * 1024 * 1024;
+pub const MAX_LOADED_ACCOUNTS_DATA_SIZE_LIMIT: u32 = 64 * 1024 * 1024;
 const MICRO_LAMPORTS_PER_LAMPORT: u128 = 1_000_000;
 
 /// Convert SOL amount (f64) to lamports without string allocation (hot path).
@@ -88,6 +89,45 @@ pub fn build_transaction_with_version(
     tip_amount: f64,
     durable_nonce: Option<&DurableNonceInfo>,
 ) -> Result<VersionedTransaction, anyhow::Error> {
+    build_transaction_with_v1_loaded_accounts_limit(
+        payer,
+        unit_limit,
+        unit_price,
+        transaction_version,
+        business_instructions,
+        address_lookup_table_accounts,
+        recent_blockhash,
+        middleware_manager,
+        protocol_name,
+        is_buy,
+        with_tip,
+        tip_account,
+        tip_amount,
+        durable_nonce,
+        None,
+    )
+}
+
+/// Build a signed transaction using the explicitly selected message version and
+/// an optional V1 `loaded_accounts_data_size_limit` override in bytes.
+#[allow(clippy::too_many_arguments)]
+pub fn build_transaction_with_v1_loaded_accounts_limit(
+    payer: &Arc<Keypair>,
+    unit_limit: u32,
+    unit_price: u64,
+    transaction_version: TradeTransactionVersion,
+    business_instructions: &[Instruction],
+    address_lookup_table_accounts: &[AddressLookupTableAccount],
+    recent_blockhash: Option<Hash>,
+    middleware_manager: Option<&Arc<MiddlewareManager>>,
+    protocol_name: &str,
+    is_buy: bool,
+    with_tip: bool,
+    tip_account: &Pubkey,
+    tip_amount: f64,
+    durable_nonce: Option<&DurableNonceInfo>,
+    v1_loaded_accounts_data_size_limit: Option<u32>,
+) -> Result<VersionedTransaction, anyhow::Error> {
     if transaction_version == TradeTransactionVersion::V1
         && !address_lookup_table_accounts.is_empty()
     {
@@ -109,21 +149,23 @@ pub fn build_transaction_with_version(
         tip_account,
         tip_amount,
         durable_nonce,
+        v1_loaded_accounts_data_size_limit,
     )?;
 
     let serialized_len = wincode::serialized_size(&transaction)? as usize;
     if crate::common::sdk_log::sdk_log_enabled() {
-        println!(
-            " [SDK][tx-size     ] {} {} serialized={} bytes, business_ix={}, nonce={}, tip={}, cu_limit={}, cu_price={}, alt={}",
-            protocol_name,
-            if is_buy { "buy" } else { "sell" },
-            serialized_len,
-            business_instructions.len(),
-            durable_nonce.is_some(),
-            with_tip && tip_amount > 0.0,
-            unit_limit,
-            unit_price,
-            address_lookup_table_accounts.len()
+        tracing::debug!(
+            target: "sol_trade_sdk",
+            protocol = protocol_name,
+            side = if is_buy { "buy" } else { "sell" },
+            serialized_bytes = serialized_len,
+            business_ix = business_instructions.len(),
+            nonce = durable_nonce.is_some(),
+            tip = with_tip && tip_amount > 0.0,
+            cu_limit = unit_limit,
+            cu_price = unit_price,
+            alt = address_lookup_table_accounts.len(),
+            "built transaction"
         );
     }
     let max_transaction_size = match transaction_version {
@@ -148,6 +190,7 @@ pub fn build_transaction_with_version(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_transaction_inner(
     payer: &Arc<Keypair>,
     unit_limit: u32,
@@ -163,6 +206,7 @@ fn build_transaction_inner(
     tip_account: &Pubkey,
     tip_amount: f64,
     durable_nonce: Option<&DurableNonceInfo>,
+    v1_loaded_accounts_data_size_limit: Option<u32>,
 ) -> Result<VersionedTransaction, anyhow::Error> {
     let mut instructions = Vec::with_capacity(business_instructions.len() + 5);
 
@@ -198,9 +242,11 @@ fn build_transaction_inner(
         middleware_manager,
         protocol_name,
         is_buy,
+        v1_loaded_accounts_data_size_limit,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_versioned_transaction(
     payer: &Arc<Keypair>,
     instructions: Vec<Instruction>,
@@ -212,6 +258,7 @@ fn build_versioned_transaction(
     middleware_manager: Option<&Arc<MiddlewareManager>>,
     protocol_name: &str,
     is_buy: bool,
+    v1_loaded_accounts_data_size_limit: Option<u32>,
 ) -> Result<VersionedTransaction, anyhow::Error> {
     let full_instructions = match middleware_manager {
         Some(middleware_manager) => middleware_manager
@@ -222,9 +269,11 @@ fn build_versioned_transaction(
     let v1_config = if transaction_version == TradeTransactionVersion::V1 {
         let effective_unit_limit =
             effective_v1_compute_unit_limit(unit_limit, full_instructions.len());
+        let effective_loaded_accounts_limit =
+            resolve_v1_loaded_accounts_data_size_limit(v1_loaded_accounts_data_size_limit)?;
         let mut config = solana_message::v1::TransactionConfig::empty()
             .with_compute_unit_limit(effective_unit_limit)
-            .with_loaded_accounts_data_size_limit(DEFAULT_LOADED_ACCOUNTS_DATA_SIZE_LIMIT);
+            .with_loaded_accounts_data_size_limit(effective_loaded_accounts_limit);
         if unit_price > 0 {
             config = config
                 .with_priority_fee(v1_priority_fee_lamports(effective_unit_limit, unit_price));
@@ -267,6 +316,18 @@ fn effective_v1_compute_unit_limit(configured_limit: u32, instruction_count: usi
         .unwrap_or(u32::MAX)
         .saturating_mul(DEFAULT_INSTRUCTION_COMPUTE_UNIT_LIMIT)
         .min(MAX_COMPUTE_UNIT_LIMIT)
+}
+
+#[inline(always)]
+fn resolve_v1_loaded_accounts_data_size_limit(
+    configured_limit: Option<u32>,
+) -> Result<u32, anyhow::Error> {
+    let limit = configured_limit.unwrap_or(DEFAULT_LOADED_ACCOUNTS_DATA_SIZE_LIMIT);
+    anyhow::ensure!(
+        (1..=MAX_LOADED_ACCOUNTS_DATA_SIZE_LIMIT).contains(&limit),
+        "v1 loaded_accounts_data_size_limit must be in 1..={MAX_LOADED_ACCOUNTS_DATA_SIZE_LIMIT}, got {limit}"
+    );
+    Ok(limit)
 }
 
 #[inline(always)]
@@ -479,5 +540,60 @@ mod tests {
     fn v1_priority_fee_rounds_up_without_overflow() {
         assert_eq!(v1_priority_fee_lamports(200_001, 5), 2);
         assert_eq!(v1_priority_fee_lamports(u32::MAX, u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn v1_honors_custom_loaded_accounts_data_size_limit() {
+        const SIXTEEN_MIB: u32 = 16 * 1024 * 1024;
+        let business_instruction =
+            Instruction { program_id: Pubkey::new_unique(), accounts: Vec::new(), data: vec![1] };
+        let tx = build_transaction_with_v1_loaded_accounts_limit(
+            &Arc::new(Keypair::new()),
+            200_000,
+            1,
+            TradeTransactionVersion::V1,
+            &[business_instruction],
+            &[],
+            Some(Hash::new_unique()),
+            None,
+            "test",
+            true,
+            false,
+            &Pubkey::default(),
+            0.0,
+            None,
+            Some(SIXTEEN_MIB),
+        )
+        .unwrap();
+        let VersionedMessage::V1(message) = tx.message else {
+            panic!("expected V1 message");
+        };
+        assert_eq!(message.config.loaded_accounts_data_size_limit, Some(SIXTEEN_MIB));
+    }
+
+    #[test]
+    fn v1_rejects_invalid_loaded_accounts_data_size_limit() {
+        for invalid in [0, MAX_LOADED_ACCOUNTS_DATA_SIZE_LIMIT + 1] {
+            let err = build_transaction_with_v1_loaded_accounts_limit(
+                &Arc::new(Keypair::new()),
+                200_000,
+                1,
+                TradeTransactionVersion::V1,
+                &[],
+                &[],
+                Some(Hash::new_unique()),
+                None,
+                "test",
+                true,
+                false,
+                &Pubkey::default(),
+                0.0,
+                None,
+                Some(invalid),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("v1 loaded_accounts_data_size_limit"), "{err}");
+        }
     }
 }

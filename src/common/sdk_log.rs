@@ -64,9 +64,12 @@ pub fn set_sdk_log_enabled(enabled: bool) {
     SDK_LOG_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
-/// Aligned log: ` [Soyas        ] Buy submitted: 13.936 µs`. Call only when sdk_log_enabled().
+/// Aligned log: ` [Soyas        ] Buy submitted: 13.936 µs`. No-op when `!sdk_log_enabled()`.
 #[inline]
 pub fn log_swqos_submitted(provider: &str, trade_type: impl fmt::Display, elapsed: Duration) {
+    if !sdk_log_enabled() {
+        return;
+    }
     println!(
         " [{:width$}] {} submitted: {}",
         provider,
@@ -78,7 +81,7 @@ pub fn log_swqos_submitted(provider: &str, trade_type: impl fmt::Display, elapse
 
 /// Prints one SDK timing block (build_instructions, before_submit, per-channel submit_done).
 /// When confirm_us is Some, prints confirmed + total; when None, prints "confirmed: -, total: submit_ms".
-/// Call only when sdk_log_enabled().
+/// No-op when `!sdk_log_enabled()`.
 pub fn print_sdk_timing_block(
     dir: &str,
     start_us: Option<i64>,
@@ -87,6 +90,9 @@ pub fn print_sdk_timing_block(
     submit_timings: &[crate::common::SwqosSubmitTiming],
     confirm_us: Option<i64>,
 ) {
+    if !sdk_log_enabled() {
+        return;
+    }
     println!();
     let start_us = match start_us {
         Some(u) => u,
@@ -142,7 +148,7 @@ pub fn print_sdk_timing_block(
     }
 }
 
-/// Aligned log: ` [Stellium     ] Buy submission failed after 97.9396 ms: ...`. Call only when sdk_log_enabled().
+/// Aligned log: ` [Stellium     ] Buy submission failed after 97.9396 ms: ...`. No-op when `!sdk_log_enabled()`.
 /// Error is normalized: JSON "message"/"data" or quoted string is shown; raw JSON is not.
 #[inline]
 pub fn log_swqos_submission_failed(
@@ -151,6 +157,9 @@ pub fn log_swqos_submission_failed(
     elapsed: Duration,
     err: impl fmt::Display,
 ) {
+    if !sdk_log_enabled() {
+        return;
+    }
     let msg = extract_swqos_error_message(&format!("{}", err));
     eprintln!(
         " [{:width$}] {} submission failed after {}, error: {}",

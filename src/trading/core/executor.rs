@@ -18,7 +18,7 @@ use crate::{
     perf::syscall_bypass::SystemCallBypassManager,
     swqos::common::poll_any_transaction_confirmation,
     trading::core::{
-        async_executor::execute_parallel_with_version,
+        async_executor::execute_parallel_with_v1_loaded_accounts_limit,
         execution::{InstructionProcessor, Prefetch},
         traits::TradeExecutor,
     },
@@ -113,6 +113,7 @@ impl TradeExecutor for GenericTradeExecutor {
                 if is_buy { true } else { params.with_tip },
                 params.gas_fee_strategy,
                 params.transaction_version,
+                params.v1_loaded_accounts_data_size_limit,
             )
             .await;
             let send_elapsed = send_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
@@ -164,7 +165,7 @@ impl TradeExecutor for GenericTradeExecutor {
         // returned signature when the caller opts in.
         let wait_for_all_submits = params.wait_for_all_submits;
         let sender_config = params.sender_concurrency_config();
-        let result = execute_parallel_with_version(
+        let result = execute_parallel_with_v1_loaded_accounts_limit(
             params.swqos_clients.as_slice(),
             params.payer,
             final_instructions,
@@ -182,6 +183,7 @@ impl TradeExecutor for GenericTradeExecutor {
             sender_config,
             params.check_min_tip,
             params.transaction_version,
+            params.v1_loaded_accounts_data_size_limit,
         )
         .await;
 
@@ -252,6 +254,7 @@ impl TradeExecutor for GenericTradeExecutor {
 
 /// Simulate mode: single RPC simulation, returns Vec<Signature> for API consistency.
 /// 模拟模式：单次 RPC 模拟，返回 Vec<Signature> 以与 API 一致。
+#[allow(clippy::too_many_arguments)]
 async fn simulate_transaction(
     rpc: Option<Arc<SolanaRpcClient>>,
     payer: Arc<Keypair>,
@@ -265,8 +268,9 @@ async fn simulate_transaction(
     with_tip: bool,
     gas_fee_strategy: GasFeeStrategy,
     transaction_version: crate::common::TradeTransactionVersion,
+    v1_loaded_accounts_data_size_limit: Option<u32>,
 ) -> Result<(bool, Vec<Signature>, Option<anyhow::Error>, Vec<SwqosSubmitTiming>)> {
-    use crate::trading::common::build_transaction_with_version;
+    use crate::trading::common::build_transaction_with_v1_loaded_accounts_limit;
     use solana_client::rpc_config::RpcSimulateTransactionConfig;
     use solana_commitment_config::CommitmentLevel;
     use solana_transaction_status_client_types::UiTransactionEncoding;
@@ -287,7 +291,7 @@ async fn simulate_transaction(
     let unit_limit = default_config.2.cu_limit;
     let unit_price = default_config.2.cu_price;
 
-    let transaction = build_transaction_with_version(
+    let transaction = build_transaction_with_v1_loaded_accounts_limit(
         &payer,
         unit_limit,
         unit_price,
@@ -302,6 +306,7 @@ async fn simulate_transaction(
         &Pubkey::default(),
         tip,
         durable_nonce.as_ref(),
+        v1_loaded_accounts_data_size_limit,
     )?;
 
     // Simulate the transaction

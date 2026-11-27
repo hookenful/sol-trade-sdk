@@ -41,6 +41,7 @@ pub fn offline_demo_params(version: TradeTransactionVersion, close_output: bool)
         effective_core_ids: Arc::new(vec![]),
         check_min_tip: false,
         transaction_version: version,
+        v1_loaded_accounts_data_size_limit: None,
         grpc_recv_us: None,
         use_exact_sol_amount: None,
         precheck: None,

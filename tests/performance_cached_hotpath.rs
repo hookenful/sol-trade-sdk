@@ -109,6 +109,7 @@ fn actual_cached_and_parser_hotpaths() -> Result<()> {
                 effective_core_ids: Arc::new(vec![]),
                 check_min_tip: false,
                 transaction_version: TradeTransactionVersion::V1,
+                v1_loaded_accounts_data_size_limit: None,
                 grpc_recv_us: None,
                 use_exact_sol_amount: None,
                 precheck: None,

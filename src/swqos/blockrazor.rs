@@ -66,7 +66,11 @@ impl BlockRazorGrpcClient {
     ) -> Result<String> {
         // 检查交易数据大小
         if crate::common::sdk_log::sdk_log_enabled() {
-            eprintln!("BlockRazor transaction size: {} bytes", transaction.len());
+            tracing::debug!(
+                target: "sol_trade_sdk",
+                bytes = transaction.len(),
+                "BlockRazor transaction size"
+            );
         }
 
         let mut client = serverpb::server_client::ServerClient::new(self.channel.clone());
@@ -411,7 +415,7 @@ impl BlockRazorClient {
             .await?;
         let status = response.status();
         let _ = response.bytes().await;
-        if !status.is_success() {
+        if !status.is_success() && crate::common::sdk_log::sdk_log_enabled() {
             eprintln!("BlockRazor HTTP ping request failed with status: {}", status);
         }
         Ok(())
