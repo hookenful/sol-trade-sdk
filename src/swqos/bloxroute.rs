@@ -1,6 +1,7 @@
-use crate::swqos::common::default_http_client_builder;
-use crate::swqos::common::poll_transaction_confirmation;
-use crate::swqos::common::serialize_transaction_and_encode;
+use crate::swqos::common::{
+    default_http_client_builder, parse_http_json_submit_response, poll_transaction_confirmation,
+    serialize_transaction_and_encode,
+};
 use crate::swqos::serialization;
 use rand::seq::IndexedRandom;
 use reqwest::Client;
@@ -112,6 +113,106 @@ impl BloxrouteClient {
         Ok(())
     }
 
+    fn validate_submit_response(
+        trade_type: TradeType,
+        elapsed: Duration,
+        status: reqwest::StatusCode,
+        response_text: &str,
+    ) -> Result<()> {
+        let response_json = parse_http_json_submit_response(
+            "bloxroute",
+            trade_type,
+            elapsed,
+            status,
+            response_text,
+        )?;
+
+        let has_result = response_json.get("result").is_some_and(|v| !v.is_null());
+        let has_signature = response_json
+            .get("signature")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+
+        if has_result || has_signature {
+            if crate::common::sdk_log::sdk_log_enabled() {
+                crate::common::sdk_log::log_swqos_submitted("bloxroute", trade_type, elapsed);
+            }
+            return Ok(());
+        }
+
+        let detail = format!("unexpected JSON (missing result/signature): {response_text}");
+        if crate::common::sdk_log::sdk_log_enabled() {
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "bloxroute",
+                trade_type,
+                elapsed,
+                &detail,
+            );
+        }
+        Err(anyhow::anyhow!("bloxroute submission failed: {detail}"))
+    }
+
+    fn validate_batch_response(
+        trade_type: TradeType,
+        elapsed: Duration,
+        status: reqwest::StatusCode,
+        response_text: &str,
+    ) -> Result<()> {
+        let response_json = parse_http_json_submit_response(
+            "bloxroute",
+            trade_type,
+            elapsed,
+            status,
+            response_text,
+        )?;
+
+        let has_result = response_json.get("result").is_some_and(|v| !v.is_null());
+        let has_signature = response_json
+            .get("signature")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        let has_valid_transactions = response_json
+            .get("transactions")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|txs| {
+                !txs.is_empty()
+                    && txs.iter().all(|tx| {
+                        let submitted_ok =
+                            tx.get("submitted").and_then(serde_json::Value::as_bool) != Some(false);
+                        let no_entry_error = match tx.get("error") {
+                            None | Some(serde_json::Value::Null) => true,
+                            Some(serde_json::Value::String(s)) => s.is_empty(),
+                            Some(_) => false,
+                        };
+                        let has_entry_ack =
+                            tx.get("submitted").and_then(serde_json::Value::as_bool) == Some(true)
+                                || tx
+                                    .get("signature")
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|s| !s.is_empty());
+                        submitted_ok && no_entry_error && has_entry_ack
+                    })
+            });
+
+        if has_result || has_signature || has_valid_transactions {
+            if crate::common::sdk_log::sdk_log_enabled() {
+                crate::common::sdk_log::log_swqos_submitted("bloxroute", trade_type, elapsed);
+            }
+            return Ok(());
+        }
+
+        let detail = format!("unexpected batch JSON response: {response_text}");
+        if crate::common::sdk_log::sdk_log_enabled() {
+            crate::common::sdk_log::log_swqos_submission_failed(
+                "bloxroute",
+                trade_type,
+                elapsed,
+                &detail,
+            );
+        }
+        Err(anyhow::anyhow!("bloxroute batch submission failed: {detail}"))
+    }
+
     pub async fn send_transaction(
         &self,
         trade_type: TradeType,
@@ -129,43 +230,18 @@ impl BloxrouteClient {
         );
 
         let endpoint = format!("{}/api/v2/submit", self.endpoint);
-        let response_text = self
+        let response = self
             .http_client
             .post(&endpoint)
             .body(body)
             .header("Content-Type", "application/json")
             .header("Authorization", self.auth_token.as_str())
             .send()
-            .await?
-            .text()
             .await?;
+        let status = response.status();
+        let response_text = response.text().await?;
 
-        // Parse with from_str to avoid extra wait from .json().await
-        if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-            if crate::common::sdk_log::sdk_log_enabled() {
-                if response_json.get("result").is_some() {
-                    crate::common::sdk_log::log_swqos_submitted(
-                        "bloxroute",
-                        trade_type,
-                        start_time.elapsed(),
-                    );
-                } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(
-                        " [bloxroute] {} submission failed after {:?}: {:?}",
-                        trade_type,
-                        start_time.elapsed(),
-                        _error
-                    );
-                }
-            }
-        } else if crate::common::sdk_log::sdk_log_enabled() {
-            crate::common::sdk_log::log_swqos_submission_failed(
-                "bloxroute",
-                trade_type,
-                start_time.elapsed(),
-                response_text,
-            );
-        }
+        Self::validate_submit_response(trade_type, start_time.elapsed(), status, &response_text)?;
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
@@ -218,31 +294,18 @@ impl BloxrouteClient {
         let body = format!(r#"{{"entries":[{}]}}"#, entries);
 
         let endpoint = format!("{}/api/v2/submit-batch", self.endpoint);
-        let response_text = self
+        let response = self
             .http_client
             .post(&endpoint)
             .body(body)
             .header("Content-Type", "application/json")
             .header("Authorization", self.auth_token.as_str())
             .send()
-            .await?
-            .text()
             .await?;
+        let status = response.status();
+        let response_text = response.text().await?;
 
-        if crate::common::sdk_log::sdk_log_enabled() {
-            if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-                if response_json.get("result").is_some() {
-                    println!(" bloxroute {} submitted: {:?}", trade_type, start_time.elapsed());
-                } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(
-                        " bloxroute {} submission failed after {:?}: {:?}",
-                        trade_type,
-                        start_time.elapsed(),
-                        _error
-                    );
-                }
-            }
-        }
+        Self::validate_batch_response(trade_type, start_time.elapsed(), status, &response_text)?;
 
         Ok(())
     }
@@ -256,5 +319,112 @@ impl Drop for BloxrouteClient {
             return;
         }
         self.stop_ping.store(true, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::swqos::common::test_http::{dummy_versioned_transaction, spawn_mock_http_server};
+
+    fn test_client_for(endpoint: String) -> BloxrouteClient {
+        BloxrouteClient {
+            endpoint,
+            auth_token: "test-token".to_string(),
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            http_client: default_http_client_builder().build().unwrap(),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+            instance_refs: Arc::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_http_429_401_500() {
+        let tx = dummy_versioned_transaction();
+        for (status_line, body, expected_code) in [
+            ("429 Too Many Requests", r#"{"message":"rate limit exceeded"}"#, "429"),
+            ("401 Unauthorized", "unauthorized", "401"),
+            ("500 Internal Server Error", "server failure", "500"),
+        ] {
+            let server = spawn_mock_http_server(status_line, body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            let err = client
+                .send_transaction(TradeType::Buy, &tx, false)
+                .await
+                .expect_err("non-2xx HTTP status must fail");
+            assert!(
+                err.to_string().contains(expected_code),
+                "expected error to mention {expected_code}, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_json_error_missing_result_and_invalid_json() {
+        let tx = dummy_versioned_transaction();
+        for body in [
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"rejected"},"id":1}"#,
+            r#"{"error":"bad request"}"#,
+            r#"{"signature":""}"#,
+            r#"{}"#,
+            "plain-text-error",
+        ] {
+            let server = spawn_mock_http_server("200 OK", body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            assert!(
+                client.send_transaction(TradeType::Buy, &tx, false).await.is_err(),
+                "expected error for response body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_accepts_signature_and_json_rpc_result() {
+        let tx = dummy_versioned_transaction();
+        for body in
+            [r#"{"signature":"5sigBase58"}"#, r#"{"jsonrpc":"2.0","result":"5sigBase58","id":1}"#]
+        {
+            let server = spawn_mock_http_server("200 OK", body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            client
+                .send_transaction(TradeType::Buy, &tx, false)
+                .await
+                .unwrap_or_else(|e| panic!("expected Ok for {body}, got: {e}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transactions_batch_validates_errors_and_accepts_valid_responses() {
+        let txs = vec![dummy_versioned_transaction()];
+        for (status_line, body) in [
+            ("429 Too Many Requests", "rate limited"),
+            ("500 Internal Server Error", "internal error"),
+            ("200 OK", r#"{"error":{"code":-32000,"message":"batch failed"}}"#),
+            (
+                "200 OK",
+                r#"{"transactions":[{"signature":"5sig","submitted":false,"error":"BlockhashNotFound"}]}"#,
+            ),
+            ("200 OK", r#"{}"#),
+            ("200 OK", "not-json"),
+        ] {
+            let server = spawn_mock_http_server(status_line, body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            assert!(
+                client.send_transactions(TradeType::Buy, &txs, false).await.is_err(),
+                "expected batch error for {status_line} / {body}"
+            );
+        }
+
+        for body in [
+            r#"{"transactions":[{"signature":"5sig","submitted":true,"error":""}]}"#,
+            r#"{"jsonrpc":"2.0","result":"ok","id":1}"#,
+        ] {
+            let server = spawn_mock_http_server("200 OK", body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            client
+                .send_transactions(TradeType::Buy, &txs, false)
+                .await
+                .unwrap_or_else(|e| panic!("expected batch Ok for {body}, got: {e}"));
+        }
     }
 }

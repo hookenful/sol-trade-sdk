@@ -1,5 +1,6 @@
 use crate::swqos::common::{
     default_http_client_builder, poll_transaction_confirmation, serialize_transaction_and_encode,
+    validate_json_rpc_submit_response,
 };
 use rand::seq::IndexedRandom;
 use reqwest::Client;
@@ -169,43 +170,24 @@ impl Node1Client {
         }))?;
 
         // Node1 uses api-key header instead of URL parameter
-        let response_text = self
+        let response = self
             .http_client
             .post(&self.endpoint)
             .body(request_body)
             .header("Content-Type", "application/json")
             .header("api-key", &self.auth_token)
             .send()
-            .await?
-            .text()
             .await?;
+        let status = response.status();
+        let response_text = response.text().await?;
 
-        // Parse JSON response
-        if let Ok(response_json) = serde_json::from_str::<serde_json::Value>(&response_text) {
-            if crate::common::sdk_log::sdk_log_enabled() {
-                if response_json.get("result").is_some() {
-                    crate::common::sdk_log::log_swqos_submitted(
-                        "node1",
-                        trade_type,
-                        start_time.elapsed(),
-                    );
-                } else if let Some(_error) = response_json.get("error") {
-                    eprintln!(
-                        " [node1] {} submission failed after {:?}: {:?}",
-                        trade_type,
-                        start_time.elapsed(),
-                        _error
-                    );
-                }
-            }
-        } else if crate::common::sdk_log::sdk_log_enabled() {
-            crate::common::sdk_log::log_swqos_submission_failed(
-                "node1",
-                trade_type,
-                start_time.elapsed(),
-                response_text,
-            );
-        }
+        validate_json_rpc_submit_response(
+            "node1",
+            trade_type,
+            start_time.elapsed(),
+            status,
+            &response_text,
+        )?;
 
         let start_time: Instant = Instant::now();
         match poll_transaction_confirmation(&self.rpc_client, signature, wait_confirmation).await {
@@ -297,5 +279,83 @@ mod tests {
         drop(clone);
 
         assert!(!client.stop_ping.load(Ordering::Relaxed));
+    }
+
+    fn test_client_for(endpoint: String) -> Node1Client {
+        Node1Client {
+            endpoint,
+            auth_token: "token".to_string(),
+            rpc_client: Arc::new(SolanaRpcClient::new("http://127.0.0.1:8899".to_string())),
+            http_client: default_http_client_builder().build().unwrap(),
+            ping_handle: Arc::new(tokio::sync::Mutex::new(None)),
+            stop_ping: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_http_429_401_500() {
+        use crate::swqos::common::test_http::{
+            dummy_versioned_transaction, spawn_mock_http_server,
+        };
+
+        let tx = dummy_versioned_transaction();
+        for (status_line, body, expected_code) in [
+            ("429 Too Many Requests", r#"{"error":"rate limited"}"#, "429"),
+            ("401 Unauthorized", "unauthorized", "401"),
+            ("500 Internal Server Error", "internal error", "500"),
+        ] {
+            let server = spawn_mock_http_server(status_line, body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            let err = client
+                .send_transaction(TradeType::Buy, &tx, false)
+                .await
+                .expect_err("non-2xx HTTP status must fail");
+            assert!(
+                err.to_string().contains(expected_code),
+                "expected error to mention {expected_code}, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_rejects_json_rpc_error_missing_result_and_invalid_json() {
+        use crate::swqos::common::test_http::{
+            dummy_versioned_transaction, spawn_mock_http_server,
+        };
+
+        let tx = dummy_versioned_transaction();
+        for body in [
+            r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"rate limited"},"id":1}"#,
+            r#"{"jsonrpc":"2.0","result":null,"error":{"code":-32002,"message":"bad tx"},"id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            "not-json",
+        ] {
+            let server = spawn_mock_http_server("200 OK", body, Duration::ZERO).await;
+            let client = test_client_for(server.base_url.clone());
+            assert!(
+                client.send_transaction(TradeType::Buy, &tx, false).await.is_err(),
+                "expected error for response body: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transaction_accepts_valid_json_rpc_result() {
+        use crate::swqos::common::test_http::{
+            dummy_versioned_transaction, spawn_mock_http_server,
+        };
+
+        let tx = dummy_versioned_transaction();
+        let server = spawn_mock_http_server(
+            "200 OK",
+            r#"{"jsonrpc":"2.0","result":"5sig","id":1}"#,
+            Duration::ZERO,
+        )
+        .await;
+        let client = test_client_for(server.base_url.clone());
+        client
+            .send_transaction(TradeType::Buy, &tx, false)
+            .await
+            .expect("valid JSON-RPC result should succeed");
     }
 }
