@@ -727,6 +727,7 @@ mod tests {
             effective_core_ids: Arc::new(Vec::new()),
             check_min_tip: false,
             transaction_version: crate::common::TradeTransactionVersion::V0,
+            v1_loaded_accounts_data_size_limit: None,
             grpc_recv_us: None,
             use_exact_sol_amount: Some(true),
             precheck: None,

@@ -152,12 +152,12 @@ fn normalize_swqos_configs(rpc_url: &str, configs: &[SwqosConfig]) -> Vec<SwqosC
     out
 }
 
+const MAX_SENDER_CONCURRENCY: usize = 32;
+
 #[inline]
 fn compute_sender_concurrency(max_submit_lanes: usize) -> (usize, Arc<Vec<core_affinity::CoreId>>) {
-    let num_cores = core_affinity::get_core_ids().map(|c| c.len()).unwrap_or(0);
-    let max_by_cores = (num_cores * 2 / 3).max(1);
-    let cap = max_submit_lanes.min(max_by_cores).max(1);
-    // Keep v4's sender concurrency cap, but disable automatic core pinning.
+    let cap = max_submit_lanes.clamp(1, MAX_SENDER_CONCURRENCY);
+    // Do not cap parallel submit lanes by 2/3 of CPU cores; automatic core pinning stays disabled.
     (cap, Arc::new(Vec::new()))
 }
 
@@ -936,6 +936,8 @@ impl TradingInfrastructure {
             .max(1);
         let (max_sender_concurrency, effective_core_ids) =
             compute_sender_concurrency(max_submit_lanes);
+        let _ =
+            crate::trading::core::async_executor::warm_swqos_sender_pool(max_sender_concurrency);
 
         crate::instruction::utils::pumpswap::warm_pumpswap_global_config(Some(&rpc)).await;
 
@@ -991,7 +993,7 @@ pub struct TradingClient {
     pub use_dedicated_sender_threads: bool,
     /// Internal: core indices for dedicated sender threads. Trimmed to ≤ max_sender_concurrency at set.
     pub sender_thread_cores: Option<Arc<Vec<usize>>>,
-    /// Internal: precomputed at infra init (min(swqos_count, 2/3*cores)). Not user-configurable.
+    /// Internal: precomputed at infra init from submit lane count (capped at 32). Not user-configurable.
     pub max_sender_concurrency: usize,
     /// Internal: precomputed at infra init for job affinity. Not user-configurable.
     pub effective_core_ids: Arc<Vec<core_affinity::CoreId>>,
@@ -1001,6 +1003,8 @@ pub struct TradingClient {
     pub check_min_tip: bool,
     /// Solana transaction construction mode selected in `TradeConfig`.
     pub transaction_version: TradeTransactionVersion,
+    /// Optional `loaded_accounts_data_size_limit` (bytes) for V1 transactions.
+    pub v1_loaded_accounts_data_size_limit: Option<u32>,
     pub pumpfun_version: crate::common::PumpFunVersion,
 }
 
@@ -1025,6 +1029,7 @@ impl Clone for TradingClient {
             log_enabled: self.log_enabled,
             check_min_tip: self.check_min_tip,
             transaction_version: self.transaction_version,
+            v1_loaded_accounts_data_size_limit: self.v1_loaded_accounts_data_size_limit,
             pumpfun_version: self.pumpfun_version,
         }
     }
@@ -1320,6 +1325,7 @@ impl TradingClient {
             log_enabled: false,
             check_min_tip: false,
             transaction_version: TradeTransactionVersion::V0,
+            v1_loaded_accounts_data_size_limit: None,
             pumpfun_version: crate::common::PumpFunVersion::default(),
         }
     }
@@ -1370,6 +1376,7 @@ impl TradingClient {
             log_enabled: false,
             check_min_tip: false,
             transaction_version: TradeTransactionVersion::V0,
+            v1_loaded_accounts_data_size_limit: None,
             pumpfun_version: crate::common::PumpFunVersion::default(),
         }
     }
@@ -1552,6 +1559,7 @@ impl TradingClient {
             log_enabled: trade_config.log_enabled,
             check_min_tip: trade_config.check_min_tip,
             transaction_version: trade_config.transaction_version,
+            v1_loaded_accounts_data_size_limit: trade_config.v1_loaded_accounts_data_size_limit,
             pumpfun_version: trade_config.pumpfun_version,
         };
 
@@ -1678,6 +1686,18 @@ impl TradingClient {
     /// `V0` preserves the existing behavior: Legacy without ALTs and V0 with ALTs.
     pub fn with_transaction_version(mut self, version: TradeTransactionVersion) -> Self {
         self.transaction_version = version;
+        self
+    }
+
+    /// Override `loaded_accounts_data_size_limit` (bytes) for V1 transactions (e.g. `16 * 1024 * 1024`).
+    pub fn with_v1_loaded_accounts_data_size_limit(mut self, limit: u32) -> Self {
+        self.v1_loaded_accounts_data_size_limit = Some(limit);
+        self
+    }
+
+    /// Configure per-client SDK diagnostics flag (`false` by default).
+    pub fn with_log_enabled(mut self, enabled: bool) -> Self {
+        self.log_enabled = enabled;
         self
     }
 
@@ -1872,6 +1892,7 @@ impl TradingClient {
             effective_core_ids: self.effective_core_ids.clone(),
             check_min_tip: self.check_min_tip,
             transaction_version: self.transaction_version,
+            v1_loaded_accounts_data_size_limit: self.v1_loaded_accounts_data_size_limit,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: params.use_exact_sol_amount,
             precheck: params.precheck,
@@ -2030,6 +2051,7 @@ impl TradingClient {
             effective_core_ids: self.effective_core_ids.clone(),
             check_min_tip: self.check_min_tip,
             transaction_version: self.transaction_version,
+            v1_loaded_accounts_data_size_limit: self.v1_loaded_accounts_data_size_limit,
             grpc_recv_us: params.grpc_recv_us,
             use_exact_sol_amount: None,
             precheck: None,
@@ -2531,8 +2553,92 @@ mod tests {
     fn sender_concurrency_disables_automatic_core_affinity() {
         let (max_sender_concurrency, effective_core_ids) = compute_sender_concurrency(4);
 
-        assert!((1..=4).contains(&max_sender_concurrency));
+        assert_eq!(max_sender_concurrency, 4);
         assert!(effective_core_ids.is_empty());
+
+        let (ten_lanes, ten_cores) = compute_sender_concurrency(10);
+        assert_eq!(ten_lanes, 10);
+        assert!(ten_cores.is_empty());
+
+        let (capped, _) = compute_sender_concurrency(64);
+        assert_eq!(capped, MAX_SENDER_CONCURRENCY);
+
+        let (min_one, _) = compute_sender_concurrency(0);
+        assert_eq!(min_one, 1);
+    }
+
+    #[test]
+    fn client_builders_propagate_log_enabled_and_v1_loaded_accounts_limit() {
+        let infra = Arc::new(TradingInfrastructure {
+            rpc: Arc::new(SolanaRpcClient::new("https://example.invalid".to_string())),
+            swqos_clients: Arc::new(Vec::new()),
+            config: InfrastructureConfig::new(
+                "https://example.invalid".to_string(),
+                Vec::new(),
+                solana_commitment_config::CommitmentConfig::processed(),
+            ),
+            max_sender_concurrency: 10,
+            effective_core_ids: Arc::new(Vec::new()),
+        });
+        let client = TradingClient::from_infrastructure(Arc::new(Keypair::new()), infra, false)
+            .with_transaction_version(TradeTransactionVersion::V1)
+            .with_v1_loaded_accounts_data_size_limit(16 * 1024 * 1024)
+            .with_log_enabled(true);
+        assert!(client.log_enabled);
+        assert_eq!(client.v1_loaded_accounts_data_size_limit, Some(16 * 1024 * 1024));
+
+        let buy_swap = client
+            .prepare_buy(TradeBuyParams {
+                dex_type: DexType::PumpFun,
+                input_token_type: TradeTokenType::SOL,
+                mint: Pubkey::new_unique(),
+                input_token_amount: 10_000,
+                slippage_basis_points: Some(100),
+                recent_blockhash: Some(Hash::new_unique()),
+                extension_params: dummy_pumpfun_params(),
+                address_lookup_table_accounts: Vec::new(),
+                wait_tx_confirmed: false,
+                wait_for_all_submits: false,
+                create_input_token_ata: false,
+                close_input_token_ata: false,
+                create_mint_ata: false,
+                durable_nonce: None,
+                fixed_output_token_amount: None,
+                gas_fee_strategy: GasFeeStrategy::new(),
+                simulate: false,
+                use_exact_sol_amount: Some(true),
+                precheck: None,
+                grpc_recv_us: None,
+            })
+            .unwrap();
+        assert!(buy_swap.log_enabled);
+        assert_eq!(buy_swap.v1_loaded_accounts_data_size_limit, Some(16 * 1024 * 1024));
+
+        let sell_swap = client
+            .prepare_sell(TradeSellParams {
+                dex_type: DexType::PumpFun,
+                output_token_type: TradeTokenType::SOL,
+                mint: Pubkey::new_unique(),
+                input_token_amount: 10_000,
+                slippage_basis_points: Some(100),
+                recent_blockhash: Some(Hash::new_unique()),
+                with_tip: true,
+                extension_params: dummy_pumpfun_params(),
+                address_lookup_table_accounts: Vec::new(),
+                wait_tx_confirmed: false,
+                wait_for_all_submits: false,
+                create_output_token_ata: false,
+                close_output_token_ata: false,
+                close_mint_token_ata: false,
+                durable_nonce: None,
+                fixed_output_token_amount: None,
+                gas_fee_strategy: GasFeeStrategy::new(),
+                simulate: false,
+                grpc_recv_us: None,
+            })
+            .unwrap();
+        assert!(sell_swap.log_enabled);
+        assert_eq!(sell_swap.v1_loaded_accounts_data_size_limit, Some(16 * 1024 * 1024));
     }
 
     #[test]

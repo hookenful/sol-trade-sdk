@@ -113,6 +113,9 @@ pub struct TradeConfig {
     pub commitment: CommitmentConfig,
     /// Transaction construction mode. V0 (default) preserves Legacy messages when no ALT is used.
     pub transaction_version: TradeTransactionVersion,
+    /// Optional `loaded_accounts_data_size_limit` (bytes) for V1 transactions.
+    /// When `None`, V1 transactions default to 64 MiB (`64 * 1024 * 1024`).
+    pub v1_loaded_accounts_data_size_limit: Option<u32>,
     /// Whether to create WSOL ATA on startup (default: true)
     /// If true, SDK will check WSOL ATA on initialization and create if not exists
     pub create_wsol_ata_on_startup: bool,
@@ -182,6 +185,7 @@ pub struct TradeConfigBuilder {
     swqos_configs: Vec<SwqosConfig>,
     commitment: CommitmentConfig,
     transaction_version: TradeTransactionVersion,
+    v1_loaded_accounts_data_size_limit: Option<u32>,
     create_wsol_ata_on_startup: bool,
     use_seed_optimize: bool,
     log_enabled: bool,
@@ -199,6 +203,7 @@ impl TradeConfigBuilder {
             swqos_configs,
             commitment,
             transaction_version: TradeTransactionVersion::default(),
+            v1_loaded_accounts_data_size_limit: None,
             create_wsol_ata_on_startup: true,
             use_seed_optimize: true,
             log_enabled: false,
@@ -223,6 +228,13 @@ impl TradeConfigBuilder {
     /// Select the Solana transaction construction mode. Default: [`TradeTransactionVersion::V0`].
     pub fn transaction_version(mut self, version: TradeTransactionVersion) -> Self {
         self.transaction_version = version;
+        self
+    }
+
+    /// Override `loaded_accounts_data_size_limit` (bytes) for V1 transactions (e.g. `16 * 1024 * 1024`).
+    /// When unset, V1 transactions default to 64 MiB.
+    pub fn v1_loaded_accounts_data_size_limit(mut self, limit: u32) -> Self {
+        self.v1_loaded_accounts_data_size_limit = Some(limit);
         self
     }
 
@@ -280,6 +292,7 @@ impl TradeConfigBuilder {
             swqos_configs: self.swqos_configs,
             commitment: self.commitment,
             transaction_version: self.transaction_version,
+            v1_loaded_accounts_data_size_limit: self.v1_loaded_accounts_data_size_limit,
             pumpfun_version: self.pumpfun_version,
             create_wsol_ata_on_startup: self.create_wsol_ata_on_startup,
             use_seed_optimize: self.use_seed_optimize,
@@ -306,6 +319,7 @@ mod tests {
             CommitmentConfig::processed(),
         );
         assert_eq!(config.transaction_version, TradeTransactionVersion::V0);
+        assert_eq!(config.v1_loaded_accounts_data_size_limit, None);
         assert_eq!(config.pumpfun_version, PumpFunVersion::V3);
         assert!(!config.log_enabled);
     }
@@ -318,10 +332,12 @@ mod tests {
             CommitmentConfig::processed(),
         )
         .transaction_version(TradeTransactionVersion::V1)
+        .v1_loaded_accounts_data_size_limit(16 * 1024 * 1024)
         .pumpfun_version(PumpFunVersion::V2)
         .log_enabled(true)
         .build();
         assert_eq!(config.transaction_version, TradeTransactionVersion::V1);
+        assert_eq!(config.v1_loaded_accounts_data_size_limit, Some(16 * 1024 * 1024));
         assert_eq!(config.pumpfun_version, PumpFunVersion::V2);
         assert!(config.log_enabled);
     }

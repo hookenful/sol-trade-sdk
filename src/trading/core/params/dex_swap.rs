@@ -153,6 +153,9 @@ pub struct SwapParams {
     pub check_min_tip: bool,
     /// Solana transaction construction mode selected by `TradeConfig`.
     pub transaction_version: TradeTransactionVersion,
+    /// Optional `loaded_accounts_data_size_limit` (bytes) for V1 transactions.
+    /// When `None`, V1 transactions default to 64 MiB.
+    pub v1_loaded_accounts_data_size_limit: Option<u32>,
     /// Optional event receive time in microseconds (same scale as sol-parser-sdk clock::now_micros). Used as timing start when log_enabled.
     pub grpc_recv_us: Option<i64>,
     /// Use exact quote-input buy instructions (legacy PumpFun uses SOL quote; V2/PumpSwap use generic quote).

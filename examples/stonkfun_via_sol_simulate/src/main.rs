@@ -129,6 +129,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         effective_core_ids: Arc::new(Vec::new()),
         check_min_tip: false,
         transaction_version: sol_trade_sdk::common::TradeTransactionVersion::V0,
+        v1_loaded_accounts_data_size_limit: None,
         grpc_recv_us: None,
         use_exact_sol_amount: None,
         precheck: None,
