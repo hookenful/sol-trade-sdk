@@ -5,8 +5,8 @@ use solana_sdk::{instruction::AccountMeta, pubkey::Pubkey};
 
 use crate::common::SolanaRpcClient;
 use crate::instruction::utils::meteora_dbc::{
-    fetch_config_cached, fetch_extra_account_metas, fetch_pool, ExtraAccountMeta,
-    SWAP_MODE_PARTIAL_FILL,
+    extra_account_metas_decode, fetch_config_cached, fetch_pool, get_extra_account_metas_address,
+    ExtraAccountMeta, SWAP_MODE_PARTIAL_FILL,
 };
 use crate::instruction::utils::meteora_dbc_types::{DbcConfig, DbcPool, ACTIVATION_SLOT};
 use crate::utils::calc::meteora_dbc::{
@@ -154,8 +154,50 @@ impl MeteoraDbcParams {
         pool_address: &Pubkey,
         pool: &DbcPool,
     ) -> anyhow::Result<Self> {
-        let config = fetch_config_cached(rpc, &pool.config).await?;
-        let mints = rpc.get_multiple_accounts(&[pool.base_mint, config.quote_mint]).await?;
+        Self::from_pool_with_cached_by_rpc(rpc, pool_address, pool, None, None).await
+    }
+
+    /// [`Self::from_pool_by_rpc`] reusing an already-loaded config and/or cached transfer-hook
+    /// extra account list, batching mints and any uncached hook validation account into a
+    /// single `getMultipleAccounts` RPC and taking the slot from `response.context.slot`
+    /// instead of calling `get_slot()`.
+    pub async fn from_pool_with_cached_by_rpc(
+        rpc: &SolanaRpcClient,
+        pool_address: &Pubkey,
+        pool: &DbcPool,
+        cached_config: Option<Arc<DbcConfig>>,
+        cached_hook_metas: Option<Vec<ExtraAccountMeta>>,
+    ) -> anyhow::Result<Self> {
+        let config = match cached_config {
+            Some(config) => config,
+            None => fetch_config_cached(rpc, &pool.config).await?,
+        };
+        let hook_program_and_validation = match (pool.transfer_hook, config.transfer_hook_program) {
+            (false, _) => None,
+            (true, Some(program)) => {
+                let validation = if cached_hook_metas.is_some() {
+                    None
+                } else {
+                    Some(get_extra_account_metas_address(&pool.base_mint, &program))
+                };
+                Some((program, validation))
+            }
+            (true, None) => {
+                return Err(anyhow::anyhow!(
+                    "Transfer-hook pool {pool_address} has a config without a hook program"
+                ))
+            }
+        };
+
+        let mut keys = Vec::with_capacity(3);
+        keys.push(pool.base_mint);
+        keys.push(config.quote_mint);
+        if let Some((_, Some(validation))) = hook_program_and_validation {
+            keys.push(validation);
+        }
+
+        let response = rpc.get_multiple_accounts_with_commitment(&keys, rpc.commitment()).await?;
+        let mints = response.value;
         let owner = |index: usize, mint: &Pubkey| {
             mints
                 .get(index)
@@ -166,24 +208,34 @@ impl MeteoraDbcParams {
         let base_token_program = owner(0, &pool.base_mint)?;
         let quote_token_program = owner(1, &config.quote_mint)?;
 
-        let transfer_hook = match (pool.transfer_hook, config.transfer_hook_program) {
-            (false, _) => None,
-            (true, Some(program)) => Some(DbcTransferHook::Metas {
+        let transfer_hook = match hook_program_and_validation {
+            None => None,
+            Some((program, None)) => Some(DbcTransferHook::Metas {
                 program,
-                metas: fetch_extra_account_metas(rpc, &pool.base_mint, &program).await?,
+                metas: cached_hook_metas.unwrap_or_default(),
             }),
-            (true, None) => {
-                return Err(anyhow::anyhow!(
-                    "Transfer-hook pool {pool_address} has a config without a hook program"
-                ))
+            Some((program, Some(validation))) => {
+                let account = mints.get(2).and_then(Option::as_ref).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Transfer hook validation account {validation} for {} not found",
+                        pool.base_mint
+                    )
+                })?;
+                let metas = extra_account_metas_decode(&account.data).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Account {validation} is not the transfer hook's extra account list of {}",
+                        pool.base_mint
+                    )
+                })?;
+                Some(DbcTransferHook::Metas { program, metas })
             }
         };
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| time.as_secs());
-        // Only fees that change with time need the slot.
+        // Only fees that change with time need the slot, taken directly from `context.slot`.
         let slot =
             if config.activation_type == ACTIVATION_SLOT && config.base_fee.second_factor != 0 {
-                rpc.get_slot().await?
+                response.context.slot
             } else {
                 0
             };

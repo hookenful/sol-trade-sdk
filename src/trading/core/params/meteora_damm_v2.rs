@@ -75,10 +75,25 @@ impl MeteoraDammV2Params {
     ) -> Result<Self, anyhow::Error> {
         let pool_data =
             crate::instruction::utils::meteora_damm_v2::fetch_pool(rpc, pool_address).await?;
-        let mint_accounts =
-            rpc.get_multiple_accounts(&[pool_data.token_a_mint, pool_data.token_b_mint]).await?;
+        Self::from_pool_by_rpc(rpc, pool_address, &pool_data).await
+    }
+
+    /// Loads mint token programs and current slot from a single batched RPC for
+    /// an already-read pool state, avoiding a separate `get_slot` call.
+    pub async fn from_pool_by_rpc(
+        rpc: &SolanaRpcClient,
+        pool_address: &Pubkey,
+        pool_data: &Pool,
+    ) -> Result<Self, anyhow::Error> {
+        let response = rpc
+            .get_multiple_accounts_with_commitment(
+                &[pool_data.token_a_mint, pool_data.token_b_mint],
+                rpc.commitment(),
+            )
+            .await?;
+        let mint_accounts = response.value;
         let token_a_program = mint_accounts
-            .get(0)
+            .first()
             .and_then(|a| a.as_ref())
             .map(|a| a.owner)
             .ok_or_else(|| anyhow::anyhow!("Token A mint account not found"))?;
@@ -88,15 +103,15 @@ impl MeteoraDammV2Params {
             .map(|a| a.owner)
             .ok_or_else(|| anyhow::anyhow!("Token B mint account not found"))?;
         // The pool counts time in slots (activation type 0) or seconds; only a
-        // fee still on its schedule needs the slot.
+        // fee still on its schedule needs the slot, taken directly from `context.slot`.
         let slot = if pool_data.activation_type == 0
             && pool_data.pool_fees.base_fee.period_frequency != 0
         {
-            rpc.get_slot().await?
+            response.context.slot
         } else {
             0
         };
-        Ok(Self::from_pool_state(pool_address, &pool_data, token_a_program, token_b_program, slot))
+        Ok(Self::from_pool_state(pool_address, pool_data, token_a_program, token_b_program, slot))
     }
 
     /// The parameters of a pool account already read, whose mints' token

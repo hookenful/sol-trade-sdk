@@ -1,5 +1,7 @@
 use crate::common::SolanaRpcClient;
-use crate::trading::core::params::raydium_cpmm::{token_transfer_fee_for_epoch, TokenTransferFee};
+use crate::trading::core::params::raydium_cpmm::{
+    mint_needs_transfer_fee_epoch, token_transfer_fee_for_epoch, TokenTransferFee,
+};
 use solana_sdk::pubkey::Pubkey;
 
 /// Parameters for the shared LaunchLab program.
@@ -246,21 +248,68 @@ impl BonkParams {
     ) -> Result<Self, anyhow::Error> {
         let pool_data =
             crate::instruction::utils::bonk::fetch_pool_state(rpc, pool_address).await?;
-        let base_mint_account = rpc.get_account(&pool_data.base_mint).await?;
-        let quote_mint_account = rpc.get_account(&pool_data.quote_mint).await?;
-        let fee_config = crate::instruction::utils::bonk::fetch_fee_config(
-            rpc,
-            &pool_data.global_config,
-            &pool_data.platform_config,
-        )
-        .await?;
+        Self::from_pool_state(rpc, pool_address, &pool_data).await
+    }
+
+    /// Loads LaunchLab parameters from an already-read [`PoolState`](crate::instruction::utils::bonk_types::PoolState)
+    /// in a single batched `getMultipleAccounts` RPC (`[base_mint, quote_mint, global_config,
+    /// platform_config, CLOCK_SYSVAR]`), skipping `get_epoch_info` whenever neither mint configures
+    /// a Token-2022 transfer fee.
+    pub async fn from_pool_state(
+        rpc: &SolanaRpcClient,
+        pool_address: &Pubkey,
+        pool_data: &crate::instruction::utils::bonk_types::PoolState,
+    ) -> Result<Self, anyhow::Error> {
+        let keys = [
+            pool_data.base_mint,
+            pool_data.quote_mint,
+            pool_data.global_config,
+            pool_data.platform_config,
+            super::CLOCK_SYSVAR,
+        ];
+        let accounts = rpc.get_multiple_accounts(&keys).await?;
+        let account = |index: usize, label: &str| {
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| anyhow::anyhow!("LaunchLab {label} account {} missing", keys[index]))
+        };
+        let base_mint_account = account(0, "base_mint")?;
+        let quote_mint_account = account(1, "quote_mint")?;
+        let global_account = account(2, "global_config")?;
+        let platform_account = account(3, "platform_config")?;
+        if global_account.owner != crate::instruction::utils::bonk::accounts::BONK
+            || platform_account.owner != crate::instruction::utils::bonk::accounts::BONK
+        {
+            return Err(anyhow::anyhow!("LaunchLab config account has an unexpected owner"));
+        }
+        let fee_config = crate::instruction::utils::bonk::decode_fee_config(
+            &global_account.data,
+            &platform_account.data,
+        )?;
         if fee_config.curve_type != 0 {
             return Err(anyhow::anyhow!(
                 "Unsupported LaunchLab curve type: {}",
                 fee_config.curve_type
             ));
         }
-        let epoch = rpc.get_epoch_info().await?.epoch;
+        let needs_epoch =
+            mint_needs_transfer_fee_epoch(&base_mint_account.data, base_mint_account.owner)?
+                || mint_needs_transfer_fee_epoch(
+                    &quote_mint_account.data,
+                    quote_mint_account.owner,
+                )?;
+        let epoch = if !needs_epoch {
+            0
+        } else if let Some(clock_account) = accounts.get(4).and_then(Option::as_ref) {
+            clock_account
+                .data
+                .get(16..24)
+                .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+                .ok_or_else(|| anyhow::anyhow!("Clock sysvar data is too short"))?
+        } else {
+            rpc.get_epoch_info().await?.epoch
+        };
         let base_transfer_fee =
             token_transfer_fee_for_epoch(&base_mint_account.data, base_mint_account.owner, epoch)?;
         let quote_transfer_fee = token_transfer_fee_for_epoch(

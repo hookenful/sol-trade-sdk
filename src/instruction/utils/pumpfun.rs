@@ -4,12 +4,18 @@
 
 use crate::common::{bonding_curve::BondingCurveAccount, SolanaRpcClient};
 use anyhow::anyhow;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use rand::seq::IndexedRandom;
 use solana_sdk::{
+    account::Account,
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
 };
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 // --- seeds -------------------------------------------------------------
 
@@ -518,6 +524,30 @@ pub fn get_buy_price(
 
 // --- RPC -------------------------------------------------------------
 
+const PUMPFUN_GLOBAL_FEE_RECIPIENT_TTL: Duration = Duration::from_secs(90);
+
+#[derive(Clone, Copy)]
+struct CachedGlobalFeeRecipient {
+    fetched_at: Instant,
+    fee_recipient: Pubkey,
+}
+
+static GLOBAL_FEE_RECIPIENT_CACHE: Lazy<DashMap<String, CachedGlobalFeeRecipient>> =
+    Lazy::new(DashMap::new);
+
+#[inline]
+pub(crate) fn cached_global_fee_recipient(rpc: &SolanaRpcClient) -> Option<Pubkey> {
+    let url = rpc.url();
+    let entry = GLOBAL_FEE_RECIPIENT_CACHE.get(&url)?;
+    (entry.fetched_at.elapsed() <= PUMPFUN_GLOBAL_FEE_RECIPIENT_TTL).then_some(entry.fee_recipient)
+}
+
+#[inline]
+pub(crate) fn cache_global_fee_recipient(rpc: &SolanaRpcClient, fee_recipient: Pubkey) {
+    GLOBAL_FEE_RECIPIENT_CACHE
+        .insert(rpc.url(), CachedGlobalFeeRecipient { fetched_at: Instant::now(), fee_recipient });
+}
+
 #[inline]
 pub(crate) fn decode_global_fee_recipient(data: &[u8]) -> Result<Pubkey, anyhow::Error> {
     const FEE_RECIPIENT_OFFSET: usize = 8 + 1 + 32;
@@ -541,8 +571,9 @@ pub(crate) fn decode_global_fee_recipient(data: &[u8]) -> Result<Pubkey, anyhow:
 }
 
 #[inline]
-pub async fn fetch_global_fee_recipient(rpc: &SolanaRpcClient) -> Result<Pubkey, anyhow::Error> {
-    let account = rpc.get_account(&global_constants::GLOBAL_ACCOUNT).await?;
+pub(crate) fn decode_global_fee_recipient_account(
+    account: &Account,
+) -> Result<Pubkey, anyhow::Error> {
     if account.owner != accounts::PUMPFUN {
         return Err(anyhow!("PumpFun Global account has unexpected owner {}", account.owner));
     }
@@ -550,16 +581,24 @@ pub async fn fetch_global_fee_recipient(rpc: &SolanaRpcClient) -> Result<Pubkey,
 }
 
 #[inline]
-pub async fn fetch_fee_sharing_creator_vault_if_active(
-    rpc: &SolanaRpcClient,
+pub async fn fetch_global_fee_recipient(rpc: &SolanaRpcClient) -> Result<Pubkey, anyhow::Error> {
+    if let Some(cached) = cached_global_fee_recipient(rpc) {
+        return Ok(cached);
+    }
+    let account = rpc.get_account(&global_constants::GLOBAL_ACCOUNT).await?;
+    let recipient = decode_global_fee_recipient_account(&account)?;
+    cache_global_fee_recipient(rpc, recipient);
+    Ok(recipient)
+}
+
+#[inline]
+pub(crate) fn decode_fee_sharing_creator_vault_account(
+    account: Option<&Account>,
     mint: &Pubkey,
+    config_pda: &Pubkey,
 ) -> Result<Option<Pubkey>, anyhow::Error> {
-    let Some(config_pda) = get_fee_sharing_config_pda(mint) else {
+    let Some(acc) = account else {
         return Ok(None);
-    };
-    let acc = match rpc.get_account(&config_pda).await {
-        Ok(a) => a,
-        Err(_) => return Ok(None),
     };
     if acc.owner != accounts::FEE_PROGRAM {
         return Ok(None);
@@ -577,18 +616,29 @@ pub async fn fetch_fee_sharing_creator_vault_if_active(
     if mint_on_chain != *mint {
         return Ok(None);
     }
-    Ok(get_creator_vault_pda(&config_pda))
+    Ok(get_creator_vault_pda(config_pda))
 }
 
 #[inline]
-pub async fn fetch_bonding_curve_account(
+pub async fn fetch_fee_sharing_creator_vault_if_active(
     rpc: &SolanaRpcClient,
     mint: &Pubkey,
-) -> Result<(Arc<BondingCurveAccount>, Pubkey), anyhow::Error> {
-    let bonding_curve_pda: Pubkey =
-        get_bonding_curve_pda(mint).ok_or_else(|| anyhow!("Bonding curve not found"))?;
+) -> Result<Option<Pubkey>, anyhow::Error> {
+    let Some(config_pda) = get_fee_sharing_config_pda(mint) else {
+        return Ok(None);
+    };
+    let acc = match rpc.get_account(&config_pda).await {
+        Ok(a) => a,
+        Err(_) => return Ok(None),
+    };
+    decode_fee_sharing_creator_vault_account(Some(&acc), mint, &config_pda)
+}
 
-    let account = rpc.get_account(&bonding_curve_pda).await?;
+#[inline]
+pub(crate) fn decode_bonding_curve_account(
+    account: &Account,
+    bonding_curve_pda: Pubkey,
+) -> Result<BondingCurveAccount, anyhow::Error> {
     if account.data.is_empty() {
         return Err(anyhow!("Bonding curve not found"));
     }
@@ -602,6 +652,19 @@ pub async fn fetch_bonding_curve_account(
     )
     .ok_or_else(|| anyhow::anyhow!("Failed to decode bonding curve account"))?;
     bonding_curve.account = bonding_curve_pda;
+    Ok(bonding_curve)
+}
+
+#[inline]
+pub async fn fetch_bonding_curve_account(
+    rpc: &SolanaRpcClient,
+    mint: &Pubkey,
+) -> Result<(Arc<BondingCurveAccount>, Pubkey), anyhow::Error> {
+    let bonding_curve_pda: Pubkey =
+        get_bonding_curve_pda(mint).ok_or_else(|| anyhow!("Bonding curve not found"))?;
+
+    let account = rpc.get_account(&bonding_curve_pda).await?;
+    let bonding_curve = decode_bonding_curve_account(&account, bonding_curve_pda)?;
 
     Ok((Arc::new(bonding_curve), bonding_curve_pda))
 }
@@ -837,7 +900,8 @@ mod tests {
 
     #[test]
     fn fee_rotation_handles_stale_observations_and_preserves_reserved_pools() {
-        for (old, new) in global_constants::RETIRED_NORMAL_FEE_RECIPIENTS.iter()
+        for (old, new) in global_constants::RETIRED_NORMAL_FEE_RECIPIENTS
+            .iter()
             .zip(global_constants::NORMAL_FEE_RECIPIENTS)
         {
             assert_eq!(pump_fun_fee_recipient_meta(*old, false).pubkey, new);

@@ -51,7 +51,8 @@ pub mod accounts {
     use solana_sdk::{pubkey, pubkey::Pubkey};
 
     /// Public key for the fee recipient
-    pub const FEE_RECIPIENT: Pubkey = crate::instruction::utils::pumpfun::global_constants::FEE_RECIPIENT;
+    pub const FEE_RECIPIENT: Pubkey =
+        crate::instruction::utils::pumpfun::global_constants::FEE_RECIPIENT;
 
     /// Public key for the global PDA
     pub const GLOBAL_ACCOUNT: Pubkey = pubkey!("ADyA8hdefvWN2dbGGWFotbzWxrAvLW83WG6QCVXvJKqw");
@@ -1060,32 +1061,40 @@ pub async fn find_by_quote_mint(
 /// 按 mint 查找 PumpSwap 池（本函数仅用于 PumpSwap，其他 DEX 勿用）。
 ///
 /// 查找顺序（与 @pump-fun/pump-swap-sdk 一致）：
-/// 1. Pool v2 PDA ["pool-v2", base_mint] — 一次 getAccount
-/// 2. Canonical pool PDA ["pool", 0, pumpPoolAuthority(mint), mint, WSOL] — 迁移后的标准池
-/// 3. getProgramAccounts 按 base_mint / quote_mint 过滤
+/// 1. 单次 getMultipleAccounts 批量查询 [pool_v2 PDA, canonical PDA]，优先命中 v2，次选 canonical
+/// 2. getProgramAccounts 按 base_mint / quote_mint 过滤
 pub async fn find_by_mint(
     rpc: &SolanaRpcClient,
     mint: &Pubkey,
 ) -> Result<(Pubkey, Pool), anyhow::Error> {
     let mut diag = Vec::<String>::new();
 
-    // 1. PumpSwap v2 PDA（seeds: ["pool-v2", base_mint]）
-    if let Some(pool_address) = get_pool_v2_pda(mint) {
-        diag.push(format!("PDA(v2)={}", pool_address));
-        match fetch_pool(rpc, &pool_address).await {
-            Ok(pool) if pool.base_mint == *mint => return Ok((pool_address, pool)),
-            Ok(_) => diag.push("PDA(v2) 账户存在但 base_mint 不匹配".into()),
-            Err(e) => diag.push(format!("PDA(v2) get_account/decode 失败: {}", e)),
-        }
-    }
-
-    // 2. Canonical pool PDA（与 pump-swap-sdk canonicalPumpPoolPda(mint) 一致）
+    // 1 + 2. Batch PumpSwap v2 PDA and canonical pool PDA in a single getMultipleAccounts RPC.
+    let v2_pda = get_pool_v2_pda(mint);
     let canonical_address = get_canonical_pool_pda(mint);
+    let mut candidate_keys = Vec::with_capacity(2);
+    if let Some(pool_address) = v2_pda {
+        diag.push(format!("PDA(v2)={}", pool_address));
+        candidate_keys.push((pool_address, "PDA(v2)"));
+    }
     diag.push(format!("canonical={}", canonical_address));
-    match fetch_pool(rpc, &canonical_address).await {
-        Ok(pool) if pool.base_mint == *mint => return Ok((canonical_address, pool)),
-        Ok(_) => diag.push("canonical 账户存在但 base_mint 不匹配".into()),
-        Err(e) => diag.push(format!("canonical get_account/decode 失败: {}", e)),
+    candidate_keys.push((canonical_address, "canonical"));
+
+    let keys: Vec<Pubkey> = candidate_keys.iter().map(|(k, _)| *k).collect();
+    match rpc.get_multiple_accounts(&keys).await {
+        Ok(accounts) => {
+            for ((address, label), account_opt) in candidate_keys.into_iter().zip(accounts) {
+                match account_opt {
+                    Some(account) => match decode_pool_account(&account) {
+                        Ok(pool) if pool.base_mint == *mint => return Ok((address, pool)),
+                        Ok(_) => diag.push(format!("{label} 账户存在但 base_mint 不匹配")),
+                        Err(e) => diag.push(format!("{label} decode 失败: {}", e)),
+                    },
+                    None => diag.push(format!("{label} 账户不存在")),
+                }
+            }
+        }
+        Err(e) => diag.push(format!("get_multiple_accounts(v2,canonical) 失败: {}", e)),
     }
 
     // 3. Fallback: getProgramAccounts by base_mint / quote_mint (with 3s timeout to avoid blocking)
@@ -1190,22 +1199,39 @@ pub async fn get_pool_rpc_snapshot_with_address(
     pool_hint: &Pool,
     rpc: &SolanaRpcClient,
 ) -> Result<(Pool, PoolRpcSnapshot), anyhow::Error> {
-    let addresses = [
-        *pool_address,
-        pool_hint.pool_base_token_account,
-        pool_hint.pool_quote_token_account,
-        pool_hint.base_mint,
-    ];
+    get_pool_rpc_snapshot_by_addresses(
+        pool_address,
+        &pool_hint.base_mint,
+        &pool_hint.quote_mint,
+        &pool_hint.pool_base_token_account,
+        &pool_hint.pool_quote_token_account,
+        rpc,
+    )
+    .await
+}
+
+/// Refresh Pool, both vaults and base mint in one `getMultipleAccounts` RPC
+/// using known cached account addresses, avoiding a separate initial `fetch_pool`.
+pub async fn get_pool_rpc_snapshot_by_addresses(
+    pool_address: &Pubkey,
+    base_mint: &Pubkey,
+    quote_mint: &Pubkey,
+    pool_base_token_account: &Pubkey,
+    pool_quote_token_account: &Pubkey,
+    rpc: &SolanaRpcClient,
+) -> Result<(Pool, PoolRpcSnapshot), anyhow::Error> {
+    let addresses =
+        [*pool_address, *pool_base_token_account, *pool_quote_token_account, *base_mint];
     let accounts = rpc.get_multiple_accounts(&addresses).await?;
     let pool_account = accounts
         .first()
         .and_then(Option::as_ref)
         .ok_or_else(|| anyhow!("PumpSwap Pool account was not found"))?;
     let pool = decode_pool_account(pool_account).map_err(anyhow::Error::msg)?;
-    if pool.pool_base_token_account != pool_hint.pool_base_token_account
-        || pool.pool_quote_token_account != pool_hint.pool_quote_token_account
-        || pool.base_mint != pool_hint.base_mint
-        || pool.quote_mint != pool_hint.quote_mint
+    if pool.pool_base_token_account != *pool_base_token_account
+        || pool.pool_quote_token_account != *pool_quote_token_account
+        || pool.base_mint != *base_mint
+        || pool.quote_mint != *quote_mint
     {
         return Err(anyhow!("PumpSwap Pool address hint does not match the refreshed Pool"));
     }

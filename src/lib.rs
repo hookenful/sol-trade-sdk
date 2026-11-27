@@ -17,7 +17,7 @@ pub use client::{
     TradeTokenType, TradingClient, TradingInfrastructure,
 };
 pub use trading::core::params::{
-    PumpFunQuoteHop, PumpFunQuoteRoute, PumpFunQuoteVenue, PumpFunV3Params,
+    PumpFunImmutableMeta, PumpFunQuoteHop, PumpFunQuoteRoute, PumpFunQuoteVenue, PumpFunV3Params,
     PreparedPumpSwapTrade, PumpSwapQuoteHop, PumpSwapQuoteRoute, PumpSwapQuoteVenue,
     PumpSwapRouteRejection, PumpSwapRouteSearch, PumpSwapRouteSelection, StonkFunMemeLeg,
     StonkFunParams, StonkFunQuoteHop, StonkFunQuoteHopPreview, StonkFunQuoteRoute,
