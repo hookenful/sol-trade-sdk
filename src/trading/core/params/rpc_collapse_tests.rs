@@ -415,7 +415,14 @@ async fn raydium_cpmm_from_pool_state_uses_single_batched_rpc_and_skips_epoch_fo
     let requests = rpc_builder.requests();
     let rpc = rpc_builder.client();
 
-    let params = RaydiumCpmmParams::from_pool_state(&rpc, &pool_key, &pool).await.unwrap();
+    // Pass stale fee counters in the caller's PoolState to prove from_pool_state
+    // reads the pool atomically alongside both vaults in the same single RPC slot
+    // (avoiding cross-slot fee/vault torn reads).
+    let mut stale_pool = pool.clone();
+    stale_pool.protocol_fees_token0 = 999;
+    stale_pool.protocol_fees_token1 = 1_999;
+
+    let params = RaydiumCpmmParams::from_pool_state(&rpc, &pool_key, &stale_pool).await.unwrap();
     assert_eq!(params.base_reserve, 1_000 - 17);
     assert_eq!(params.quote_reserve, 2_000 - 24);
     assert_eq!(params.trade_fee_rate, 2_500);
@@ -423,7 +430,10 @@ async fn raydium_cpmm_from_pool_state_uses_single_batched_rpc_and_skips_epoch_fo
     let recorded = requests.lock().unwrap().clone();
     assert_eq!(recorded.len(), 1, "from_pool_state must make 1 batched RPC without get_epoch_info");
     assert_eq!(recorded[0].0, RpcRequest::GetMultipleAccounts);
-    assert!(!recorded[0].1.contains(&pool_key), "from_pool_state must not re-fetch pool");
+    assert!(
+        recorded[0].1.contains(&pool_key),
+        "from_pool_state must read pool alongside vaults in the same RPC slot"
+    );
 
     requests.lock().unwrap().clear();
     let params_full = RaydiumCpmmParams::from_pool_address_by_rpc(&rpc, &pool_key).await.unwrap();
@@ -1104,8 +1114,11 @@ async fn bonk_and_cpmm_token2022_transfer_fee_uses_clock_or_falls_back_to_epoch_
         ..AmmConfig::default()
     });
 
+    let cpmm_pool_bytes = encode_cpmm_pool(&cpmm_state);
+
     // With CLOCK_SYSVAR at epoch 12: 1 GetMultipleAccounts RPC, 0 GetEpochInfo, newer fee.
     let cpmm_with_clock = CountingRpc::new(902)
+        .account(cpmm_pool, RAYDIUM_CPMM, cpmm_pool_bytes.clone())
         .account(amm_config, RAYDIUM_CPMM, amm_config_bytes.clone())
         .account(vault0, TOKEN_PROGRAM_2022, spl_token_account_bytes(base_mint, 1_000))
         .account(vault1, TOKEN_PROGRAM, spl_token_account_bytes(quote_mint, 2_000))
@@ -1128,6 +1141,7 @@ async fn bonk_and_cpmm_token2022_transfer_fee_uses_clock_or_falls_back_to_epoch_
     // Without CLOCK_SYSVAR: falls back to GetEpochInfo (epoch 7 -> older fee).
     let cpmm_no_clock = CountingRpc::new(903)
         .epoch(7)
+        .account(cpmm_pool, RAYDIUM_CPMM, cpmm_pool_bytes)
         .account(amm_config, RAYDIUM_CPMM, amm_config_bytes)
         .account(vault0, TOKEN_PROGRAM_2022, spl_token_account_bytes(base_mint, 1_000))
         .account(vault1, TOKEN_PROGRAM, spl_token_account_bytes(quote_mint, 2_000))

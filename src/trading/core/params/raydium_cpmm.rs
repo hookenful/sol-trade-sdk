@@ -254,70 +254,24 @@ impl RaydiumCpmmParams {
     ) -> Result<Self, anyhow::Error> {
         let pool =
             crate::instruction::utils::raydium_cpmm::fetch_pool_state(rpc, pool_address).await?;
-        let keys = Self::quote_account_keys(pool_address, &pool);
-        let accounts = rpc.get_multiple_accounts(&keys).await?;
-        let data = |index: usize| {
-            accounts
-                .get(index)
-                .and_then(Option::as_ref)
-                .map(|account| account.data.as_slice())
-                .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
-        };
-        let owner = |index: usize| {
-            accounts
-                .get(index)
-                .and_then(Option::as_ref)
-                .map(|account| account.owner)
-                .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
-        };
-        let token_0_mint = (owner(4)?, data(4)?);
-        let token_1_mint = (owner(5)?, data(5)?);
-        // RPCs return the clock with the rest; only query `get_epoch_info` if
-        // the clock is missing AND a Token-2022 mint actually configures a transfer fee.
-        let clock = match accounts.get(6).and_then(Option::as_ref) {
-            Some(account) => account.data.clone(),
-            None => {
-                let mut clock = vec![0u8; 40];
-                if mint_needs_transfer_fee_epoch(token_0_mint.1, token_0_mint.0)?
-                    || mint_needs_transfer_fee_epoch(token_1_mint.1, token_1_mint.0)?
-                {
-                    let epoch = rpc.get_epoch_info().await?.epoch;
-                    clock[16..24].copy_from_slice(&epoch.to_le_bytes());
-                }
-                clock
-            }
-        };
-        Self::from_quote_accounts(
-            *pool_address,
-            &CpmmQuoteAccounts {
-                pool: data(0)?,
-                amm_config: data(1)?,
-                token_0_vault: data(2)?,
-                token_1_vault: data(3)?,
-                token_0_mint,
-                token_1_mint,
-                clock: &clock,
-            },
-        )
+        Self::from_pool_state(rpc, pool_address, &pool).await
     }
 
-    /// Loads config, vaults and mints in a single `getMultipleAccounts` RPC for an
-    /// already-read [`PoolState`](crate::instruction::utils::raydium_cpmm_types::PoolState),
-    /// avoiding a duplicate pool fetch and skipping `get_epoch_info` when no Token-2022
-    /// transfer fee extension is present.
+    /// Loads fresh pool state, config, vaults, and mints atomically in a single
+    /// `getMultipleAccounts` RPC using known addresses from a previously read
+    /// [`PoolState`](crate::instruction::utils::raydium_cpmm_types::PoolState).
+    ///
+    /// Reading `*pool_address` alongside both vaults in the same RPC slot avoids
+    /// cross-slot torn reads between mutable fee counters and vault balances, while
+    /// still requiring only one RPC round trip and skipping `get_epoch_info` when no
+    /// Token-2022 transfer fee extension is present.
     pub async fn from_pool_state(
         rpc: &SolanaRpcClient,
         pool_address: &Pubkey,
         pool: &crate::instruction::utils::raydium_cpmm_types::PoolState,
     ) -> Result<Self, anyhow::Error> {
-        let keys = [
-            pool.amm_config,
-            pool.token0_vault,
-            pool.token1_vault,
-            pool.token0_mint,
-            pool.token1_mint,
-            super::CLOCK_SYSVAR,
-        ];
+        use crate::instruction::utils::raydium_cpmm_types::pool_state_decode;
+        let keys = Self::quote_account_keys(pool_address, pool);
         let accounts = rpc.get_multiple_accounts(&keys).await?;
         let data = |index: usize| {
             accounts
@@ -333,13 +287,29 @@ impl RaydiumCpmmParams {
                 .map(|account| account.owner)
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
         };
-        let token_0_mint = (owner(3)?, data(3)?);
-        let token_1_mint = (owner(4)?, data(4)?);
-        let epoch = match accounts.get(5).and_then(Option::as_ref) {
+        let fresh_pool = data(0)?
+            .get(8..)
+            .and_then(pool_state_decode)
+            .ok_or_else(|| anyhow::anyhow!("{pool_address} is not a Raydium CPMM pool"))?;
+        if fresh_pool.amm_config != pool.amm_config
+            || fresh_pool.token0_vault != pool.token0_vault
+            || fresh_pool.token1_vault != pool.token1_vault
+            || fresh_pool.token0_mint != pool.token0_mint
+            || fresh_pool.token1_mint != pool.token1_mint
+        {
+            return Err(anyhow::anyhow!(
+                "Raydium CPMM pool {} addresses changed between reads",
+                pool_address
+            ));
+        }
+        let token_0_mint = (owner(4)?, data(4)?);
+        let token_1_mint = (owner(5)?, data(5)?);
+        let epoch = match accounts.get(6).and_then(Option::as_ref) {
             Some(account) => account
                 .data
                 .get(16..24)
-                .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+                .and_then(|raw| raw.try_into().ok())
+                .map(u64::from_le_bytes)
                 .ok_or_else(|| anyhow::anyhow!("Clock sysvar data is too short"))?,
             None => {
                 if mint_needs_transfer_fee_epoch(token_0_mint.1, token_0_mint.0)?
@@ -353,10 +323,10 @@ impl RaydiumCpmmParams {
         };
         Self::from_decoded_pool_state(
             *pool_address,
-            pool,
-            data(0)?,
+            &fresh_pool,
             data(1)?,
             data(2)?,
+            data(3)?,
             token_0_mint,
             token_1_mint,
             epoch,
@@ -396,7 +366,8 @@ impl RaydiumCpmmParams {
         let epoch = accounts
             .clock
             .get(16..24)
-            .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+            .and_then(|raw| raw.try_into().ok())
+            .map(u64::from_le_bytes)
             .ok_or_else(|| anyhow::anyhow!("Clock sysvar data is too short"))?;
         Self::from_decoded_pool_state(
             pool_address,
@@ -428,7 +399,8 @@ impl RaydiumCpmmParams {
             .ok_or_else(|| anyhow::anyhow!("Raydium CPMM config {} is invalid", pool.amm_config))?;
         let balance = |data: &[u8]| {
             data.get(64..72)
-                .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+                .and_then(|raw| raw.try_into().ok())
+                .map(u64::from_le_bytes)
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM vault data is too short"))
         };
         let (token0_balance, token1_balance) = (balance(token_0_vault)?, balance(token_1_vault)?);
