@@ -305,7 +305,8 @@ impl BonkParams {
             clock_account
                 .data
                 .get(16..24)
-                .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+                .and_then(|raw| raw.try_into().ok())
+                .map(u64::from_le_bytes)
                 .ok_or_else(|| anyhow::anyhow!("Clock sysvar data is too short"))?
         } else {
             rpc.get_epoch_info().await?.epoch

@@ -223,17 +223,17 @@ pub async fn poll_any_transaction_confirmation(
 
         let status = rpc.get_signature_statuses(&valid_signatures).await?;
         // Check all signatures for any that confirmed successfully
-        for (i, maybe_status) in status.value.iter().enumerate() {
+        for (sig, maybe_status) in valid_signatures.iter().zip(status.value.iter()) {
             if let Some(s) = maybe_status {
                 if s.err.is_none()
                     && (s.confirmation_status == Some(TransactionConfirmationStatus::Confirmed)
                         || s.confirmation_status == Some(TransactionConfirmationStatus::Finalized))
                 {
-                    return Ok(valid_signatures[i]);
+                    return Ok(*sig);
                 }
                 // Track the first signature that landed on-chain (even if errored)
                 if landed_sig.is_none() {
-                    landed_sig = Some(valid_signatures[i]);
+                    landed_sig = Some(*sig);
                 }
             }
         }
