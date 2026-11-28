@@ -160,6 +160,12 @@ impl SwqosType {
         }
     }
 
+    /// Whether this provider is disabled via [`SWQOS_BLACKLIST`].
+    #[inline]
+    pub fn is_blacklisted(self) -> bool {
+        SWQOS_BLACKLIST.contains(&self)
+    }
+
     pub fn values() -> Vec<Self> {
         vec![
             Self::Jito,
@@ -528,7 +534,7 @@ impl SwqosConfig {
 
     /// Check if current config is in the blacklist
     pub fn is_blacklisted(&self) -> bool {
-        SWQOS_BLACKLIST.contains(&self.swqos_type())
+        self.swqos_type().is_blacklisted()
     }
 
     pub fn get_endpoint(swqos_type: SwqosType, region: SwqosRegion, url: Option<String>) -> String {
@@ -1110,5 +1116,15 @@ mod tests {
         .await;
         let error = result.err().expect("Glaive gRPC config must fail");
         assert!(error.to_string().contains("does not support the gRPC transport"));
+    }
+
+    #[test]
+    fn nextblock_is_blacklisted_via_swqos_type_and_config() {
+        assert!(SwqosType::NextBlock.is_blacklisted());
+        assert!(SwqosConfig::NextBlock(String::new(), SwqosRegion::Default, None, None)
+            .is_blacklisted());
+        assert!(!SwqosType::Helius.is_blacklisted());
+        assert!(!SwqosConfig::Helius(String::new(), SwqosRegion::Default, None, None, None)
+            .is_blacklisted());
     }
 }

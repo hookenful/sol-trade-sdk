@@ -191,7 +191,9 @@ impl TradeExecutor for GenericTradeExecutor {
 
         let (ok, signatures, err, submit_timings) = match result {
             Ok((success, sigs, last_error, timings)) => {
-                (success, sigs, last_error.map(|e| anyhow::anyhow!("{}", e)), timings)
+                let valid_sigs =
+                    sigs.into_iter().filter(|sig| *sig != Signature::default()).collect();
+                (success, valid_sigs, last_error.map(|e| anyhow::anyhow!("{}", e)), timings)
             }
             Err(e) => (false, vec![], Some(anyhow::anyhow!("{}", e)), vec![]),
         };
@@ -447,5 +449,132 @@ mod tests {
         println!(" [SDK][{:width$}] {} simulate (dry-run): {:.4} ms", "-", dir, 8.50, width = w);
         println!(" [SDK][{:width$}] {} total: {:.4} ms", "-", dir, 36.51, width = w);
         println!();
+    }
+
+    #[tokio::test]
+    async fn swap_filters_default_signature_and_skips_confirmation_polling_on_build_error() {
+        use super::*;
+        use crate::common::{bonding_curve::BondingCurveAccount, TradeTransactionVersion};
+        use crate::constants::TOKEN_PROGRAM;
+        use crate::swqos::{SwqosConfig, TradeType};
+        use crate::trading::core::params::{DexParamEnum, PumpFunParams};
+        use solana_commitment_config::CommitmentConfig;
+        use solana_sdk::instruction::Instruction;
+        use tokio::net::TcpListener;
+
+        struct DummyInstructionBuilder;
+
+        #[async_trait::async_trait]
+        impl InstructionBuilder for DummyInstructionBuilder {
+            async fn build_buy_instructions(
+                &self,
+                _params: &SwapParams,
+            ) -> Result<Vec<Instruction>> {
+                Ok(vec![Instruction::new_with_bytes(Pubkey::new_unique(), &[1], vec![])])
+            }
+
+            async fn build_sell_instructions(
+                &self,
+                _params: &SwapParams,
+            ) -> Result<Vec<Instruction>> {
+                Ok(vec![Instruction::new_with_bytes(Pubkey::new_unique(), &[1], vec![])])
+            }
+        }
+
+        // Unresponsive RPC server: if `swap` wrongly polled `Signature::default()`,
+        // it would block for 15s (or until RPC timeout).
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((_stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        let rpc_url = format!("http://{addr}");
+        let rpc = Arc::new(SolanaRpcClient::new_with_commitment(
+            rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+        ));
+        let client = SwqosConfig::get_swqos_client(
+            rpc_url.clone(),
+            CommitmentConfig::confirmed(),
+            SwqosConfig::Default(rpc_url),
+            false,
+        )
+        .await
+        .unwrap();
+        let strategy = GasFeeStrategy::new();
+        strategy.set_default_rpc_fee_strategy(200_000, 200_000, 0, 0);
+
+        let params = SwapParams {
+            rpc: Some(rpc),
+            payer: Arc::new(Keypair::new()),
+            trade_type: TradeType::Buy,
+            input_mint: crate::constants::SOL_TOKEN_ACCOUNT,
+            input_token_program: None,
+            output_mint: Pubkey::new_unique(),
+            output_token_program: None,
+            input_amount: Some(1_000_000),
+            slippage_basis_points: Some(300),
+            address_lookup_table_accounts: vec![],
+            recent_blockhash: Some(Hash::new_unique()),
+            wait_tx_confirmed: true,
+            protocol_params: DexParamEnum::PumpFun(PumpFunParams {
+                bonding_curve: Arc::new(BondingCurveAccount::default()),
+                associated_bonding_curve: Pubkey::default(),
+                observed_trade_creator: None,
+                creator_vault: Pubkey::default(),
+                fee_sharing_creator_vault_if_active: None,
+                token_program: TOKEN_PROGRAM,
+                close_token_account_when_sell: None,
+                fee_recipient: Pubkey::default(),
+                quote_mint: Pubkey::default(),
+            }),
+            open_seed_optimize: false,
+            swqos_clients: Arc::new(vec![client]),
+            middleware_manager: None,
+            // Invalid DurableNonceInfo triggers a local tx-build error returning `Signature::default()`.
+            durable_nonce: Some(DurableNonceInfo {
+                nonce_account: None,
+                current_nonce: Some(Hash::new_unique()),
+            }),
+            with_tip: false,
+            create_input_mint_ata: false,
+            close_input_mint_ata: false,
+            create_output_mint_ata: false,
+            close_output_mint_ata: false,
+            fixed_output_amount: None,
+            gas_fee_strategy: strategy,
+            simulate: false,
+            log_enabled: false,
+            wait_for_all_submits: true,
+            use_dedicated_sender_threads: false,
+            sender_thread_cores: None,
+            max_sender_concurrency: 1,
+            effective_core_ids: Arc::new(vec![]),
+            check_min_tip: false,
+            transaction_version: TradeTransactionVersion::V0,
+            v1_loaded_accounts_data_size_limit: None,
+            grpc_recv_us: None,
+            use_exact_sol_amount: None,
+            precheck: None,
+        };
+
+        let executor = GenericTradeExecutor::new(Arc::new(DummyInstructionBuilder), "Test");
+        let started = Instant::now();
+        let (ok, signatures, err, _timings) =
+            tokio::time::timeout(Duration::from_secs(2), executor.swap(params))
+                .await
+                .expect("swap must not poll Signature::default() for 15s")
+                .unwrap();
+
+        assert!(!ok);
+        assert!(signatures.is_empty(), "Signature::default() must be filtered out: {signatures:?}");
+        assert!(err.unwrap().to_string().contains("nonce_account is None"));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.abort();
     }
 }

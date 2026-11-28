@@ -132,24 +132,25 @@ pub struct PumpFunInstructionBuilder;
 #[async_trait::async_trait]
 impl InstructionBuilder for PumpFunInstructionBuilder {
     async fn build_buy_instructions(&self, params: &SwapParams) -> Result<Vec<Instruction>> {
-        let mut instructions = if let crate::trading::core::params::DexParamEnum::PumpFunVersioned {
-            params: curve,
-            version,
-        } = &params.protocol_params
-        {
-            build_versioned(params, curve, *version, true)?
-        } else if let crate::trading::core::params::DexParamEnum::PumpFunV3(v3) =
-            &params.protocol_params
-        {
-            super::pumpfun_v3::build(params, v3, true)?
-        } else if let crate::trading::core::params::DexParamEnum::PumpFunQuoteRoute(route) =
-            &params.protocol_params
-        {
-            validate_curve_route_endpoint(route, params.output_mint, true)?;
-            super::stonkfun_quote_route::build_quote_route(params, route, true).await?
-        } else {
-            return build_buy(params);
-        };
+        let mut instructions =
+            if let crate::trading::core::params::DexParamEnum::PumpFunVersioned {
+                params: curve,
+                version,
+            } = &params.protocol_params
+            {
+                build_versioned(params, curve, *version, true)?
+            } else if let crate::trading::core::params::DexParamEnum::PumpFunV3(v3) =
+                &params.protocol_params
+            {
+                super::pumpfun_v3::build(params, v3, true)?
+            } else if let crate::trading::core::params::DexParamEnum::PumpFunQuoteRoute(route) =
+                &params.protocol_params
+            {
+                validate_curve_route_endpoint(route, params.output_mint, true)?;
+                super::stonkfun_quote_route::build_quote_route(params, route, true).await?
+            } else {
+                return build_buy(params);
+            };
         prepend_precheck_if_needed(params, &mut instructions)?;
         Ok(instructions)
     }
@@ -325,6 +326,24 @@ fn prepend_precheck_if_needed(
     Ok(())
 }
 
+/// Compute `min_tokens_out` for exact-quote-in buys (`buy_exact_sol_in` / `buy_exact_quote_in`).
+///
+/// Both `use_exact_sol_amount = None` (default) and `Some(true)` apply `slippage_bp` to the
+/// estimated token output, matching PumpSwap and [`crate::TradeBuyParams::use_exact_sol_amount`].
+/// Passing 100% slippage (`10_000` bps) floors to `1` raw token whenever the curve produces
+/// tokens (`buy_token_amount > 0`) so on-chain `min_tokens_out > 0` remains valid.
+#[inline]
+fn exact_quote_in_min_tokens_out(buy_token_amount: u64, slippage_bp: u64) -> u64 {
+    if buy_token_amount == 0 {
+        return 0;
+    }
+    if slippage_bp >= 10_000 {
+        // Explicit 100% slippage opts into the 1-token floor instead of clamping at 99.99%.
+        return 1;
+    }
+    calculate_with_slippage_sell(buy_token_amount, slippage_bp).max(1)
+}
+
 #[inline]
 fn build_buy(params: &SwapParams) -> Result<Vec<Instruction>> {
     let mut instructions = if should_use_v2_layout(params)? {
@@ -445,11 +464,7 @@ fn build_buy_legacy(params: &SwapParams) -> Result<Vec<Instruction>> {
             lamports_in,
         );
         if params.use_exact_sol_amount.unwrap_or(true) {
-            let min_tokens_out = if params.use_exact_sol_amount == Some(true) {
-                1
-            } else {
-                calculate_with_slippage_sell(buy_token_amount, slippage_bp)
-            };
+            let min_tokens_out = exact_quote_in_min_tokens_out(buy_token_amount, slippage_bp);
             encode_pumpfun_buy_exact_quote_in_ix_data(lamports_in, min_tokens_out, ix_version)
         } else {
             let max_sol_cost = calculate_with_slippage_buy(lamports_in, slippage_bp);
@@ -794,11 +809,7 @@ fn build_buy_unified_with_minimum(
             lamports_in,
         );
         if params.use_exact_sol_amount.unwrap_or(true) {
-            let min_tokens_out = if params.use_exact_sol_amount == Some(true) {
-                1
-            } else {
-                calculate_with_slippage_sell(buy_token_amount, slippage_bp)
-            };
+            let min_tokens_out = exact_quote_in_min_tokens_out(buy_token_amount, slippage_bp);
             (
                 encode_pumpfun_buy_exact_quote_in_ix_data(
                     lamports_in,
@@ -1722,18 +1733,58 @@ mod tests {
     }
 
     #[test]
-    fn pumpfun_buy_exact_quote_explicit_true_sets_min_tokens_out_to_one() {
+    fn pumpfun_buy_exact_quote_explicit_true_matches_none_slippage_protection() {
         crate::common::seed::set_default_rents();
-        let mut params = swap_params_for_buy(Pubkey::new_unique(), TOKEN_PROGRAM);
-        params.create_output_mint_ata = false;
-        params.fixed_output_amount = None;
-        params.use_exact_sol_amount = Some(true);
+        let mint = Pubkey::new_unique();
+        let mut params_true = swap_params_for_buy(mint, TOKEN_PROGRAM);
+        params_true.create_output_mint_ata = false;
+        params_true.fixed_output_amount = None;
+        params_true.slippage_basis_points = Some(500);
+        params_true.use_exact_sol_amount = Some(true);
 
-        let instructions = build_buy(&params).unwrap();
-        let data = &instructions[0].data;
+        let mut params_none = params_true.clone();
+        params_none.use_exact_sol_amount = None;
 
-        assert_eq!(&data[..8], crate::instruction::utils::pumpfun::BUY_EXACT_SOL_IN_DISCRIMINATOR);
-        assert_eq!(u64::from_le_bytes(data[16..24].try_into().unwrap()), 1);
+        let ix_true = build_buy(&params_true).unwrap();
+        let ix_none = build_buy(&params_none).unwrap();
+        assert_eq!(
+            &ix_true[0].data[..8],
+            crate::instruction::utils::pumpfun::BUY_EXACT_SOL_IN_DISCRIMINATOR
+        );
+        let min_out_true = u64::from_le_bytes(ix_true[0].data[16..24].try_into().unwrap());
+        let min_out_none = u64::from_le_bytes(ix_none[0].data[16..24].try_into().unwrap());
+        assert_eq!(min_out_true, min_out_none);
+        assert!(min_out_true > 1, "5% slippage must not collapse min_tokens_out to 1");
+
+        // 100% slippage explicitly opts into the 1-token floor.
+        let mut params_max_slippage = params_true.clone();
+        params_max_slippage.slippage_basis_points = Some(10_000);
+        let ix_max = build_buy(&params_max_slippage).unwrap();
+        assert_eq!(u64::from_le_bytes(ix_max[0].data[16..24].try_into().unwrap()), 1);
+
+        // V2 unified layout applies the same slippage protection for Some(true) and None.
+        let mut v2_true = swap_params_for_buy(pump_mint(), TOKEN_PROGRAM);
+        v2_true.create_output_mint_ata = false;
+        v2_true.input_mint = crate::constants::USDC_TOKEN_ACCOUNT;
+        v2_true.slippage_basis_points = Some(500);
+        v2_true.use_exact_sol_amount = Some(true);
+        if let DexParamEnum::PumpFun(protocol_params) = &mut v2_true.protocol_params {
+            *protocol_params =
+                protocol_params.clone().with_quote_mint(crate::constants::USDC_TOKEN_ACCOUNT);
+        }
+        let mut v2_none = v2_true.clone();
+        v2_none.use_exact_sol_amount = None;
+
+        let v2_ix_true = build_buy(&v2_true).unwrap().pop().unwrap();
+        let v2_ix_none = build_buy(&v2_none).unwrap().pop().unwrap();
+        assert_eq!(
+            &v2_ix_true.data[..8],
+            crate::instruction::utils::pumpfun::BUY_EXACT_QUOTE_IN_V2_DISCRIMINATOR
+        );
+        let v2_min_true = u64::from_le_bytes(v2_ix_true.data[16..24].try_into().unwrap());
+        let v2_min_none = u64::from_le_bytes(v2_ix_none.data[16..24].try_into().unwrap());
+        assert_eq!(v2_min_true, v2_min_none);
+        assert!(v2_min_true > 1, "V2 5% slippage must not collapse min_tokens_out to 1");
     }
 
     #[test]

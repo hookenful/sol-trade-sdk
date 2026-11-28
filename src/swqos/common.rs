@@ -193,12 +193,14 @@ pub async fn poll_any_transaction_confirmation(
     signatures: &[Signature],
     wait_confirmation: bool,
 ) -> Result<Signature> {
-    if signatures.is_empty() {
-        return Err(anyhow::anyhow!("No signatures to confirm"));
+    let valid_signatures: Vec<Signature> =
+        signatures.iter().copied().filter(|sig| *sig != Signature::default()).collect();
+    if valid_signatures.is_empty() {
+        return Err(anyhow::anyhow!("No valid signatures to confirm"));
     }
     // If no confirmation needed, return first signature immediately
     if !wait_confirmation {
-        return Ok(signatures[0]);
+        return Ok(valid_signatures[0]);
     }
 
     let timeout: Duration = Duration::from_secs(15);
@@ -213,13 +215,13 @@ pub async fn poll_any_transaction_confirmation(
             return Err(anyhow::anyhow!(
                 "Transaction confirmation timed out after {}s ({} signatures polled)",
                 timeout.as_secs(),
-                signatures.len()
+                valid_signatures.len()
             ));
         }
 
         poll_count += 1;
 
-        let status = rpc.get_signature_statuses(signatures).await?;
+        let status = rpc.get_signature_statuses(&valid_signatures).await?;
         // Check all signatures for any that confirmed successfully
         for (i, maybe_status) in status.value.iter().enumerate() {
             if let Some(s) = maybe_status {
@@ -227,11 +229,11 @@ pub async fn poll_any_transaction_confirmation(
                     && (s.confirmation_status == Some(TransactionConfirmationStatus::Confirmed)
                         || s.confirmation_status == Some(TransactionConfirmationStatus::Finalized))
                 {
-                    return Ok(signatures[i]);
+                    return Ok(valid_signatures[i]);
                 }
                 // Track the first signature that landed on-chain (even if errored)
                 if landed_sig.is_none() {
-                    landed_sig = Some(signatures[i]);
+                    landed_sig = Some(valid_signatures[i]);
                 }
             }
         }
