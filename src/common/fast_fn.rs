@@ -4,22 +4,39 @@ use solana_sdk::{
     instruction::{AccountMeta, Instruction},
     pubkey::Pubkey,
 };
-use std::{hash::Hash, sync::Arc};
+use std::{
+    hash::Hash,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
 use crate::common::{
     spl_associated_token_account::get_associated_token_address_with_program_id,
     spl_token::close_account,
 };
-use crate::perf::compiler_optimization::CompileTimeOptimizedEventProcessor;
-
-/// 🚀 编译时优化的哈希处理器
-static COMPILE_TIME_HASH: CompileTimeOptimizedEventProcessor =
-    CompileTimeOptimizedEventProcessor::new();
 
 // Increased cache sizes for better performance
 const MAX_PDA_CACHE_SIZE: usize = 100_000;
 const MAX_ATA_CACHE_SIZE: usize = 100_000;
 const MAX_INSTRUCTION_CACHE_SIZE: usize = 100_000;
+const PRUNE_CHECK_INTERVAL_CAP: usize = 256;
+
+static INSTRUCTION_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+static PDA_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+static ATA_CACHE_INSERTS: AtomicUsize = AtomicUsize::new(0);
+
+#[inline]
+fn maybe_prune_cache<K, V>(cache: &DashMap<K, V>, inserts: &AtomicUsize, max_size: usize)
+where
+    K: Eq + Hash + Clone,
+{
+    let check_every = (max_size / 16).clamp(1, PRUNE_CHECK_INTERVAL_CAP);
+    if (inserts.fetch_add(1, Ordering::Relaxed).wrapping_add(1)).is_multiple_of(check_every) {
+        prune_cache(cache, max_size);
+    }
+}
 
 #[inline]
 fn prune_cache<K, V>(cache: &DashMap<K, V>, max_size: usize)
@@ -59,7 +76,7 @@ pub enum InstructionCacheKey {
 static INSTRUCTION_CACHE: Lazy<DashMap<InstructionCacheKey, Arc<Vec<Instruction>>>> =
     Lazy::new(|| DashMap::with_capacity(MAX_INSTRUCTION_CACHE_SIZE));
 
-/// Get cached instruction, compute and cache if not exists (lock-free)
+/// Get cached instruction, compute and cache if not exists (read-only fast path on hits).
 /// 🚀 返回 Arc 避免每次调用克隆整个 Vec
 #[inline]
 pub fn get_cached_instructions<F>(
@@ -69,22 +86,27 @@ pub fn get_cached_instructions<F>(
 where
     F: FnOnce() -> Vec<Instruction>,
 {
-    // 使用编译时优化的哈希进行快速路由
-    let _hash = match &cache_key {
-        InstructionCacheKey::CreateAssociatedTokenAccount { payer, .. } => {
-            let bytes = payer.to_bytes();
-            COMPILE_TIME_HASH.hash_lookup_optimized(bytes[0])
-        }
-        InstructionCacheKey::CloseWsolAccount { payer, .. } => {
-            let bytes = payer.to_bytes();
-            COMPILE_TIME_HASH.hash_lookup_optimized(bytes[0])
-        }
-    };
+    // Read-only fast path: avoids write-locking the shard and avoids shard-wide len() scans.
+    if let Some(instructions) = INSTRUCTION_CACHE.get(&cache_key) {
+        return Arc::clone(instructions.value());
+    }
 
-    // Lock-free cache lookup with entry API
-    let instructions =
-        INSTRUCTION_CACHE.entry(cache_key).or_insert_with(|| Arc::new(compute_fn())).clone();
-    prune_cache(&INSTRUCTION_CACHE, MAX_INSTRUCTION_CACHE_SIZE);
+    // Slow path: compute on miss and insert once.
+    let mut inserted = false;
+    let instructions = INSTRUCTION_CACHE
+        .entry(cache_key)
+        .or_insert_with(|| {
+            inserted = true;
+            Arc::new(compute_fn())
+        })
+        .clone();
+    if inserted {
+        maybe_prune_cache(
+            &INSTRUCTION_CACHE,
+            &INSTRUCTION_CACHE_INSERTS,
+            MAX_INSTRUCTION_CACHE_SIZE,
+        );
+    }
     instructions
 }
 
@@ -208,7 +230,7 @@ where
 
     if let Some(pda) = pda_result {
         PDA_CACHE.insert(cache_key, pda);
-        prune_cache(&PDA_CACHE, MAX_PDA_CACHE_SIZE);
+        maybe_prune_cache(&PDA_CACHE, &PDA_CACHE_INSERTS, MAX_PDA_CACHE_SIZE);
     }
 
     pda_result
@@ -312,7 +334,7 @@ fn _get_associated_token_address_with_program_id_fast(
 
     // Store computation result in cache (lock-free)
     ATA_CACHE.insert(cache_key, ata);
-    prune_cache(&ATA_CACHE, MAX_ATA_CACHE_SIZE);
+    maybe_prune_cache(&ATA_CACHE, &ATA_CACHE_INSERTS, MAX_ATA_CACHE_SIZE);
 
     ata
 }
@@ -340,8 +362,8 @@ pub fn fast_init(payer: &Pubkey) {
             vec![close_account(
                 &crate::constants::TOKEN_PROGRAM,
                 &wsol_token_account,
-                &payer,
-                &payer,
+                payer,
+                payer,
                 &[],
             )
             .unwrap()]
@@ -367,5 +389,41 @@ mod token_extension_seed_tests {
         assert_eq!(instructions.len(), 1);
         assert_eq!(instructions[0].program_id, crate::constants::ASSOCIATED_TOKEN_PROGRAM_ID);
         assert_eq!(instructions[0].accounts[1].pubkey, address);
+    }
+
+    #[test]
+    fn get_cached_instructions_read_only_fast_path_reuses_arc_without_recomputing() {
+        let key = InstructionCacheKey::CloseWsolAccount {
+            payer: Pubkey::new_unique(),
+            wsol_token_account: Pubkey::new_unique(),
+        };
+        let calls = AtomicUsize::new(0);
+        let first = get_cached_instructions(key.clone(), || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            vec![Instruction::new_with_bytes(Pubkey::new_unique(), &[1, 2, 3], vec![])]
+        });
+        let inserts_after_first = INSTRUCTION_CACHE_INSERTS.load(Ordering::Relaxed);
+        let second = get_cached_instructions(key, || {
+            calls.fetch_add(1, Ordering::Relaxed);
+            vec![]
+        });
+        let inserts_after_second = INSTRUCTION_CACHE_INSERTS.load(Ordering::Relaxed);
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(
+            inserts_after_first, inserts_after_second,
+            "cache hits must not trigger insert counter or prune scans"
+        );
+    }
+
+    #[test]
+    fn maybe_prune_cache_bounds_cache_size_periodically() {
+        let map: DashMap<usize, usize> = DashMap::new();
+        let counter = AtomicUsize::new(0);
+        for i in 0..40 {
+            map.insert(i, i);
+            maybe_prune_cache(&map, &counter, 16);
+        }
+        assert!(map.len() <= 16, "cache len {} exceeded max_size 16", map.len());
     }
 }

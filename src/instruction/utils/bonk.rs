@@ -92,8 +92,15 @@ pub async fn fetch_fee_config(
     global_config: &Pubkey,
     platform_config: &Pubkey,
 ) -> Result<LaunchLabFeeConfig, anyhow::Error> {
-    let global = rpc.get_account(global_config).await?;
-    let platform = rpc.get_account(platform_config).await?;
+    let accounts = rpc.get_multiple_accounts(&[*global_config, *platform_config]).await?;
+    let global = accounts
+        .first()
+        .and_then(Option::as_ref)
+        .ok_or_else(|| anyhow!("LaunchLab GlobalConfig account {global_config} not found"))?;
+    let platform = accounts
+        .get(1)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| anyhow!("LaunchLab PlatformConfig account {platform_config} not found"))?;
     if global.owner != accounts::BONK || platform.owner != accounts::BONK {
         return Err(anyhow!("LaunchLab config account has an unexpected owner"));
     }

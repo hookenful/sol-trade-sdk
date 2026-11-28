@@ -23,7 +23,11 @@ impl TokenTransferFee {
         mint: &Pubkey,
     ) -> anyhow::Result<(Pubkey, Self)> {
         let account = rpc.get_account(mint).await?;
-        let epoch = rpc.get_epoch_info().await?.epoch;
+        let epoch = if mint_needs_transfer_fee_epoch(&account.data, account.owner)? {
+            rpc.get_epoch_info().await?.epoch
+        } else {
+            0
+        };
         Ok((account.owner, token_transfer_fee_for_epoch(&account.data, account.owner, epoch)?))
     }
 
@@ -77,6 +81,32 @@ mod transfer_fee_tests {
 
         assert_eq!(pre_fee_amount - fee.calculate(pre_fee_amount), post_fee_amount);
     }
+}
+
+/// Returns whether reading the current cluster epoch is required to compute a
+/// mint's active transfer fee. Classic SPL Token mints and Token-2022 mints
+/// without `TransferFeeConfig` never need an epoch RPC.
+pub(crate) fn mint_needs_transfer_fee_epoch(
+    data: &[u8],
+    token_program: Pubkey,
+) -> Result<bool, anyhow::Error> {
+    if token_program == crate::constants::TOKEN_PROGRAM {
+        return Ok(false);
+    }
+    let token_2022_program = Pubkey::new_from_array(spl_token_2022_interface::ID.to_bytes());
+    if token_program != token_2022_program {
+        return Err(anyhow::anyhow!("Unsupported CPMM token program: {}", token_program));
+    }
+    let mint = StateWithExtensions::<Mint>::unpack(data)
+        .map_err(|error| anyhow::anyhow!("Failed to decode Token-2022 mint: {}", error))?;
+    anyhow::ensure!(
+        spl_token_2022_interface::extension::transfer_hook::get_program_id(&mint).is_none(),
+        "Active transfer hook requires unsupported extra accounts"
+    );
+    Ok(mint
+        .get_extension_types()
+        .map_err(|error| anyhow::anyhow!("Failed to inspect Token-2022 mint: {}", error))?
+        .contains(&ExtensionType::TransferFeeConfig))
 }
 
 /// The transfer fee a mint charges in `epoch`: none for SPL Token mints, the
@@ -227,25 +257,33 @@ impl RaydiumCpmmParams {
         let keys = Self::quote_account_keys(pool_address, &pool);
         let accounts = rpc.get_multiple_accounts(&keys).await?;
         let data = |index: usize| {
-            accounts[index]
-                .as_ref()
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
                 .map(|account| account.data.as_slice())
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
         };
         let owner = |index: usize| {
-            accounts[index]
-                .as_ref()
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
                 .map(|account| account.owner)
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
         };
-        // RPCs return the clock with the rest; one that leaves it out still
-        // gives the epoch the mints' transfer fees follow.
-        let clock = match &accounts[6] {
+        let token_0_mint = (owner(4)?, data(4)?);
+        let token_1_mint = (owner(5)?, data(5)?);
+        // RPCs return the clock with the rest; only query `get_epoch_info` if
+        // the clock is missing AND a Token-2022 mint actually configures a transfer fee.
+        let clock = match accounts.get(6).and_then(Option::as_ref) {
             Some(account) => account.data.clone(),
             None => {
                 let mut clock = vec![0u8; 40];
-                let epoch = rpc.get_epoch_info().await?.epoch;
-                clock[16..24].copy_from_slice(&epoch.to_le_bytes());
+                if mint_needs_transfer_fee_epoch(token_0_mint.1, token_0_mint.0)?
+                    || mint_needs_transfer_fee_epoch(token_1_mint.1, token_1_mint.0)?
+                {
+                    let epoch = rpc.get_epoch_info().await?.epoch;
+                    clock[16..24].copy_from_slice(&epoch.to_le_bytes());
+                }
                 clock
             }
         };
@@ -256,10 +294,72 @@ impl RaydiumCpmmParams {
                 amm_config: data(1)?,
                 token_0_vault: data(2)?,
                 token_1_vault: data(3)?,
-                token_0_mint: (owner(4)?, data(4)?),
-                token_1_mint: (owner(5)?, data(5)?),
+                token_0_mint,
+                token_1_mint,
                 clock: &clock,
             },
+        )
+    }
+
+    /// Loads config, vaults and mints in a single `getMultipleAccounts` RPC for an
+    /// already-read [`PoolState`](crate::instruction::utils::raydium_cpmm_types::PoolState),
+    /// avoiding a duplicate pool fetch and skipping `get_epoch_info` when no Token-2022
+    /// transfer fee extension is present.
+    pub async fn from_pool_state(
+        rpc: &SolanaRpcClient,
+        pool_address: &Pubkey,
+        pool: &crate::instruction::utils::raydium_cpmm_types::PoolState,
+    ) -> Result<Self, anyhow::Error> {
+        let keys = [
+            pool.amm_config,
+            pool.token0_vault,
+            pool.token1_vault,
+            pool.token0_mint,
+            pool.token1_mint,
+            super::CLOCK_SYSVAR,
+        ];
+        let accounts = rpc.get_multiple_accounts(&keys).await?;
+        let data = |index: usize| {
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|account| account.data.as_slice())
+                .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
+        };
+        let owner = |index: usize| {
+            accounts
+                .get(index)
+                .and_then(Option::as_ref)
+                .map(|account| account.owner)
+                .ok_or_else(|| anyhow::anyhow!("Raydium CPMM account {} missing", keys[index]))
+        };
+        let token_0_mint = (owner(3)?, data(3)?);
+        let token_1_mint = (owner(4)?, data(4)?);
+        let epoch = match accounts.get(5).and_then(Option::as_ref) {
+            Some(account) => account
+                .data
+                .get(16..24)
+                .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+                .ok_or_else(|| anyhow::anyhow!("Clock sysvar data is too short"))?,
+            None => {
+                if mint_needs_transfer_fee_epoch(token_0_mint.1, token_0_mint.0)?
+                    || mint_needs_transfer_fee_epoch(token_1_mint.1, token_1_mint.0)?
+                {
+                    rpc.get_epoch_info().await?.epoch
+                } else {
+                    0
+                }
+            }
+        };
+        Self::from_decoded_pool_state(
+            *pool_address,
+            pool,
+            data(0)?,
+            data(1)?,
+            data(2)?,
+            token_0_mint,
+            token_1_mint,
+            epoch,
         )
     }
 
@@ -287,23 +387,51 @@ impl RaydiumCpmmParams {
         pool_address: Pubkey,
         accounts: &CpmmQuoteAccounts,
     ) -> Result<Self, anyhow::Error> {
-        use crate::instruction::utils::raydium_cpmm_types::{amm_config_decode, pool_state_decode};
+        use crate::instruction::utils::raydium_cpmm_types::pool_state_decode;
         let pool = accounts
             .pool
             .get(8..)
             .and_then(pool_state_decode)
             .ok_or_else(|| anyhow::anyhow!("{pool_address} is not a Raydium CPMM pool"))?;
-        let amm_config =
-            accounts.amm_config.get(8..).and_then(amm_config_decode).ok_or_else(|| {
-                anyhow::anyhow!("Raydium CPMM config {} is invalid", pool.amm_config)
-            })?;
+        let epoch = accounts
+            .clock
+            .get(16..24)
+            .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
+            .ok_or_else(|| anyhow::anyhow!("Clock sysvar data is too short"))?;
+        Self::from_decoded_pool_state(
+            pool_address,
+            &pool,
+            accounts.amm_config,
+            accounts.token_0_vault,
+            accounts.token_1_vault,
+            accounts.token_0_mint,
+            accounts.token_1_mint,
+            epoch,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_decoded_pool_state(
+        pool_address: Pubkey,
+        pool: &crate::instruction::utils::raydium_cpmm_types::PoolState,
+        amm_config_data: &[u8],
+        token_0_vault: &[u8],
+        token_1_vault: &[u8],
+        token_0_mint: (Pubkey, &[u8]),
+        token_1_mint: (Pubkey, &[u8]),
+        epoch: u64,
+    ) -> Result<Self, anyhow::Error> {
+        use crate::instruction::utils::raydium_cpmm_types::amm_config_decode;
+        let amm_config = amm_config_data
+            .get(8..)
+            .and_then(amm_config_decode)
+            .ok_or_else(|| anyhow::anyhow!("Raydium CPMM config {} is invalid", pool.amm_config))?;
         let balance = |data: &[u8]| {
             data.get(64..72)
                 .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
                 .ok_or_else(|| anyhow::anyhow!("Raydium CPMM vault data is too short"))
         };
-        let (token0_balance, token1_balance) =
-            (balance(accounts.token_0_vault)?, balance(accounts.token_1_vault)?);
+        let (token0_balance, token1_balance) = (balance(token_0_vault)?, balance(token_1_vault)?);
         let token0_reserve = token0_balance
             .checked_sub(pool.protocol_fees_token0)
             .and_then(|amount| amount.checked_sub(pool.fund_fees_token0))
@@ -315,17 +443,12 @@ impl RaydiumCpmmParams {
             .and_then(|amount| amount.checked_sub(pool.creator_fees_token1))
             .ok_or_else(|| anyhow::anyhow!("Raydium CPMM token1 fees exceed vault balance"))?;
         let ((token0_owner, token0_mint), (token1_owner, token1_mint)) =
-            (accounts.token_0_mint, accounts.token_1_mint);
+            (token_0_mint, token_1_mint);
         if token0_owner != pool.token0_program || token1_owner != pool.token1_program {
             return Err(anyhow::anyhow!(
                 "Raydium CPMM mint owner does not match PoolState token program"
             ));
         }
-        let epoch = accounts
-            .clock
-            .get(16..24)
-            .map(|raw| u64::from_le_bytes(raw.try_into().unwrap()))
-            .ok_or_else(|| anyhow::anyhow!("Clock sysvar data is too short"))?;
         let token0_transfer_fee =
             token_transfer_fee_for_epoch(token0_mint, pool.token0_program, epoch)?;
         let token1_transfer_fee =

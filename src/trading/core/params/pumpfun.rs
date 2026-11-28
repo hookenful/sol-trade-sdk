@@ -5,6 +5,39 @@ use crate::instruction::utils::pumpfun::reconcile_mayhem_mode_for_trade;
 use solana_sdk::pubkey::Pubkey;
 use std::sync::Arc;
 
+/// Immutable per-mint PumpFun position fields cached from a buy event or prior RPC read.
+/// Reusing these on exits avoids re-fetching the mint account and global fee config.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PumpFunImmutableMeta {
+    pub token_program: Pubkey,
+    pub creator: Pubkey,
+    pub creator_vault: Pubkey,
+    pub is_mayhem_mode: bool,
+    pub is_cashback_coin: bool,
+    pub quote_mint: Pubkey,
+    /// Active fee-sharing creator vault if already verified on-chain.
+    pub fee_sharing_creator_vault_if_active: Option<Pubkey>,
+    /// Observed or global protocol fee recipient (`Pubkey::default()` falls back to Global cache/RPC).
+    pub fee_recipient: Pubkey,
+}
+
+impl PumpFunImmutableMeta {
+    /// Extract cacheable per-mint fields from an already-constructed [`PumpFunParams`].
+    #[inline]
+    pub fn from_params(params: &PumpFunParams) -> Self {
+        Self {
+            token_program: params.token_program,
+            creator: params.effective_creator_for_trade(),
+            creator_vault: params.creator_vault,
+            is_mayhem_mode: params.bonding_curve.is_mayhem_mode,
+            is_cashback_coin: params.bonding_curve.is_cashback_coin,
+            quote_mint: params.bonding_curve.effective_quote_mint(),
+            fee_sharing_creator_vault_if_active: params.fee_sharing_creator_vault_if_active,
+            fee_recipient: params.fee_recipient,
+        }
+    }
+}
+
 /// Explicit V3 trade with a fresh caller-supplied minimum output (raw units).
 /// Exact-output buys use SwapParams.fixed_output_amount and input_amount as the
 /// maximum quote budget. Partial fills are disabled. No RPC during construction.
@@ -300,70 +333,240 @@ impl PumpFunParams {
     }
 
     /// 仅 RPC 读取曲线快照；[`Self::observed_trade_creator`] 为 `None`，便于 bot 缓存合并时用粘性的 trade 日志 creator 覆盖陈旧曲线推导。
+    ///
+    /// Batches bonding curve, mint, optional fee-sharing config, and (on cold cache) Global
+    /// account into a single `getMultipleAccounts` RPC instead of 4 separate `getAccount` calls.
     pub async fn from_mint_by_rpc(
         rpc: &SolanaRpcClient,
         mint: &Pubkey,
     ) -> Result<Self, anyhow::Error> {
-        let (account, mint_account, fee_sharing_creator_vault_if_active, fee_recipient) = tokio::join!(
-            crate::instruction::utils::pumpfun::fetch_bonding_curve_account(rpc, mint),
-            rpc.get_account(mint),
-            crate::instruction::utils::pumpfun::fetch_fee_sharing_creator_vault_if_active(
-                rpc, mint
-            ),
-            crate::instruction::utils::pumpfun::fetch_global_fee_recipient(rpc),
-        );
-        let account = account?;
-        let mint_account = mint_account?;
-        let fee_sharing_creator_vault_if_active = fee_sharing_creator_vault_if_active?;
-        let fee_recipient = fee_recipient?;
-        let bonding_curve = BondingCurveAccount {
-            discriminator: 0,
-            account: account.1,
-            virtual_token_reserves: account.0.virtual_token_reserves,
-            virtual_sol_reserves: account.0.virtual_sol_reserves,
-            real_token_reserves: account.0.real_token_reserves,
-            real_sol_reserves: account.0.real_sol_reserves,
-            token_total_supply: account.0.token_total_supply,
-            complete: account.0.complete,
-            creator: account.0.creator,
-            is_mayhem_mode: account.0.is_mayhem_mode,
-            is_cashback_coin: account.0.is_cashback_coin,
-            quote_mint: account.0.quote_mint,
-            creator_fee_bps: account.0.creator_fee_bps,
-            can_edit_creator_fee: account.0.can_edit_creator_fee,
-            is_holder_reward: account.0.is_holder_reward,
-            creator_fee: account.0.creator_fee,
-            protocol_fees: account.0.protocol_fees,
-            depth: account.0.depth,
-            initial_virtual_quote_reserves: account.0.initial_virtual_quote_reserves,
-            post_complete_base_out: account.0.post_complete_base_out,
-            post_complete_quote_in: account.0.post_complete_quote_in,
+        use crate::instruction::utils::pumpfun::{
+            cache_global_fee_recipient, cached_global_fee_recipient, decode_bonding_curve_account,
+            decode_fee_sharing_creator_vault_account, decode_global_fee_recipient_account,
+            get_bonding_curve_pda, get_creator_vault_pda, get_fee_sharing_config_pda,
+            global_constants, resolve_creator_vault_for_ix_with_fee_sharing,
         };
+
+        let bonding_curve_pda = get_bonding_curve_pda(mint)
+            .ok_or_else(|| anyhow::anyhow!("Bonding curve not found"))?;
+        let fee_sharing_pda = get_fee_sharing_config_pda(mint);
+        let cached_fee_recipient = cached_global_fee_recipient(rpc);
+
+        let mut keys = Vec::with_capacity(4);
+        keys.push(bonding_curve_pda);
+        keys.push(*mint);
+        let sharing_idx = fee_sharing_pda.map(|pda| {
+            let idx = keys.len();
+            keys.push(pda);
+            idx
+        });
+        let global_idx = if cached_fee_recipient.is_none() {
+            let idx = keys.len();
+            keys.push(global_constants::GLOBAL_ACCOUNT);
+            Some(idx)
+        } else {
+            None
+        };
+
+        let accounts = rpc.get_multiple_accounts(&keys).await?;
+        let curve_account = accounts
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or_else(|| anyhow::anyhow!("Bonding curve not found"))?;
+        let mint_account = accounts
+            .get(1)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| anyhow::anyhow!("PumpFun mint account {mint} not found"))?;
+        let bonding_curve = decode_bonding_curve_account(curve_account, bonding_curve_pda)?;
+        let fee_sharing_creator_vault_if_active = match (fee_sharing_pda, sharing_idx) {
+            (Some(pda), Some(idx)) => decode_fee_sharing_creator_vault_account(
+                accounts.get(idx).and_then(Option::as_ref),
+                mint,
+                &pda,
+            )?,
+            _ => None,
+        };
+        let fee_recipient = if let Some(cached) = cached_fee_recipient {
+            cached
+        } else {
+            let idx = global_idx.expect("global account requested when cache cold");
+            let global_account = accounts
+                .get(idx)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| anyhow::anyhow!("PumpFun Global account not found"))?;
+            let recipient = decode_global_fee_recipient_account(global_account)?;
+            cache_global_fee_recipient(rpc, recipient);
+            recipient
+        };
+
         let associated_bonding_curve = get_associated_token_address_with_program_id(
             &bonding_curve.account,
             mint,
             &mint_account.owner,
         );
-        let creator_vault =
-            crate::instruction::utils::pumpfun::resolve_creator_vault_for_ix_with_fee_sharing(
-                &bonding_curve.creator,
-                Pubkey::default(),
-                mint,
-                fee_sharing_creator_vault_if_active,
-            )
-            .or_else(|| {
-                crate::instruction::utils::pumpfun::get_creator_vault_pda(&bonding_curve.creator)
-            })
-            .unwrap_or_default();
+        let creator_vault = resolve_creator_vault_for_ix_with_fee_sharing(
+            &bonding_curve.creator,
+            Pubkey::default(),
+            mint,
+            fee_sharing_creator_vault_if_active,
+        )
+        .or_else(|| get_creator_vault_pda(&bonding_curve.creator))
+        .unwrap_or_default();
         let quote_mint = bonding_curve.quote_mint;
         Ok(Self {
             bonding_curve: Arc::new(bonding_curve),
-            associated_bonding_curve: associated_bonding_curve,
+            associated_bonding_curve,
             observed_trade_creator: None,
             creator_vault,
             fee_sharing_creator_vault_if_active,
             close_token_account_when_sell: None,
             token_program: mint_account.owner,
+            fee_recipient,
+            quote_mint: Self::quote_mint_for_rpc_return(quote_mint),
+        })
+    }
+
+    /// Exit fast path using cached immutable per-mint fields (`token_program`, `creator`,
+    /// `creator_vault`, `is_mayhem_mode`, `is_cashback_coin`, `quote_mint`).
+    ///
+    /// Performs a single batched `getMultipleAccounts` RPC to refresh live bonding curve
+    /// reserves/completion, checking `SharingConfig` when fee sharing was not yet active,
+    /// `Global` when the 90s global fee-recipient cache is cold (for non-mayhem coins),
+    /// and the mint account only when `cached.token_program` is unset.
+    pub async fn from_cached_meta_by_rpc(
+        rpc: &SolanaRpcClient,
+        mint: &Pubkey,
+        cached: &PumpFunImmutableMeta,
+    ) -> Result<Self, anyhow::Error> {
+        use crate::instruction::utils::pumpfun::{
+            cache_global_fee_recipient, cached_global_fee_recipient, decode_bonding_curve_account,
+            decode_fee_sharing_creator_vault_account, decode_global_fee_recipient_account,
+            get_bonding_curve_pda, get_creator_vault_pda, get_fee_sharing_config_pda,
+            global_constants, resolve_creator_vault_for_ix_with_fee_sharing,
+        };
+
+        let bonding_curve_pda = get_bonding_curve_pda(mint)
+            .ok_or_else(|| anyhow::anyhow!("Bonding curve not found"))?;
+        let fee_sharing_pda = if cached.fee_sharing_creator_vault_if_active.is_none() {
+            get_fee_sharing_config_pda(mint)
+        } else {
+            None
+        };
+        // Mayhem coins use a dedicated mayhem fee recipient; normal coins must honor
+        // the 90s Global fee-recipient TTL cache so protocol fee-recipient rotations
+        // propagate without using a stale per-mint entry.
+        let known_fee_recipient = if cached.is_mayhem_mode
+            && global_constants::MAYHEM_FEE_RECIPIENTS.contains(&cached.fee_recipient)
+        {
+            Some(cached.fee_recipient)
+        } else {
+            cached_global_fee_recipient(rpc)
+        };
+
+        let mut keys = Vec::with_capacity(4);
+        keys.push(bonding_curve_pda);
+        let mint_idx = if cached.token_program == Pubkey::default() {
+            let idx = keys.len();
+            keys.push(*mint);
+            Some(idx)
+        } else {
+            None
+        };
+        let sharing_idx = fee_sharing_pda.map(|pda| {
+            let idx = keys.len();
+            keys.push(pda);
+            idx
+        });
+        let global_idx = if known_fee_recipient.is_none() {
+            let idx = keys.len();
+            keys.push(global_constants::GLOBAL_ACCOUNT);
+            Some(idx)
+        } else {
+            None
+        };
+
+        let accounts = rpc.get_multiple_accounts(&keys).await?;
+        let curve_account = accounts
+            .first()
+            .and_then(Option::as_ref)
+            .ok_or_else(|| anyhow::anyhow!("Bonding curve not found"))?;
+        let mut bonding_curve = decode_bonding_curve_account(curve_account, bonding_curve_pda)?;
+        if bonding_curve.creator == Pubkey::default() {
+            bonding_curve.creator = cached.creator;
+        }
+        bonding_curve.is_mayhem_mode |= cached.is_mayhem_mode;
+        bonding_curve.is_cashback_coin |= cached.is_cashback_coin;
+        if bonding_curve.quote_mint == Pubkey::default() && cached.quote_mint != Pubkey::default() {
+            bonding_curve.quote_mint = cached.quote_mint;
+        }
+
+        let fee_sharing_creator_vault_if_active =
+            if cached.fee_sharing_creator_vault_if_active.is_some() {
+                cached.fee_sharing_creator_vault_if_active
+            } else if let (Some(pda), Some(idx)) = (fee_sharing_pda, sharing_idx) {
+                decode_fee_sharing_creator_vault_account(
+                    accounts.get(idx).and_then(Option::as_ref),
+                    mint,
+                    &pda,
+                )?
+            } else {
+                None
+            };
+        let fee_recipient = if let Some(recipient) = known_fee_recipient {
+            recipient
+        } else {
+            let idx = global_idx.expect("global account requested when fee recipient unknown");
+            if let Some(global_account) = accounts.get(idx).and_then(Option::as_ref) {
+                let recipient = decode_global_fee_recipient_account(global_account)?;
+                cache_global_fee_recipient(rpc, recipient);
+                recipient
+            } else if cached.fee_recipient != Pubkey::default() {
+                cached.fee_recipient
+            } else {
+                return Err(anyhow::anyhow!("PumpFun Global account not found"));
+            }
+        };
+
+        let token_program = if cached.token_program != Pubkey::default() {
+            cached.token_program
+        } else {
+            let idx = mint_idx.expect("mint account requested when token_program unknown");
+            accounts
+                .get(idx)
+                .and_then(Option::as_ref)
+                .map(|account| account.owner)
+                .ok_or_else(|| anyhow::anyhow!("PumpFun mint account {mint} not found"))?
+        };
+        let associated_bonding_curve =
+            crate::common::fast_fn::get_associated_token_address_with_program_id_fast(
+                &bonding_curve.account,
+                mint,
+                &token_program,
+            );
+        // If fee sharing activated after the buy, the active sharing vault must override the
+        // pre-sharing creator vault to avoid Anchor 2006.
+        let creator_vault = if let Some(active_sharing_vault) = fee_sharing_creator_vault_if_active
+        {
+            active_sharing_vault
+        } else {
+            resolve_creator_vault_for_ix_with_fee_sharing(
+                &bonding_curve.creator,
+                cached.creator_vault,
+                mint,
+                None,
+            )
+            .or_else(|| get_creator_vault_pda(&bonding_curve.creator))
+            .unwrap_or_default()
+        };
+        let quote_mint = bonding_curve.quote_mint;
+        Ok(Self {
+            bonding_curve: Arc::new(bonding_curve),
+            associated_bonding_curve,
+            observed_trade_creator: (cached.creator != Pubkey::default()).then_some(cached.creator),
+            creator_vault,
+            fee_sharing_creator_vault_if_active,
+            close_token_account_when_sell: None,
+            token_program,
             fee_recipient,
             quote_mint: Self::quote_mint_for_rpc_return(quote_mint),
         })

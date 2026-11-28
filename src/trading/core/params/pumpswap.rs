@@ -383,23 +383,47 @@ impl PumpSwapParams {
     ///
     /// Refreshes the Pool, both vaults and base mint in one RPC snapshot so a
     /// changing virtual reserve cannot be combined with balances from another slot.
-    /// The hint avoids a separate Pool lookup before this batched read.
+    /// Runs cached fee/global config fetches concurrently with the pool snapshot.
     pub async fn from_pool_data(
         rpc: &SolanaRpcClient,
         pool_address: &Pubkey,
         pool_data: &crate::instruction::utils::pumpswap_types::Pool,
     ) -> Result<Self, anyhow::Error> {
-        let (pool_data, snapshot) =
-            crate::instruction::utils::pumpswap::get_pool_rpc_snapshot_with_address(
+        Self::from_known_pool_addresses_by_rpc(
+            rpc,
+            pool_address,
+            &pool_data.base_mint,
+            &pool_data.quote_mint,
+            &pool_data.pool_base_token_account,
+            &pool_data.pool_quote_token_account,
+        )
+        .await
+    }
+
+    /// Build params in a single batched `getMultipleAccounts` RPC when pool, mints
+    /// and vault addresses are already known (e.g. from a pool address cache), running
+    /// cached fee/global config refreshes concurrently.
+    pub async fn from_known_pool_addresses_by_rpc(
+        rpc: &SolanaRpcClient,
+        pool_address: &Pubkey,
+        base_mint: &Pubkey,
+        quote_mint: &Pubkey,
+        pool_base_token_account: &Pubkey,
+        pool_quote_token_account: &Pubkey,
+    ) -> Result<Self, anyhow::Error> {
+        let (snapshot_res, fee_config, global_config) = tokio::join!(
+            crate::instruction::utils::pumpswap::get_pool_rpc_snapshot_by_addresses(
                 pool_address,
-                pool_data,
+                base_mint,
+                quote_mint,
+                pool_base_token_account,
+                pool_quote_token_account,
                 rpc,
-            )
-            .await?;
-        let (fee_config, global_config) = tokio::join!(
+            ),
             crate::instruction::utils::pumpswap::fetch_fee_config(rpc),
             crate::instruction::utils::pumpswap::fetch_global_config(rpc),
         );
+        let (pool_data, snapshot) = snapshot_res?;
         Self::from_cached_pool_snapshot(
             pool_address,
             &pool_data,

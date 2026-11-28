@@ -18,6 +18,8 @@ pub(crate) use pumpswap_route_search::{canonical_conversion_pools, ConversionGra
 mod raydium_amm_v4;
 mod raydium_clmm;
 mod raydium_cpmm;
+#[cfg(test)]
+mod rpc_collapse_tests;
 mod stonkfun_preparation;
 mod stonkfun_quote_route;
 mod stonkfun_via_sol;
@@ -38,7 +40,7 @@ pub(crate) use meteora_dlmm::fixture_pair as dlmm_fixture_pair;
 pub use meteora_dlmm::{
     DlmmHopQuote, DlmmQuoteAccounts, DlmmQuoteState, MeteoraDlmmParams, QUOTE_BIN_ARRAYS,
 };
-pub use pumpfun::{PumpFunParams, PumpFunV3Params};
+pub use pumpfun::{PumpFunImmutableMeta, PumpFunParams, PumpFunV3Params};
 pub use pumpswap::PumpSwapParams;
 pub use pumpswap_preparation::PreparedPumpSwapTrade;
 pub use pumpswap_route_search::{
